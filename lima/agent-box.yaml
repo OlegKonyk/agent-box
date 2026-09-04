@@ -1,0 +1,150 @@
+# agent-box — a disposable Ubuntu 24.04 VM that runs one coding agent against
+# one mounted repository, with default-deny egress.
+#
+# This template is never used directly: bin/agentbox passes the two mount
+# locations as template parameters, e.g.
+#
+#   limactl create --name agent-box-demo \
+#     --param repo=/path/to/the/repo \
+#     --param box=/path/to/this/checkout \
+#     lima/agent-box.yaml
+#
+# `mounts[].location` is a host template and `mounts[].mountPoint` is a guest
+# template; both accept {{.Param.Key}}. See docs/decisions.md.
+
+minimumLimaVersion: "2.0.0"
+
+# ---------------------------------------------------------------------------
+# Machine
+# ---------------------------------------------------------------------------
+
+# Apple Virtualization.framework. Required for virtiofs on macOS.
+vmType: "vz"
+
+cpus: 4
+memory: "6GiB"
+disk: "30GiB"
+
+# Ubuntu 24.04 LTS (Noble). Pinned entries first with digests, then the
+# rolling `release/` entries as a fallback when the pinned build is retired.
+# Mirrors the layout of Lima's own template:_images/ubuntu-24.04.
+images:
+- location: "https://cloud-images.ubuntu.com/releases/noble/release-20260705/ubuntu-24.04-server-cloudimg-arm64.img"
+  arch: "aarch64"
+  digest: "sha256:7df0201546f75b8bcc1044594c806c35749421ad3c9bc1be2a3ab806cfae39cc"
+  variant: "server"
+- location: "https://cloud-images.ubuntu.com/releases/noble/release-20260705/ubuntu-24.04-server-cloudimg-amd64.img"
+  arch: "x86_64"
+  digest: "sha256:ffe6203da54deeb6db5d2a98a83f9ec8e55f149d3f7ba622e1abe5fa966ee3d6"
+  variant: "server"
+- location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img"
+  arch: "aarch64"
+  variant: "server"
+- location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img"
+  arch: "x86_64"
+  variant: "server"
+
+# ---------------------------------------------------------------------------
+# Isolation
+# ---------------------------------------------------------------------------
+
+# No container runtime. The agent runs on the bare guest.
+containerd:
+  system: false
+  user: false
+
+# Nothing the guest listens on is reachable from the host or the LAN.
+#
+# guestIPMustBeZero has to be set explicitly. Lima defaults it to
+# `guestIP == 0.0.0.0` (pkg/limayaml/defaults.go), so leaving it out of the
+# 0.0.0.0 rule makes that rule match ONLY a literal 0.0.0.0 bind — and a service
+# bound to the guest's own interface address, say 192.168.64.x:8080, then
+# matches neither rule and falls through to Lima's default, which forwards it to
+# the host's loopback. Setting it false is what makes 0.0.0.0 mean "any bound
+# interface", per Lima's own reference config.
+portForwards:
+- guestIP: "0.0.0.0"
+  guestIPMustBeZero: false
+  guestPortRange: [1, 65535]
+  proto: "any"
+  ignore: true
+- guestIP: "127.0.0.1"
+  guestPortRange: [1, 65535]
+  proto: "any"
+  ignore: true
+
+ssh:
+  # Never expose the host's ssh-agent (and therefore the host's git identities)
+  # to the agent.
+  forwardAgent: false
+  forwardX11: false
+  forwardX11Trusted: false
+  loadDotSSHPubKeys: false
+
+# Exactly three mounts, two of them read-only. Notably absent: the host home
+# directory, which Lima's default template mounts read-only. The agent sees one
+# repository, this checkout, and the host's agent-box config — nothing else
+# belonging to the host user.
+param:
+  # Placeholders only. bin/agentbox always overrides all three with --param, so
+  # that `limactl validate` on the bare template still resolves to real paths.
+  repo: "/tmp"
+  box: "/tmp"
+  config: "/tmp"
+
+mounts:
+- location: "{{.Param.repo}}"
+  mountPoint: "/work"
+  writable: true
+- location: "{{.Param.box}}"
+  mountPoint: "/opt/agent-box"
+  writable: false
+# The host's ~/.config/agent-box/guest: allowlist.local and ca.pem, and nothing
+# else. Mounted rather than copied into this checkout, so that site-specific
+# strings never enter a git repository at all — not even an ignored directory
+# inside one.
+#
+# The subdirectory matters. blocklist.txt — the literal list of terms that must
+# never leave — stays in the PARENT directory, is read on the host by
+# host/preflight.sh, and is never mounted. Mounting the parent would put that
+# list inside a VM that talks to a model under a personal subscription.
+- location: "{{.Param.config}}"
+  mountPoint: "/opt/agent-box-config"
+  writable: false
+
+mountType: "virtiofs"
+
+# ---------------------------------------------------------------------------
+# Guest environment
+# ---------------------------------------------------------------------------
+
+# Written to /etc/environment by Lima. Values here are literals: Lima does not
+# expand template variables in `env`, so CLAUDE_CONFIG_DIR (which needs the
+# guest home directory) is set by guest/provision.sh instead. See
+# docs/decisions.md.
+env:
+  DISABLE_TELEMETRY: "1"
+  DISABLE_ERROR_REPORTING: "1"
+
+# Lima otherwise copies the host's http_proxy / https_proxy / no_proxy into the
+# guest's /etc/environment. On a managed Mac those routinely name internal
+# hosts, which is exactly the kind of string this VM exists to keep away from a
+# personal subscription — and it would hand the agent a general-purpose egress
+# relay that the allowlist does not govern. If a proxy really is needed, put its
+# hostname in ~/.config/agent-box/allowlist.local and its root in ca.pem, which
+# makes the decision explicit and reviewable.
+propagateProxyEnv: false
+
+# ---------------------------------------------------------------------------
+# Provisioning
+# ---------------------------------------------------------------------------
+
+# The real script lives in the read-only /opt/agent-box mount so it is
+# reviewable as a file rather than as a YAML string. Provision scripts are
+# guest templates, which is how the guest username and home reach it.
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -euo pipefail
+    exec /opt/agent-box/guest/provision.sh "{{.User}}" "{{.Home}}"

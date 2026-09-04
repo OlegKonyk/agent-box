@@ -1,0 +1,365 @@
+#!/usr/bin/env bash
+#
+# agentbox — drive a disposable Lima VM that runs a coding agent against one
+# repository, with default-deny egress.
+#
+# One instance per repository: Lima fixes mounts at create time, so the repo a
+# VM can see is decided once, when the VM is made, and cannot drift afterwards.
+
+set -euo pipefail
+
+BOX_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+HOST_CONFIG_DIR="${AGENT_BOX_CONFIG_DIR:-${HOME}/.config/agent-box}"
+# ONLY this subdirectory is mounted into the guest. blocklist.txt stays in the
+# parent, where preflight reads it host-side: it is the literal list of terms
+# that must never leave, so it has no business being readable by an agent that
+# talks to a model. See docs/decisions.md.
+HOST_GUEST_CONFIG_DIR="${HOST_CONFIG_DIR}/guest"
+LIMA_TEMPLATE="${BOX_DIR}/lima/agent-box.yaml"
+LIMACTL="${LIMACTL:-limactl}"
+
+PROG=$(basename "$0")
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+info() { printf '%s: %s\n' "$PROG" "$*"; }
+
+usage() {
+    cat <<EOF
+usage: ${PROG} <command> [args]
+
+  preflight <repo>                  scan a repo for secrets and configured terms
+  create <repo>                     preflight, then create and start its VM
+  start <repo>                      preflight, then start an existing VM
+  token <repo>                      read an OAuth token from the terminal into the VM
+  verify-auth <repo>                prove the token authenticates, with a real model call
+  shell <repo>                      interactive shell in the VM, in /work
+  run <repo> <brief.md> [--model M] run one headless task; default model: sonnet
+  stop <repo|name>                  stop the VM
+  destroy <repo|name>               stop and delete the VM
+  status                            list all Lima instances
+  firewall-check <repo|name>        re-run the egress verification inside the VM
+  help                              this message
+
+stop, destroy and firewall-check also accept a bare instance name, so a VM can
+still be shut down and deleted after its repository directory has been removed.
+
+Host-side configuration, never copied into this repository.
+
+Mounted read-only into the VM at /opt/agent-box-config:
+  ${HOST_GUEST_CONFIG_DIR}/allowlist.local   extra egress domains, one per line
+  ${HOST_GUEST_CONFIG_DIR}/ca.pem            corporate TLS-intercept root, if any
+
+Read on this host only, never mounted, never visible to the agent:
+  ${HOST_CONFIG_DIR}/blocklist.txt     literal terms preflight looks for
+
+The OAuth token is never written to a file on this host, never passed as an
+argument, and never placed in the environment. It is typed once and piped
+straight into the VM.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+require_limactl() {
+    command -v "$LIMACTL" >/dev/null 2>&1 || die "limactl not found on PATH (brew install lima)"
+}
+
+# Absolute, symlink-resolved repo path.
+abs_repo() {
+    local p="${1:?}"
+    [ -d "$p" ] || die "not a directory: ${p}"
+    (cd "$p" && pwd -P)
+}
+
+slugify() {
+    printf '%s' "${1:?}" \
+        | tr '[:upper:]' '[:lower:]' \
+        | tr -c 'a-z0-9' '-' \
+        | sed -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//'
+}
+
+# Derived from the path string alone, so it does not require the directory to
+# exist. stop, destroy and firewall-check rely on that: deleting the repo must
+# not strand a VM — with the OAuth token still inside it — that the CLI can no
+# longer address.
+instance_name() {
+    local arg="${1:?}" slug
+    # A real directory always wins. Testing the glob first would misread a
+    # repository whose directory is literally named agent-box-something as an
+    # instance name, and stop/destroy/firewall-check would then address the
+    # wrong instance.
+    if [ -d "$arg" ]; then
+        arg=$(abs_repo "$arg")
+    else
+        # No such directory: accept a bare instance name, which is what makes a
+        # VM removable after its repository has been deleted.
+        case "$arg" in
+            agent-box-*) printf '%s' "$arg"; return 0 ;;
+        esac
+    fi
+    slug=$(slugify "$(basename "$arg")")
+    [ -n "$slug" ] || die "cannot derive an instance name from ${arg}"
+    printf 'agent-box-%s' "$slug"
+}
+
+instance_exists() {
+    "$LIMACTL" list --quiet 2>/dev/null | grep -qxF "$1"
+}
+
+require_instance() {
+    instance_exists "$1" || die "no instance named '${1}'. Run '${PROG} create <repo>' first."
+}
+
+run_preflight() {
+    local repo="$1"
+    info "preflight on ${repo}"
+    "${BOX_DIR}/host/preflight.sh" "$repo"
+}
+
+# The host's config directory is mounted read-only into the guest. It must exist
+# for Lima to mount it, but it may be completely empty.
+ensure_host_config_dir() {
+    if [ ! -d "$HOST_GUEST_CONFIG_DIR" ]; then
+        info "creating ${HOST_GUEST_CONFIG_DIR} (it may stay empty)"
+        mkdir -p "$HOST_GUEST_CONFIG_DIR"
+    fi
+    local n=0
+    [ -f "${HOST_GUEST_CONFIG_DIR}/allowlist.local" ] && { info "allowlist.local will be mounted read-only"; n=1; }
+    [ -f "${HOST_GUEST_CONFIG_DIR}/ca.pem" ]          && { info "ca.pem will be mounted read-only"; n=1; }
+    [ "$n" -eq 1 ] || info "no allowlist.local or ca.pem in ${HOST_GUEST_CONFIG_DIR} (that is fine)"
+
+    # The term list must never be inside the mounted directory.
+    if [ -f "${HOST_GUEST_CONFIG_DIR}/blocklist.txt" ]; then
+        die "blocklist.txt is in ${HOST_GUEST_CONFIG_DIR}, which is mounted into the VM. Move it up to ${HOST_CONFIG_DIR}/blocklist.txt, where it is read on this host only."
+    fi
+}
+
+exclude_from_backup() {
+    command -v tmutil >/dev/null 2>&1 || return 0
+    [ -d "${HOME}/.lima" ] || return 0
+    if tmutil addexclusion "${HOME}/.lima" >/dev/null 2>&1; then
+        info "excluded ~/.lima from Time Machine"
+    else
+        info "NOTE: could not exclude ~/.lima from Time Machine. VM disk images will be backed up unless you exclude the directory yourself in System Settings > General > Time Machine > Options."
+    fi
+}
+
+# Every guest invocation passes an explicit --workdir. Without it limactl tries
+# to cd into the host's current directory inside the guest, which fails noisily
+# and tells the guest a host path it has no business knowing.
+guest_shell() {
+    local inst="$1"; shift
+    "$LIMACTL" shell --workdir /work "$inst" -- "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_preflight() {
+    local repo; repo=$(abs_repo "${1:?usage: ${PROG} preflight <repo>}")
+    "${BOX_DIR}/host/preflight.sh" "$repo"
+}
+
+cmd_create() {
+    local repo inst
+    repo=$(abs_repo "${1:?usage: ${PROG} create <repo>}")
+    inst=$(instance_name "$repo")
+    require_limactl
+
+    instance_exists "$inst" && die "instance '${inst}' already exists. Use '${PROG} start' or '${PROG} destroy'."
+
+    run_preflight "$repo" || die "preflight failed; refusing to mount ${repo}"
+    ensure_host_config_dir
+
+    info "creating ${inst}"
+    "$LIMACTL" create --yes \
+        --name "$inst" \
+        --param "repo=${repo}" \
+        --param "box=${BOX_DIR}" \
+        --param "config=${HOST_GUEST_CONFIG_DIR}" \
+        "$LIMA_TEMPLATE"
+
+    # After create, not before: on a machine that has never run Lima, ~/.lima
+    # does not exist yet and the exclusion would fail for no reason.
+    exclude_from_backup
+
+    info "starting ${inst} (first boot downloads the image and provisions; this takes a while)"
+    "$LIMACTL" start --yes "$inst"
+
+    cat <<EOF
+
+${inst} is up.
+
+Next: ${PROG} token ${repo}         # paste the OAuth token, once
+Then: ${PROG} verify-auth ${repo}   # a real model call, which is the only proof
+EOF
+}
+
+cmd_start() {
+    local repo inst
+    repo=$(abs_repo "${1:?usage: ${PROG} start <repo>}")
+    inst=$(instance_name "$repo")
+    require_limactl
+    require_instance "$inst"
+
+    run_preflight "$repo" || die "preflight failed; refusing to start ${inst}"
+    ensure_host_config_dir
+    "$LIMACTL" start --yes "$inst"
+}
+
+cmd_token() {
+    local repo inst
+    repo=$(abs_repo "${1:?usage: ${PROG} token <repo>}")
+    inst=$(instance_name "$repo")
+    require_limactl
+    require_instance "$inst"
+
+    [ -t 0 ] || die "refusing to read a token from a pipe; run this from a terminal"
+
+    cat <<'EOF'
+Paste the token from `claude setup-token` (run on your personal machine).
+It is not echoed, is not stored on this host, and is not passed as an argument.
+EOF
+    local token=""
+    # `|| die`: read returns non-zero on EOF, and under `set -e` a bare Ctrl-D
+    # would otherwise kill the script before the friendly message below.
+    IFS= read -rs -p 'token: ' token < /dev/tty || die "no token read (end of input)"
+    printf '\n'
+    [ -n "$token" ] || die "empty token"
+    case "$token" in
+        *[[:space:]]*) die "the token contains whitespace; paste it as a single line" ;;
+    esac
+
+    # The token travels only on this pipe: not in argv (which is world-visible
+    # in `ps`), not in the environment, and not on disk on this host.
+    #
+    # One assumption is load-bearing and worth naming: `limactl shell` must not
+    # allocate a pty when its stdin is a pipe. If it ever did, the guest tty
+    # would echo the token back onto this terminal and into scrollback.
+    # test/smoke.sh asserts the current behaviour so a regression is caught.
+    # shellcheck disable=SC2016  # $HOME must expand in the guest, not here.
+    if printf '%s' "$token" | "$LIMACTL" shell --workdir /work "$inst" -- \
+        sh -c 'umask 077; mkdir -p "$HOME/.config/agent-box"; cat > "$HOME/.config/agent-box/token"; chmod 600 "$HOME/.config/agent-box/token"'
+    then
+        token=""
+        unset token
+        info "token stored in the guest at ~/.config/agent-box/token (mode 600)"
+        # shellcheck disable=SC2016  # $HOME and awk's $1 must expand in the guest.
+        guest_shell "$inst" sh -c 'ls -l "$HOME/.config/agent-box/token" | awk "{print \$1, \$3, \$9}"'
+        info "now run: ${PROG} verify-auth ${repo}"
+    else
+        token=""
+        unset token
+        die "failed to write the token into ${inst}"
+    fi
+}
+
+cmd_verify_auth() {
+    local repo inst model
+    repo=$(abs_repo "${1:?usage: ${PROG} verify-auth <repo> [--model haiku]}")
+    shift
+    model="haiku"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --model) model="${2:?--model needs a value}"; shift 2 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    inst=$(instance_name "$repo")
+    require_limactl
+    require_instance "$inst"
+    guest_shell "$inst" /opt/agent-box/guest/verify-auth.sh "$model"
+}
+
+cmd_shell() {
+    local repo inst
+    repo=$(abs_repo "${1:?usage: ${PROG} shell <repo>}")
+    inst=$(instance_name "$repo")
+    require_limactl
+    require_instance "$inst"
+    exec "$LIMACTL" shell --workdir /work "$inst"
+}
+
+cmd_run() {
+    local repo brief model inst slug
+    repo=$(abs_repo "${1:?usage: ${PROG} run <repo> <brief.md> [--model sonnet]}")
+    brief="${2:?usage: ${PROG} run <repo> <brief.md> [--model sonnet]}"
+    shift 2
+    model="sonnet"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --model) model="${2:?--model needs a value}"; shift 2 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+
+    [ -f "$brief" ] || die "brief not found: ${brief}"
+    inst=$(instance_name "$repo")
+    require_limactl
+    require_instance "$inst"
+
+    slug=$(basename "$brief"); slug="${slug%.*}"
+
+    info "running ${slug} in ${inst} on model ${model}"
+    # The brief goes in on stdin, so it needs no path the guest can see.
+    "$LIMACTL" shell --workdir /work "$inst" -- \
+        /opt/agent-box/guest/agent-run.sh --slug "$slug" --model "$model" --brief - < "$brief"
+}
+
+cmd_stop() {
+    local inst; inst=$(instance_name "${1:?usage: ${PROG} stop <repo|name>}")
+    require_limactl
+    require_instance "$inst"
+    "$LIMACTL" stop "$inst"
+}
+
+cmd_destroy() {
+    local inst; inst=$(instance_name "${1:?usage: ${PROG} destroy <repo|name>}")
+    require_limactl
+    require_instance "$inst"
+    "$LIMACTL" stop --force "$inst" >/dev/null 2>&1 || true
+    "$LIMACTL" delete --force "$inst"
+    cat <<EOF
+
+${inst} deleted.
+
+The OAuth token that was inside it is gone with the disk image, but it is still
+valid at Anthropic until you revoke it. If this was the last VM using it, revoke
+it now: claude.ai -> Settings -> Claude Code -> revoke the token.
+EOF
+}
+
+cmd_status() {
+    require_limactl
+    "$LIMACTL" list
+}
+
+cmd_firewall_check() {
+    local inst; inst=$(instance_name "${1:?usage: ${PROG} firewall-check <repo|name>}")
+    require_limactl
+    require_instance "$inst"
+    # Under sudo: the verification reads the live ruleset with `iptables -S`,
+    # which needs CAP_NET_ADMIN.
+    guest_shell "$inst" sudo /opt/agent-box/guest/init-firewall.sh --verify-only
+}
+
+# ---------------------------------------------------------------------------
+
+case "${1:-}" in
+    preflight)      shift; cmd_preflight "$@" ;;
+    create)         shift; cmd_create "$@" ;;
+    start)          shift; cmd_start "$@" ;;
+    token)          shift; cmd_token "$@" ;;
+    verify-auth)    shift; cmd_verify_auth "$@" ;;
+    shell)          shift; cmd_shell "$@" ;;
+    run)            shift; cmd_run "$@" ;;
+    stop)           shift; cmd_stop "$@" ;;
+    destroy)        shift; cmd_destroy "$@" ;;
+    status)         shift; cmd_status "$@" ;;
+    firewall-check) shift; cmd_firewall_check "$@" ;;
+    help|-h|--help) usage ;;
+    *)              usage >&2; exit 2 ;;
+esac
