@@ -216,6 +216,87 @@ else
 fi
 
 # ===========================================================================
+step "3d. stage the host-side plugin and personal-config files"
+# ===========================================================================
+#
+# Everything here goes into the hermetic config directory, which is mounted
+# read-only at /opt/agent-box-config. It must exist BEFORE create, because
+# provisioning reads it: the plugin install runs on first boot, after the
+# firewall comes up.
+
+GUEST_CFG="${AGENT_BOX_CONFIG_DIR}/guest"
+CLAUDE_MARKER="agent-box-smoke-marker-${SMOKE_ID}"
+MARKETPLACE_REPO="konyklabs/claude-plugins"
+# The registered NAME comes from the marketplace's own manifest, not from the
+# repository name: .claude-plugin/marketplace.json on that public repo's main
+# branch declares "konyklabs-plugins".
+MARKETPLACE_NAME="konyklabs-plugins"
+PLUGIN_UNDER_TEST="governor"
+
+mkdir -p "${GUEST_CFG}/claude/rules" \
+         "${GUEST_CFG}/plugin-dir/demo/.claude-plugin" \
+         "${GUEST_CFG}/plugin-dir/demo/commands"
+
+cat > "${GUEST_CFG}/plugins.txt" <<EOF
+# agent-box smoke test
+marketplace ${MARKETPLACE_REPO}
+install ${PLUGIN_UNDER_TEST}@${MARKETPLACE_NAME}
+EOF
+
+cat > "${GUEST_CFG}/claude/CLAUDE.md" <<EOF
+# smoke
+
+${CLAUDE_MARKER}
+EOF
+
+printf '{}\n' > "${GUEST_CFG}/claude/governor.json"
+printf '# a rule\n\nNothing to see.\n' > "${GUEST_CFG}/claude/rules/smoke.md"
+
+# A settings.json shaped like the one a person would really copy in: a harmless
+# setting next to an `env` block holding an API key. That block is merged into
+# the CLI's own process environment, so it would arrive AFTER the shell
+# environment check in lib.sh has already passed. The harmless key must survive
+# the crossing and the credential must not.
+SETTINGS_HARMLESS_KEY="includeCoAuthoredBy"
+SETTINGS_FAKE_KEY="sk-ant-fake-smoke-key-must-not-cross"
+cat > "${GUEST_CFG}/claude/settings.json" <<EOF
+{
+  "${SETTINGS_HARMLESS_KEY}": false,
+  "env": {"ANTHROPIC_API_KEY": "${SETTINGS_FAKE_KEY}"},
+  "apiKeyHelper": "echo sk-ant-nor-this"
+}
+EOF
+
+# Staged deliberately: the sync is an allowlist, and a credential-shaped file
+# left in the source directory must be refused out loud rather than skipped in
+# silence, because a silent skip looks exactly like a successful copy.
+printf '{"fake":"this must never be copied into the guest"}\n' > "${GUEST_CFG}/claude/.credentials.json"
+
+cat > "${GUEST_CFG}/plugin-dir/demo/.claude-plugin/plugin.json" <<'EOF'
+{
+  "name": "demo",
+  "description": "A minimal plugin, loaded per session by the agent-box smoke test.",
+  "version": "0.1.0"
+}
+EOF
+
+cat > "${GUEST_CFG}/plugin-dir/demo/commands/hello.md" <<'EOF'
+---
+description: Say hello from the demo plugin.
+---
+
+Reply with the single word: hello
+EOF
+
+printf -- '--- staged under %s ---\n' "$GUEST_CFG"
+find "$GUEST_CFG" -type f | sed "s#^${GUEST_CFG}/##" | sort
+if [ -f "${GUEST_CFG}/plugins.txt" ] && [ -f "${GUEST_CFG}/plugin-dir/demo/.claude-plugin/plugin.json" ]; then
+    ok "the host-side plugin and config files are staged"
+else
+    bad "the host-side plugin and config files are not staged"
+fi
+
+# ===========================================================================
 step "4. create a real instance from the clean repository"
 # ===========================================================================
 
@@ -453,6 +534,352 @@ if printf '%s' "$TTY_OUT" | grep -qi 'not a tty'; then
     ok "no pty is allocated when stdin is a pipe"
 else
     bad "a pty was allocated for piped stdin; the token could be echoed"
+fi
+
+# ===========================================================================
+step "7b. personal config carry-over, plugins, and the interactive subcommand"
+# ===========================================================================
+#
+# Everything staged in step 3d, checked from inside the guest. The plugin
+# install ran during provisioning, after the firewall came up, so it is also a
+# live test of the GitHub range rule.
+
+printf -- '--- python3 is present (the config sync and the plugin checks need it) ---\n'
+PY_OUT=$(guest python3 --version 2>&1)
+printf '%s\n' "$PY_OUT"
+if printf '%s' "$PY_OUT" | grep -qE 'Python 3\.[0-9]+'; then
+    ok "python3 is present in the guest"
+else
+    bad "python3 is not present in the guest"
+fi
+
+printf -- '\n--- the carried-over CLAUDE.md and governor.json ---\n'
+CARRY_OUT="${TMP_ROOT}/carry.out"
+guest bash -l > "$CARRY_OUT" 2>&1 <<'SH'
+echo "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR}"
+echo "--- CLAUDE.md ---"
+cat "${CLAUDE_CONFIG_DIR}/CLAUDE.md" 2>&1
+echo "--- listing ---"
+ls -A "${CLAUDE_CONFIG_DIR}" 2>&1
+echo "--- rules ---"
+ls -A "${CLAUDE_CONFIG_DIR}/rules" 2>&1
+echo "--- settings.json as installed ---"
+cat "${CLAUDE_CONFIG_DIR}/settings.json" 2>&1
+for f in governor.json rules/smoke.md; do
+    if [ -f "${CLAUDE_CONFIG_DIR}/${f}" ]; then echo "PRESENT ${f}"; else echo "MISSING ${f}"; fi
+done
+if [ -e "${CLAUDE_CONFIG_DIR}/.credentials.json" ]; then
+    echo "CRED-PRESENT"
+else
+    echo "CRED-ABSENT"
+fi
+SH
+cat "$CARRY_OUT"
+
+if grep -qF "$CLAUDE_MARKER" "$CARRY_OUT"; then
+    ok "the host CLAUDE.md was carried into the guest config directory"
+else
+    bad "the host CLAUDE.md did not reach the guest config directory"
+fi
+if grep -qx 'PRESENT governor.json' "$CARRY_OUT"; then
+    ok "governor.json was carried over"
+else
+    bad "governor.json was not carried over"
+fi
+if grep -qx 'PRESENT rules/smoke.md' "$CARRY_OUT"; then
+    ok "rules/*.md were carried over"
+else
+    bad "rules/*.md were not carried over"
+fi
+if grep -qx 'CRED-ABSENT' "$CARRY_OUT"; then
+    ok "the staged .credentials.json was NOT copied into the guest"
+else
+    bad "a .credentials.json reached the guest config directory"
+fi
+
+# settings.json crosses, but filtered. A name-based allowlist cannot see inside
+# a file, and this file's `env` block is a credential.
+if grep -q "\"${SETTINGS_HARMLESS_KEY}\"" "$CARRY_OUT"; then
+    ok "the harmless settings.json key survived the crossing"
+else
+    bad "the harmless settings.json key did not survive the crossing"
+fi
+if grep -q '"env"' "$CARRY_OUT"; then
+    bad "the settings.json env block reached the guest"
+else
+    ok "the settings.json env block did NOT reach the guest"
+fi
+if grep -q '"apiKeyHelper"' "$CARRY_OUT"; then
+    bad "the settings.json apiKeyHelper reached the guest"
+else
+    ok "the settings.json apiKeyHelper did NOT reach the guest"
+fi
+if grep -qF "$SETTINGS_FAKE_KEY" "$CARRY_OUT"; then
+    bad "the fake API key from settings.json reached the guest"
+else
+    ok "the fake API key from settings.json did NOT reach the guest"
+fi
+
+printf -- '\n--- the refusal and the stripping are logged, not silent ---\n'
+SYNC_OUT="${TMP_ROOT}/sync.out"
+guest /opt/agent-box/guest/sync-claude-config.sh > "$SYNC_OUT" 2>&1
+rc=$?
+cat "$SYNC_OUT"
+if [ "$rc" -eq 0 ]; then ok "sync-claude-config exited 0 on a second run (idempotent)"; else bad "sync-claude-config exited ${rc} on a second run"; fi
+if grep -q 'REFUSED .credentials.json' "$SYNC_OUT"; then
+    ok "the refusal of .credentials.json was reported"
+else
+    bad "the refusal of .credentials.json was not reported"
+fi
+if grep -q 'STRIPPED settings.json:env' "$SYNC_OUT" && grep -q 'STRIPPED settings.json:apiKeyHelper' "$SYNC_OUT"; then
+    ok "each stripped settings.json key was named"
+else
+    bad "the stripped settings.json keys were not named"
+fi
+
+printf -- '\n--- a settings.json edited inside the guest cannot smuggle a key past the precondition ---\n'
+# The filter above covers the file that crosses the mount. This covers the
+# other way in: a settings.json written directly inside the guest. Without the
+# check in lib.sh, `env.ANTHROPIC_API_KEY` would be injected by the CLI after
+# abx_assert_environment had already approved the shell environment, and the
+# run would bill an API account instead of the subscription. A token is planted
+# too, so the refusal cannot be the "no token" one.
+#
+# agent-run.sh is invoked directly rather than through `agentbox run`, because
+# the host command re-syncs the config first and would repair the poisoned file
+# before the guest ever saw it. Bypassing that is the point: the guard has to
+# hold on the file as it stands, not only on the file as the mount supplies it.
+POISON_OUT="${TMP_ROOT}/poisoned-settings.out"
+POISON_TOKEN="sk-ant-oat01-POISONHEADzzzzzzzzzzzzzzzzPOISONTAIL"
+guest bash -l <<SH
+umask 077
+printf '%s' '${POISON_TOKEN}' > "\$HOME/.config/agent-box/token"
+chmod 600 "\$HOME/.config/agent-box/token"
+cp "\${CLAUDE_CONFIG_DIR}/settings.json" /tmp/settings.json.smokebak
+printf '{"env":{"ANTHROPIC_API_KEY":"%s"}}\n' '${SETTINGS_FAKE_KEY}' > "\${CLAUDE_CONFIG_DIR}/settings.json"
+SH
+printf 'Do nothing.\n' | "$LIMACTL" shell --workdir /work "$INSTANCE" -- \
+    /opt/agent-box/guest/agent-run.sh --slug poison --brief - > "$POISON_OUT" 2>&1
+poison_rc=$?
+cat "$POISON_OUT"
+if [ "$poison_rc" -ne 0 ]; then
+    ok "agent-run refused while settings.json carried a credential"
+else
+    bad "agent-run proceeded with a credential-bearing settings.json"
+fi
+if [ -d "${CLEAN_REPO}/.agent-box" ] || git -C "$CLEAN_REPO" rev-parse --abbrev-ref HEAD 2>/dev/null | grep -q '^agent/poison'; then
+    bad "agent-run changed something before refusing over settings.json"
+else
+    ok "agent-run changed nothing before refusing over settings.json"
+fi
+if grep -q 'credential-bearing keys' "$POISON_OUT" && grep -q 'settings.json' "$POISON_OUT"; then
+    ok "the refusal named settings.json and the key"
+else
+    bad "the refusal did not name settings.json"
+fi
+if grep -qF "$SETTINGS_FAKE_KEY" "$POISON_OUT"; then
+    bad "the refusal echoed the key's value"
+else
+    ok "the refusal did not echo the key's value"
+fi
+# Put the guest back the way it was: the filtered settings.json, no token.
+# shellcheck disable=SC2016  # must expand in the guest, not on the host.
+guest bash -l -c 'mv -f /tmp/settings.json.smokebak "${CLAUDE_CONFIG_DIR}/settings.json"; rm -f "$HOME/.config/agent-box/token"'
+
+printf -- '\n--- /work is marked as a trusted folder ---\n'
+TRUST_OUT="${TMP_ROOT}/trust.out"
+guest bash -l > "$TRUST_OUT" 2>&1 <<'SH'
+jq -r --arg p /work '.projects[$p].hasTrustDialogAccepted' "${CLAUDE_CONFIG_DIR}/.claude.json"
+SH
+cat "$TRUST_OUT"
+if grep -qx 'true' "$TRUST_OUT"; then
+    ok 'projects["/work"].hasTrustDialogAccepted is true'
+else
+    bad 'projects["/work"].hasTrustDialogAccepted is not true'
+fi
+
+printf -- '\n--- DISABLE_AUTOUPDATER in the login environment ---\n'
+# shellcheck disable=SC2016  # must expand in the guest, not on the host.
+AU_OUT=$(guest bash -lc 'echo "DISABLE_AUTOUPDATER=${DISABLE_AUTOUPDATER:-<unset>}"' 2>&1)
+printf '%s\n' "$AU_OUT"
+if printf '%s' "$AU_OUT" | grep -qx 'DISABLE_AUTOUPDATER=1'; then
+    ok "DISABLE_AUTOUPDATER=1 in the login environment"
+else
+    bad "DISABLE_AUTOUPDATER is not 1 in the login environment"
+fi
+
+printf -- '\n--- agentbox plugins: the on-demand path, and whether it needs an account ---\n'
+PLUG_OUT="${TMP_ROOT}/plugins.out"
+run_bounded 300 "$PLUG_OUT" "$AGENTBOX" plugins "$CLEAN_REPO"
+plug_rc=$BOUNDED_RC
+cat "$PLUG_OUT"
+printf 'agentbox plugins exit status: %s\n' "$plug_rc"
+
+printf -- '\n--- claude plugin marketplace list / claude plugin list ---\n'
+PLIST_OUT="${TMP_ROOT}/plugin-list.out"
+MK_OUT="${TMP_ROOT}/marketplace-list.out"
+INST_OUT="${TMP_ROOT}/installed-list.out"
+guest bash -l > "$MK_OUT" 2>&1 <<'SH'
+claude plugin marketplace list 2>&1
+SH
+guest bash -l > "$INST_OUT" 2>&1 <<'SH'
+claude plugin list 2>&1
+SH
+{ printf -- '--- marketplaces ---\n'; cat "$MK_OUT"; printf -- '--- installed ---\n'; cat "$INST_OUT"; } | tee "$PLIST_OUT"
+
+# One of two things is true, and the point of the step is to record which.
+# Either an explicit CLI install works with no account in the VM, or it does
+# not and the documented fallback is what the operator sees.
+#
+# The installed check asserts the full identity, `governor@konyklabs-plugins`,
+# against the installed listing alone. A bare `governor` would also match the
+# marketplace listing, and a plugin of that name from some other marketplace.
+if grep -q "$MARKETPLACE_NAME" "$MK_OUT" && grep -q "${PLUGIN_UNDER_TEST}@${MARKETPLACE_NAME}" "$INST_OUT"; then
+    ok "PLUGIN PATH: install needs NO account — ${MARKETPLACE_NAME} is registered and ${PLUGIN_UNDER_TEST} is installed"
+    if [ "$plug_rc" -eq 0 ]; then
+        ok "agentbox plugins exited 0 on an already-satisfied plugins.txt"
+    else
+        bad "agentbox plugins exited ${plug_rc} although the plugin is installed"
+    fi
+    # Installed is not the same as usable. `claude plugin install` records the
+    # enable in settings.json, which is the very file the config sync carries
+    # over — so a sync that copied it wholesale would disable every plugin the
+    # guest had just installed, and the listing above would still say it was
+    # installed. That is the failure this line exists to catch.
+    if grep -q 'disabled' "$INST_OUT"; then
+        bad "${PLUGIN_UNDER_TEST} is installed but DISABLED — the config sync clobbered enabledPlugins"
+    else
+        ok "${PLUGIN_UNDER_TEST} survived the config sync still enabled"
+    fi
+elif [ "$plug_rc" -eq 4 ] && grep -q 'would not install plugins without an account' "$PLUG_OUT"; then
+    ok "PLUGIN PATH: install NEEDS an account — the documented fallback was printed and the exit status was 4"
+    if grep -q 'agentbox plugins <repo>' "$PLUG_OUT"; then
+        ok "the fallback names 'agentbox plugins' as the next step"
+    else
+        bad "the fallback does not name the next step"
+    fi
+else
+    bad "neither plugin path held: exit ${plug_rc}, and the listings show neither the marketplace nor the fallback"
+fi
+
+printf -- '\n--- a session-only plugin from the read-only config mount ---\n'
+DEMO_OUT="${TMP_ROOT}/demo-plugin.out"
+guest bash -l > "$DEMO_OUT" 2>&1 <<'SH'
+claude --plugin-dir /opt/agent-box-config/plugin-dir/demo plugin list 2>&1
+SH
+cat "$DEMO_OUT"
+# `demo@inline` is the identity the CLI prints for a --plugin-dir plugin, and
+# it prints it only under Session-only plugins. A bare `demo` would also match
+# the directory path in the `Path:` line, which the CLI prints whether or not
+# the plugin loaded.
+if grep -q 'demo@inline' "$DEMO_OUT"; then
+    ok "--plugin-dir loaded demo from the read-only host config mount"
+else
+    bad "--plugin-dir did not load demo"
+fi
+if grep -qE 'Status:.*(loaded|enabled)' "$DEMO_OUT"; then
+    ok "the CLI reported the session plugin as loaded, not merely listed"
+else
+    bad "the CLI did not report the session plugin as loaded"
+fi
+
+printf -- '\n--- agentbox claude refuses cleanly with no token ---\n'
+AC_OUT="${TMP_ROOT}/agentbox-claude.out"
+run_bounded 60 "$AC_OUT" "$AGENTBOX" claude "$CLEAN_REPO" --version
+ac_rc=$BOUNDED_RC
+cat "$AC_OUT"
+if [ "$ac_rc" -ne 0 ]; then ok "agentbox claude exited non-zero without a token"; else bad "agentbox claude exited 0 without a token"; fi
+if grep -q 'no token at' "$AC_OUT"; then
+    ok "agentbox claude named the missing token as the reason"
+else
+    bad "agentbox claude did not name the missing token"
+fi
+if grep -qi 'browser\|log in' "$AC_OUT"; then
+    bad "agentbox claude fell through to an interactive login"
+else
+    ok "agentbox claude did not fall through to an interactive login"
+fi
+
+printf -- '\n--- agentbox update reports a version either side of the update ---\n'
+UP_OUT="${TMP_ROOT}/update.out"
+run_bounded 300 "$UP_OUT" "$AGENTBOX" update "$CLEAN_REPO"
+up_rc=$BOUNDED_RC
+cat "$UP_OUT"
+if [ "$up_rc" -eq 0 ]; then ok "agentbox update exited 0"; else bad "agentbox update exited ${up_rc}"; fi
+if grep -qE '^agentbox: before: .*[0-9]+\.[0-9]+\.[0-9]+' "$UP_OUT" && grep -qE '^agentbox: after: +.*[0-9]+\.[0-9]+\.[0-9]+' "$UP_OUT"; then
+    ok "agentbox update printed the version before and after"
+else
+    bad "agentbox update did not print both versions"
+fi
+
+# ===========================================================================
+step "7c. install-plugins rejects a bad directive and bounds its CLI calls"
+# ===========================================================================
+#
+# Both paths need a plugins.txt other than the one on the read-only mount, so
+# they use AGENT_BOX_CONFIG_DIR to point the script at a writable directory in
+# the guest. Neither can be exercised on the host: the script needs bash 4's
+# mapfile and coreutils `timeout`, and this Mac has bash 3.2 and neither.
+
+printf -- '--- a directive argument that starts with a dash is refused ---\n'
+DASH_OUT="${TMP_ROOT}/plugins-dash.out"
+guest bash -l > "$DASH_OUT" 2>&1 <<'SH'
+rm -rf /tmp/abx-badcfg
+mkdir -p /tmp/abx-badcfg
+printf 'marketplace --help\n' > /tmp/abx-badcfg/plugins.txt
+AGENT_BOX_CONFIG_DIR=/tmp/abx-badcfg /opt/agent-box/guest/install-plugins.sh
+echo "RC=$?"
+SH
+cat "$DASH_OUT"
+guest sh -c 'rm -rf /tmp/abx-badcfg'
+if grep -q 'RC=2' "$DASH_OUT"; then
+    ok "a malformed directive exited 2"
+else
+    bad "a malformed directive did not exit 2"
+fi
+if grep -q "must not start with '-'" "$DASH_OUT"; then
+    ok "a leading-dash argument was refused by name"
+else
+    bad "a leading-dash argument was not refused"
+fi
+if grep -q 'marketplace add --help: ok' "$DASH_OUT"; then
+    bad "the CLI was invoked with the dash argument as a flag"
+else
+    ok "the CLI was never invoked with the dash argument"
+fi
+
+printf -- '\n--- a CLI call that never answers is bounded and reported as unreachable ---\n'
+# A stub `claude` that hangs, reached through a temporary HOME because the
+# script prepends "$HOME/.local/bin" to PATH. This reproduces the shape of an
+# unresponsive marketplace exactly, with no dependency on the network being
+# broken at the time.
+HANG_OUT="${TMP_ROOT}/plugins-hang.out"
+run_bounded 90 "$HANG_OUT" "$LIMACTL" shell --workdir /work "$INSTANCE" -- bash -l -c '
+rm -rf /tmp/abx-hang
+mkdir -p /tmp/abx-hang/.local/bin /tmp/abx-hang/cfg
+printf "#!/bin/sh\nsleep 300\n" > /tmp/abx-hang/.local/bin/claude
+chmod +x /tmp/abx-hang/.local/bin/claude
+printf "marketplace someone/never-answers\n" > /tmp/abx-hang/cfg/plugins.txt
+HOME=/tmp/abx-hang AGENT_BOX_CONFIG_DIR=/tmp/abx-hang/cfg ABX_CLI_TIMEOUT=3 \
+    /opt/agent-box/guest/install-plugins.sh
+echo "RC=$?"
+'
+cat "$HANG_OUT"
+guest sh -c 'rm -rf /tmp/abx-hang'
+if grep -q 'RC=5' "$HANG_OUT"; then
+    ok "an unanswering CLI call exited 5, the unreachable-marketplace status"
+else
+    bad "an unanswering CLI call did not exit 5"
+fi
+if grep -q 'the marketplace is unreachable' "$HANG_OUT"; then
+    ok "the timeout was reported as an unreachable marketplace"
+else
+    bad "the timeout was not reported as an unreachable marketplace"
+fi
+if grep -q 'firewall-check' "$HANG_OUT"; then
+    ok "the unreachable message names the next thing to run"
+else
+    bad "the unreachable message does not name a next step"
 fi
 
 # ===========================================================================

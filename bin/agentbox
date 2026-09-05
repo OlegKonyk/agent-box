@@ -32,8 +32,11 @@ usage: ${PROG} <command> [args]
   start <repo>                      preflight, then start an existing VM
   token <repo>                      read an OAuth token from the terminal into the VM
   verify-auth <repo>                prove the token authenticates, with a real model call
+  claude <repo> [claude args...]    interactive Claude Code in the VM, in /work
   shell <repo>                      interactive shell in the VM, in /work
   run <repo> <brief.md> [--model M] run one headless task; default model: sonnet
+  plugins <repo> [--update]         apply plugins.txt inside the VM
+  update <repo>                     update Claude Code inside the VM
   stop <repo|name>                  stop the VM
   destroy <repo|name>               stop and delete the VM
   status                            list all Lima instances
@@ -48,6 +51,9 @@ Host-side configuration, never copied into this repository.
 Mounted read-only into the VM at /opt/agent-box-config:
   ${HOST_GUEST_CONFIG_DIR}/allowlist.local   extra egress domains, one per line
   ${HOST_GUEST_CONFIG_DIR}/ca.pem            corporate TLS-intercept root, if any
+  ${HOST_GUEST_CONFIG_DIR}/plugins.txt       marketplaces and plugins to install
+  ${HOST_GUEST_CONFIG_DIR}/plugin-dir/<name> plugin roots loaded per session
+  ${HOST_GUEST_CONFIG_DIR}/claude/           CLAUDE.md, settings.json, governor.json, rules/
 
 Read on this host only, never mounted, never visible to the agent:
   ${HOST_CONFIG_DIR}/blocklist.txt     literal terms preflight looks for
@@ -128,7 +134,10 @@ ensure_host_config_dir() {
     local n=0
     [ -f "${HOST_GUEST_CONFIG_DIR}/allowlist.local" ] && { info "allowlist.local will be mounted read-only"; n=1; }
     [ -f "${HOST_GUEST_CONFIG_DIR}/ca.pem" ]          && { info "ca.pem will be mounted read-only"; n=1; }
-    [ "$n" -eq 1 ] || info "no allowlist.local or ca.pem in ${HOST_GUEST_CONFIG_DIR} (that is fine)"
+    [ -f "${HOST_GUEST_CONFIG_DIR}/plugins.txt" ]     && { info "plugins.txt will be applied inside the VM"; n=1; }
+    [ -d "${HOST_GUEST_CONFIG_DIR}/claude" ]          && { info "claude/ will be synced into the guest config dir (allowlisted names only)"; n=1; }
+    [ -d "${HOST_GUEST_CONFIG_DIR}/plugin-dir" ]      && { info "plugin-dir/ will be loaded per session with --plugin-dir"; n=1; }
+    [ "$n" -eq 1 ] || info "no allowlist.local, ca.pem, plugins.txt, claude/ or plugin-dir/ in ${HOST_GUEST_CONFIG_DIR} (that is fine)"
 
     # The term list must never be inside the mounted directory.
     if [ -f "${HOST_GUEST_CONFIG_DIR}/blocklist.txt" ]; then
@@ -152,6 +161,17 @@ exclude_from_backup() {
 guest_shell() {
     local inst="$1"; shift
     "$LIMACTL" shell --workdir /work "$inst" -- "$@"
+}
+
+# Carry the allowlisted personal config files across and mark /work trusted.
+# Cheap and idempotent by design, so it runs before every launch rather than
+# only at create time: a CLAUDE.md edited on the host is then in effect on the
+# next command instead of on the next VM. Never fatal — a config that did not
+# sync is a reason to say so, not a reason to refuse to open a shell.
+sync_guest_config() {
+    local inst="$1"
+    guest_shell "$inst" /opt/agent-box/guest/sync-claude-config.sh --quiet \
+        || info "NOTE: syncing the Claude Code config into ${inst} reported a problem (see above)"
 }
 
 # ---------------------------------------------------------------------------
@@ -208,6 +228,7 @@ cmd_start() {
     run_preflight "$repo" || die "preflight failed; refusing to start ${inst}"
     ensure_host_config_dir
     "$LIMACTL" start --yes "$inst"
+    sync_guest_config "$inst"
 }
 
 cmd_token() {
@@ -249,12 +270,34 @@ EOF
         info "token stored in the guest at ~/.config/agent-box/token (mode 600)"
         # shellcheck disable=SC2016  # $HOME and awk's $1 must expand in the guest.
         guest_shell "$inst" sh -c 'ls -l "$HOME/.config/agent-box/token" | awk "{print \$1, \$3, \$9}"'
+        offer_plugins_after_token "$repo" "$inst"
         info "now run: ${PROG} verify-auth ${repo}"
     else
         token=""
         unset token
         die "failed to write the token into ${inst}"
     fi
+}
+
+# Provisioning installs plugins before a token exists, so if the CLI ever
+# refuses to install without an account, this is the moment the missing piece
+# can be supplied — and asking beats printing an instruction that gets scrolled
+# past. Only asked when there is a plugins.txt to apply and a terminal to
+# answer on.
+offer_plugins_after_token() {
+    local repo="$1" inst="$2" reply=""
+    [ -f "${HOST_GUEST_CONFIG_DIR}/plugins.txt" ] || return 0
+    [ -t 0 ] || return 0
+
+    printf '%s: %s has a plugins.txt. Apply it now? [Y/n] ' "$PROG" "$HOST_GUEST_CONFIG_DIR"
+    IFS= read -r reply < /dev/tty || reply="n"
+    case "$reply" in
+        ""|[Yy]|[Yy][Ee][Ss])
+            guest_shell "$inst" /opt/agent-box/guest/install-plugins.sh \
+                || info "plugin install reported a problem; re-run with '${PROG} plugins ${repo}'"
+            ;;
+        *) info "skipped; run '${PROG} plugins ${repo}' when you want it" ;;
+    esac
 }
 
 cmd_verify_auth() {
@@ -271,6 +314,13 @@ cmd_verify_auth() {
     inst=$(instance_name "$repo")
     require_limactl
     require_instance "$inst"
+    # The same sync every other launch path does. verify-auth goes out of its
+    # way to load the same session plugins a real run gets, for the reason its
+    # own comment gives: verifying against a different environment proves the
+    # wrong thing. That applies just as much to CLAUDE.md, settings.json and
+    # rules — without this it would be checking whatever the last command
+    # happened to leave behind.
+    sync_guest_config "$inst"
     guest_shell "$inst" /opt/agent-box/guest/verify-auth.sh "$model"
 }
 
@@ -280,7 +330,71 @@ cmd_shell() {
     inst=$(instance_name "$repo")
     require_limactl
     require_instance "$inst"
+    sync_guest_config "$inst"
     exec "$LIMACTL" shell --workdir /work "$inst"
+}
+
+# The interactive half of the box. `run` is the headless half: it branches,
+# keeps the transcript inside the VM, scrubs the summary and checks it for
+# token fragments. This one hands the terminal to the CLI, so none of that
+# applies — what appears on screen is whatever the session prints. That is the
+# trade being made deliberately; docs/decisions.md states it.
+cmd_claude() {
+    local repo inst
+    repo=$(abs_repo "${1:?usage: ${PROG} claude <repo> [claude args...]}")
+    shift
+    inst=$(instance_name "$repo")
+    require_limactl
+    require_instance "$inst"
+    sync_guest_config "$inst"
+    exec "$LIMACTL" shell --workdir /work "$inst" -- \
+        /opt/agent-box/guest/claude-session.sh "$@"
+}
+
+cmd_plugins() {
+    local repo inst update=""
+    repo=$(abs_repo "${1:?usage: ${PROG} plugins <repo> [--update]}")
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --update) update="--update"; shift ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    inst=$(instance_name "$repo")
+    require_limactl
+    require_instance "$inst"
+
+    if [ ! -f "${HOST_GUEST_CONFIG_DIR}/plugins.txt" ]; then
+        info "no ${HOST_GUEST_CONFIG_DIR}/plugins.txt; nothing to install"
+        info "write one with 'marketplace <owner/repo>' and 'install <plugin@marketplace>' lines. See docs/daily-use.md."
+        return 0
+    fi
+
+    if [ -n "$update" ]; then
+        guest_shell "$inst" /opt/agent-box/guest/install-plugins.sh "$update"
+    else
+        guest_shell "$inst" /opt/agent-box/guest/install-plugins.sh
+    fi
+}
+
+cmd_update() {
+    local repo inst before after
+    repo=$(abs_repo "${1:?usage: ${PROG} update <repo>}")
+    inst=$(instance_name "$repo")
+    require_limactl
+    require_instance "$inst"
+
+    # A login shell: the native installer puts claude in ~/.local/bin, which
+    # /etc/profile.d/agent-box.sh adds to PATH.
+    before=$("$LIMACTL" shell --workdir /work "$inst" -- bash -lc 'claude --version' 2>&1 || true)
+    info "before: ${before}"
+    "$LIMACTL" shell --workdir /work "$inst" -- bash -lc 'claude update'
+    after=$("$LIMACTL" shell --workdir /work "$inst" -- bash -lc 'claude --version' 2>&1 || true)
+    info "after:  ${after}"
+    if [ "$before" = "$after" ]; then
+        info "no version change"
+    fi
 }
 
 cmd_run() {
@@ -303,6 +417,7 @@ cmd_run() {
 
     slug=$(basename "$brief"); slug="${slug%.*}"
 
+    sync_guest_config "$inst"
     info "running ${slug} in ${inst} on model ${model}"
     # The brief goes in on stdin, so it needs no path the guest can see.
     "$LIMACTL" shell --workdir /work "$inst" -- \
@@ -354,8 +469,11 @@ case "${1:-}" in
     start)          shift; cmd_start "$@" ;;
     token)          shift; cmd_token "$@" ;;
     verify-auth)    shift; cmd_verify_auth "$@" ;;
+    claude)         shift; cmd_claude "$@" ;;
     shell)          shift; cmd_shell "$@" ;;
     run)            shift; cmd_run "$@" ;;
+    plugins)        shift; cmd_plugins "$@" ;;
+    update)         shift; cmd_update "$@" ;;
     stop)           shift; cmd_stop "$@" ;;
     destroy)        shift; cmd_destroy "$@" ;;
     status)         shift; cmd_status "$@" ;;

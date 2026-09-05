@@ -9,7 +9,8 @@
 # shell, so "run `agentbox shell` and then `claude -p ...`" does not work: the
 # CLI finds no credential and asks the user to log in through a browser the VM
 # does not have. This script is that test, done properly — the export and the
-# call in one process.
+# call in one process. (`agentbox claude` is the other way to get an
+# authenticated session, and it takes its preconditions from the same lib.sh.)
 #
 # Prints pass or fail and the model's reply. The token is never printed, and
 # the CLI's own output is scrubbed of the token's head and tail before it is
@@ -17,53 +18,40 @@
 
 set -uo pipefail
 
-TOKEN_FILE="${HOME}/.config/agent-box/token"
 MODEL="${1:-haiku}"
-
-export PATH="${HOME}/.local/bin:${PATH}"
 
 die() { printf 'verify-auth: FAIL — %s\n' "$*" >&2; exit 1; }
 
-[ "$(id -u)" -ne 0 ] || die "must not run as root"
-[ -f "$TOKEN_FILE" ] || die "no token at ${TOKEN_FILE}. Run 'agentbox token <repo>' on the host first."
+ABX_LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=guest/lib.sh
+. "${ABX_LIB_DIR}/lib.sh"
 
-token_mode=$(stat -c '%a' "$TOKEN_FILE")
-[ "$token_mode" = "600" ] || die "${TOKEN_FILE} has mode ${token_mode}; expected 600"
+# `warn`: this command exists to diagnose a broken box, and refusing to
+# diagnose because the box is broken helps nobody. agent-run and claude-session
+# pass `die` here instead.
+abx_assert_environment warn
 
-[ -z "${ANTHROPIC_API_KEY:-}" ]   || die "ANTHROPIC_API_KEY is set; it would silently override the subscription token"
-[ -z "${ANTHROPIC_AUTH_TOKEN:-}" ] || die "ANTHROPIC_AUTH_TOKEN is set; it would silently override the subscription token"
+# The same session-only plugin roots a real session gets. Verifying auth with a
+# different plugin set than the one that will actually run would prove the
+# wrong thing, and a hook that fails to load is worth seeing here first.
+PLUGIN_ARGS=()
+mapfile -t PLUGIN_ARGS < <(abx_plugin_dir_args)
+abx_report_plugin_dirs "${PLUGIN_ARGS[@]}"
 
-command -v claude >/dev/null 2>&1 || die "claude is not on PATH"
-
-if ! systemctl is-active --quiet agent-box-firewall.service; then
-    printf 'verify-auth: WARNING — the egress firewall is not active\n' >&2
-fi
-
-CLAUDE_CODE_OAUTH_TOKEN=$(cat "$TOKEN_FILE")
-export CLAUDE_CODE_OAUTH_TOKEN
-
-# Everything this script prints goes to the host's terminal and its scrollback,
-# which is the one channel the whole design exists to keep clean. The CLI's
-# stderr is folded into OUT below, so before anything is printed the token's
-# recognisable head and tail are removed from it. Neither variable is printed.
-TOK_HEAD="${CLAUDE_CODE_OAUTH_TOKEN:0:8}"
-TOK_TAIL="${CLAUDE_CODE_OAUTH_TOKEN: -8}"
+abx_export_token
 
 printf 'verify-auth: asking %s for a one-word reply...\n' "$MODEL"
 
-OUT=$(claude -p --model "$MODEL" 'reply with the single word OK' 2>&1)
+OUT=$(claude "${PLUGIN_ARGS[@]}" -p --model "$MODEL" 'reply with the single word OK' 2>&1)
 RC=$?
 
-unset CLAUDE_CODE_OAUTH_TOKEN
+abx_forget_token
 
-# Bash literal substitution, not sed. Building a sed expression out of token
-# text treats it as a regex AND as a delimiter: a single slash in the fragment
-# makes sed abort with a message quoting the offending expression, which prints
-# the fragment unredacted, empties SAFE_OUT, loses the diagnostic, and turns a
-# successful authentication into a FAIL. Quoting the pattern inside
-# ${var//pat/rep} makes it literal, needs no escaping, and costs no subprocess.
-SAFE_OUT="${OUT//"$TOK_HEAD"/<redacted>}"
-SAFE_OUT="${SAFE_OUT//"$TOK_TAIL"/<redacted>}"
+# Everything this script prints goes to the host's terminal and its scrollback,
+# which is the one channel the whole design exists to keep clean. The CLI's
+# stderr is folded into OUT above, so nothing is printed before the token's
+# recognisable head and tail have been removed from it.
+SAFE_OUT=$(abx_scrub_token "$OUT")
 
 if [ "$RC" -ne 0 ]; then
     printf 'verify-auth: FAIL — claude exited %d\n' "$RC" >&2

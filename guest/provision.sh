@@ -171,6 +171,12 @@ fi
 {
     printf '%s\n' "$ENV_MARKER"
     printf 'CLAUDE_CONFIG_DIR=%s/.claude\n' "$BOX_HOME"
+    # No background self-update. An update is a new binary arriving over the
+    # network in the middle of a run, quietly changing the thing under test,
+    # and if the download were ever blocked the first symptom would be a slow
+    # start nobody can account for. `agentbox update <repo>` does it on
+    # purpose instead; `claude update` by hand still works.
+    printf 'DISABLE_AUTOUPDATER=1\n'
     [ -n "$NODE_CA_LINE" ] && printf '%s\n' "$NODE_CA_LINE"
 } >> /etc/environment
 
@@ -180,6 +186,7 @@ export PATH="\$HOME/.local/bin:\$PATH"
 export CLAUDE_CONFIG_DIR="${BOX_HOME}/.claude"
 export DISABLE_TELEMETRY=1
 export DISABLE_ERROR_REPORTING=1
+export DISABLE_AUTOUPDATER=1
 EOF
 [ -n "$NODE_CA_LINE" ] && printf 'export %s\n' "$NODE_CA_LINE" >> /etc/profile.d/agent-box.sh
 chmod 0644 /etc/profile.d/agent-box.sh
@@ -284,5 +291,36 @@ log "Enabling the egress firewall"
 systemctl enable "$FIREWALL_UNIT"
 systemctl restart "$FIREWALL_UNIT"
 systemctl enable --now agent-box-firewall.timer
+
+# ---------------------------------------------------------------------------
+# 6. Personal configuration and plugins, as the guest user, under the firewall
+# ---------------------------------------------------------------------------
+#
+# Both steps run AFTER the firewall is back up, deliberately. The plugin
+# install pulls from GitHub, which the allowlist permits through the ranges
+# fetched from api.github.com/meta, so this is also a live test of that rule on
+# every first boot: if the GitHub range rule ever breaks, the install says so
+# here rather than the next time someone needs it.
+#
+# Neither is allowed to fail the boot. The isolation properties — the mounts,
+# the firewall, the non-root user, the token handling — do not depend on either
+# one, and a VM that will not start because a marketplace was unreachable is
+# worse than a VM without a plugin.
+
+# A login shell, so /etc/profile.d/agent-box.sh (written above) supplies PATH
+# and CLAUDE_CONFIG_DIR. The arguments go through as arguments rather than
+# being pasted into the command string, so nothing here depends on the paths
+# being free of shell metacharacters.
+run_as_box_user() {
+    sudo -u "$BOX_USER" -H bash -lc 'exec "$@"' bash "$@"
+}
+
+log "Syncing personal Claude Code configuration from the host config mount"
+run_as_box_user "${BOX_DIR}/guest/sync-claude-config.sh" \
+    || log "WARN: sync-claude-config.sh exited non-zero; continuing"
+
+log "Installing plugins listed in ${CONFIG_DIR}/plugins.txt, if any"
+run_as_box_user "${BOX_DIR}/guest/install-plugins.sh" \
+    || log "WARN: install-plugins.sh exited non-zero; run 'agentbox plugins <repo>' after 'agentbox token <repo>'"
 
 log "Provisioning complete"

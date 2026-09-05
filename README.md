@@ -42,8 +42,11 @@ One instance per repository, named `agent-box-<repo basename>`.
 | `agentbox start <repo>` | Preflight, then start an existing VM. |
 | `agentbox token <repo>` | Read an OAuth token from the terminal into the VM. Never echoed, never stored on the host. |
 | `agentbox verify-auth <repo>` | Prove the token authenticates, with one real model call. |
+| `agentbox claude <repo> [args]` | Interactive Claude Code in the VM, in `/work`. Arguments pass through to the CLI. |
 | `agentbox shell <repo>` | Interactive shell in the VM, in `/work`. |
 | `agentbox run <repo> <brief.md> [--model M]` | Run one headless task from a brief. Default model `sonnet`. |
+| `agentbox plugins <repo> [--update]` | Apply `plugins.txt` inside the VM. |
+| `agentbox update <repo>` | Update Claude Code inside the VM, printing the version before and after. |
 | `agentbox stop <repo\|name>` | Stop the VM. |
 | `agentbox destroy <repo\|name>` | Stop and delete the VM, and remind you to revoke the token. |
 | `agentbox status` | List all Lima instances. |
@@ -60,25 +63,43 @@ lima/agent-box.yaml     the VM: three mounts (two read-only), no home directory
 guest/provision.sh      first-boot setup, as root
 guest/init-firewall.sh  the egress allowlist, as root, on a 15-minute timer
 guest/allowlist.base    generic allowed domains, one per line
+guest/lib.sh            the preconditions and token handling the next three share
 guest/agent-run.sh      one headless task, as the non-root guest user
+guest/claude-session.sh one interactive session, as the non-root guest user
 guest/verify-auth.sh    one small model call, to prove the token works
+guest/sync-claude-config.sh  carry named config files in; mark /work trusted
+guest/install-plugins.sh     apply plugins.txt inside the guest
 host/preflight.sh       repository scan; reports paths only, never contents
 templates/brief.md      the task brief to copy and fill in
 test/smoke.sh           builds a real VM, checks it, destroys it
 docs/first-run.md       sign-off, token, daily loop, decommissioning
+docs/daily-use.md       the two modes, config carry-over, plugins, the friction
 docs/decisions.md       why it is built this way, and what was rejected
 ```
 
 Anything specific to where you work lives in `~/.config/agent-box/`, never in
 this repository. It is split in two on purpose:
 
-- `~/.config/agent-box/guest/` holds `allowlist.local` and `ca.pem`, and is
-  mounted read-only into the VM at `/opt/agent-box-config`.
+```
+~/.config/agent-box/
+  blocklist.txt              read on the host only, NEVER mounted
+  guest/                     mounted read-only at /opt/agent-box-config
+    allowlist.local          extra egress domains, one per line
+    ca.pem                   corporate TLS-intercept root, if any
+    plugins.txt              marketplaces to register, plugins to install
+    plugin-dir/<name>/       plugin roots loaded per session, not installed
+    claude/                  CLAUDE.md, settings.json, governor.json, rules/
+```
+
+- `~/.config/agent-box/guest/` is mounted read-only into the VM at
+  `/opt/agent-box-config`.
 - `~/.config/agent-box/blocklist.txt` holds the terms that must never leave. It
   is read on the host only and is **never** mounted, because it is the one file
   whose contents an agent must not see.
 
 Both distinctions are deliberate: see [docs/decisions.md](docs/decisions.md).
+What of `claude/` crosses into the guest, and what is refused, is in
+[docs/daily-use.md](docs/daily-use.md).
 
 ## What this is not
 
