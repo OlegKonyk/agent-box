@@ -49,8 +49,9 @@ TEXT_LIMIT = 160
 DETAIL_LIMIT = 120
 
 # System events the CLI emits for its own bookkeeping, several per turn, that
-# tell an operator nothing: token-count estimates while the model thinks.
-NOISY_SYSTEM_SUBTYPES = frozenset({"thinking_tokens"})
+# tell an operator nothing: token-count estimates while the model thinks,
+# and the start and progress pings of its own background tasks.
+NOISY_SYSTEM_SUBTYPES = frozenset({"thinking_tokens", "task_started", "task_notification"})
 
 # Hook events that say something the stream does not. PreToolUse and
 # PostToolUse are left out on purpose: the stream already carries the tool call
