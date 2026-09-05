@@ -1,40 +1,40 @@
 # First run
 
-Follow this once, in order. Steps 1 and 2 happen away from the work machine.
+Follow this once, in order. Steps 1 and 2 do not need the host at all.
 
 ---
 
-## 1. Get sign-off first
+## 1. Before you point it at code you do not own
 
-This puts a personal subscription to work on employer time, on employer
-hardware. Ask before, not after. Send something like this to your manager and
-whoever owns security, and keep the reply.
+Get permission first, in writing, from whoever owns the repository and the
+data in it. This tool cannot do that for you. Send something like this and
+keep the reply.
 
-> I would like to use my personal Claude Max subscription to run an AI coding
-> agent against `<repository>`, a generic end-to-end test repository that
-> contains no customer data, no production configuration and no credentials.
+> I would like to run an AI coding agent, under my own Claude subscription,
+> against `<repository>`, a generic end-to-end test repository that contains
+> no customer data, no production configuration and no credentials.
 >
-> It runs inside a disposable Linux virtual machine on my work laptop. The VM
-> can see that one repository and nothing else on the machine — not my home
-> directory, not other projects. Its outbound network is deny-by-default with a
-> short allowlist.
+> It runs inside a disposable Linux virtual machine on my machine. The VM can
+> see that one repository and nothing else — not my home directory, not other
+> projects. Its outbound network is deny-by-default with a short allowlist.
 >
-> The work is processed under my personal subscription, not a company account.
-> The agent never pushes: I review every change and push it myself under my own
-> identity.
+> The agent never pushes: I review every change and push it myself under my
+> own identity.
 >
 > Please confirm this is acceptable, or tell me what would make it acceptable.
 
 If the answer is no, stop. Nothing below makes it a yes.
 
-## 2. On your personal machine: privacy setting, then mint the token
+## 2. Turn off training on this account, then mint the token
 
-Do this on the personal Mac, not the work one.
+Any Claude subscription works — Pro, Max, Team or Enterprise — via
+`claude setup-token`. Do this on any machine where you are logged in to
+Claude; it does not need to be the host that will run the VM.
 
 1. Go to claude.ai → Settings → Privacy and turn **"Help improve Claude"**
    **off**. Do this *before* minting the token. It governs whether your
    conversations may be used for model training, and you are about to point
-   this account at a work repository.
+   this account at a repository that is not your own.
 
 2. Mint the token:
 
@@ -47,7 +47,7 @@ Do this on the personal Mac, not the work one.
 
 Keep it in your password manager, not in a file, not in a note, not in a chat.
 
-## 3. On the work machine: set up the box
+## 3. On the host: set up the box
 
 ```
 brew install lima gitleaks
@@ -76,12 +76,13 @@ api-staging.example.internal
 ```
 
 **`~/.config/agent-box/blocklist.txt`** — literal terms that must never leave,
-one per line. Note the path: this one lives in the **parent** directory, not in
-`guest/`, and it is never mounted into the VM. It is the list of the very terms
-you are trying to keep out of a model's context, so it is read on this machine
-only. `agentbox create` refuses to start if it finds this file inside `guest/`. Product codenames, internal service names, anything that
-identifies the employer. `agentbox preflight` scans every repository for these
-before it is mounted and reports **paths only**, never the term itself.
+one per line: names, hostnames or codenames you never want a model to see.
+Note the path: this one lives in the **parent** directory, not in `guest/`,
+and it is never mounted into the VM. It is the list of the very terms you are
+trying to keep out of a model's context, so it is read on this machine only.
+`agentbox create` refuses to start if it finds this file inside `guest/`.
+`agentbox preflight` scans every repository for these before it is mounted and
+reports **paths only**, never the term itself.
 
 **`~/.config/agent-box/guest/plugins.txt`** — optional. Marketplaces to register
 and plugins to install inside the VM, one directive per line, `#` for comments.
@@ -132,8 +133,8 @@ cd ~/dev/agent-box
 image. Subsequent instances reuse the cached image.
 
 The token goes straight from your terminal into the VM. It is never written to
-a file on the work machine, never passed as a command-line argument, and never
-put in the environment.
+a file on the host, never passed as a command-line argument, and never put in
+the environment.
 
 ## 4. Confirm it actually works
 
@@ -157,8 +158,8 @@ If it fails, in this order:
 2. `./bin/agentbox firewall-check ~/dev/my-e2e-tests` — every line must say
    PASS. A failing `anthropic-allowed` line means the egress rules, not the
    token.
-3. Check whether your employer applies managed Claude Code settings that
-   restrict which accounts may sign in on the device.
+3. Check whether a managed Claude Code configuration on this device restricts
+   which accounts may sign in.
 
 To look around inside the VM for any other reason:
 
@@ -186,7 +187,7 @@ The full JSON transcript of each run stays **inside the VM**, under
 `<repo>/.agent-box/last-run.txt`, excluded through the repository's
 `.git/info/exclude` rather than its tracked `.gitignore`. That split is
 deliberate: the transcript is the model's own output, and the model's input is
-the repository, so it does not belong on the work machine's disk. See
+the repository, so it does not belong on the host's disk. See
 `docs/decisions.md`.
 
 After every run the transcript, `git status` and both diffs are checked for
@@ -195,10 +196,10 @@ you should rotate the token immediately.
 
 ## 6. Quota
 
-The token draws on the **same** five-hour and weekly Max limits as your personal
-machine. A long unattended run in the VM is a run you cannot do at home that
-evening. Default to `sonnet`, which is what `agentbox run` uses unless told
-otherwise, and reach for a larger model deliberately.
+The token draws on the **same** five-hour and weekly limits as any other device
+signed in to your account. A long unattended run in the VM is a run you cannot
+do elsewhere that evening. Default to `sonnet`, which is what `agentbox run`
+uses unless told otherwise, and reach for a larger model deliberately.
 
 ## 7. Decommissioning and rotation
 
@@ -235,9 +236,9 @@ reasons to try the setup before you depend on it.
 - **A TLS-intercepting proxy** will break the VM's HTTPS until you supply
   `ca.pem` (step 3). The symptom is certificate errors from `curl` and from
   `claude` inside the guest.
-- **Employer-managed Claude Code settings** can restrict which accounts may
-  sign in on a device. If they apply to the whole machine rather than to an
-  installed copy of the CLI, they may reach into the VM too.
+- **A managed Claude Code configuration** can restrict which accounts may sign
+  in on a device. If it applies to the whole machine rather than to an
+  installed copy of the CLI, it may reach into the VM too.
 - **Telemetry hosts are not on the allowlist.** `DISABLE_TELEMETRY=1` and
   `DISABLE_ERROR_REPORTING=1` are set in the guest, so nothing should try to
   reach them. If a future version of the CLI needs a host that is blocked, the
