@@ -241,8 +241,9 @@ cmd_token() {
     [ -t 0 ] || die "refusing to read a token from a pipe; run this from a terminal"
 
     cat <<'EOF'
-Paste the token from `claude setup-token` (run on your personal machine).
-It is not echoed, is not stored on this host, and is not passed as an argument.
+Paste the token from `claude setup-token` (run on any machine where you are
+logged in to Claude). It is not echoed, is not stored on this host, and is
+not passed as an argument.
 EOF
     local token=""
     # `|| die`: read returns non-zero on EOF, and under `set -e` a bare Ctrl-D

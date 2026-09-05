@@ -4,15 +4,36 @@ Why this is built the way it is, and what was rejected. Each entry names the
 thing it is protecting against, because a control whose threat is forgotten
 gets removed by the next person who finds it inconvenient.
 
+## Why the premise is an unattended agent, not a particular user
+
+The isolation this project builds — one mounted repository, one token,
+default-deny egress, no push — was worked out against a single scenario:
+running an agent against a repository under a personal subscription. Nothing
+in the actual design depends on who owns the machine or why the token is
+personal, though. It depends on one thing: an agent is being allowed to run
+without someone watching every action it takes, which is what turns an
+ordinary mistake or a prompt injection into something expensive rather than
+merely embarrassing.
+
+So the premise is stated as the general case rather than the scenario it was
+first built for. Whoever is running this — against their own project, a
+client's repository, or code someone else owns — needs the same two
+boundaries: the agent must not reach anything beyond the one thing it was
+given, and whatever token it authenticates with must not be visible to what it
+writes. Tying the tool to one relationship between operator and code owner
+would have meant re-deriving the same guarantees for every other one; stating
+the premise as "an unattended agent" instead means the isolation it earns does
+not depend on the reason you needed it.
+
 ## The two directions of isolation
 
 Everything below serves one of two goals, and it is worth being explicit about
 which, because they pull in different directions:
 
 - **Outward.** The agent must not see the host. Not other repositories, not
-  the host's SSH keys, not browser profiles, not the corporate filesystem.
-- **Inward.** A personal subscription token must not end up on a
-  work-managed machine's disk, in its backups, or in its logs.
+  the host's SSH keys, not browser profiles, not the rest of its filesystem.
+- **Inward.** A subscription token must not end up on the host's disk, in its
+  backups, or in its logs.
 
 A control that only serves one of these is not enough on its own.
 
@@ -99,9 +120,9 @@ safe.
 The rules could live on the host — a packet filter rule per VM interface, or a
 proxy the guest is forced through. Both were rejected:
 
-- Host-level packet filtering on a work-managed Mac means changing a
-  configuration the employer owns. That is exactly the sort of change this
-  project exists to avoid needing.
+- Host-level packet filtering means changing a system-level configuration on
+  the host itself, which may not even be yours to change. That is exactly the
+  sort of change this project exists to avoid needing.
 - A proxy has to terminate TLS to filter by hostname, which means minting a CA
   and trusting it in the guest — building the very interception this setup
   otherwise treats as a hazard.
@@ -136,7 +157,7 @@ Two smaller choices inside it:
 They are the three files whose contents are specific to wherever this is being
 used: which internal hosts the app under test needs, which terms must never
 leave, and which corporate root signs intercepted TLS. Each is a small
-description of an employer's environment.
+description of the environment it runs in.
 
 They live in `~/.config/agent-box/` on the host, and the `guest/` subdirectory
 of it — containing `allowlist.local` and `ca.pem`, and nothing else — is mounted
@@ -144,9 +165,9 @@ read-only into the guest at `/opt/agent-box-config`. It is a mount, not a copy,
 and that distinction is the whole point.
 
 **The split into a subdirectory is not tidiness.** `blocklist.txt` stays in the
-parent, unmounted. It is the literal list of employer-identifying terms, so it
+parent, unmounted. It is the literal list of terms that must never leave, so it
 is the single file in this project that most needs to stay out of a VM which
-talks to a model under a personal subscription. Mounting the whole config
+talks to a model under your subscription. Mounting the whole config
 directory would have put it at `/opt/agent-box-config/blocklist.txt`, readable
 by an agent running with `--dangerously-skip-permissions`, one `cat` away from
 the transcript — and repository content is untrusted input that could steer an
@@ -157,7 +178,7 @@ refuses to start if it finds `blocklist.txt` inside the mounted subdirectory.
 An earlier version copied them into this checkout's gitignored `.local/`
 directory. That was wrong twice over. A `.gitignore` is one `git add -f`, one
 `git clean -x` mishap, or one repository-wide scanner away from publishing an
-internal hostname, and the rule is that employer-identifying strings never enter
+internal hostname, and the rule is that blocklisted strings never enter
 a durable artifact at all — not that they enter one and are then excluded. It
 also coupled every instance to one shared file: creating a VM for repository B
 rewrote the allowlist that repository A's running VM would read at its next
@@ -284,7 +305,7 @@ The verification asserts this directly: `dig @9.9.9.9` must fail.
 An earlier version turned the gateway address into a `/24` and accepted all
 traffic to and from it, on every port, in both directions. Under `vmType: vz`
 that subnet is the host plus every other VM on the machine, so the agent could
-reach any port the work Mac had bound on that interface, entirely outside the
+reach any port the host had bound on that interface, entirely outside the
 allowlist.
 
 The justification given was `limactl shell`, and it was wrong: that is an
@@ -295,8 +316,8 @@ already-established connection or carried over vsock.
 
 `propagateProxyEnv` is set to `false` for a related reason. Lima otherwise
 copies the host's `http_proxy`, `https_proxy` and `no_proxy` into the guest's
-`/etc/environment`. On a managed Mac those routinely name internal hosts — the
-exact strings this VM exists to keep away from a personal subscription — and
+`/etc/environment`. On a managed host those routinely name internal hosts —
+exactly the strings this VM exists to keep away from a model — and
 they would hand the agent a general-purpose egress relay the allowlist does not
 govern. A proxy that is genuinely wanted goes in `allowlist.local` and `ca.pem`,
 which makes it a decision someone made rather than one that happened.
@@ -329,7 +350,7 @@ The token never touches the host filesystem: `agentbox token` reads it with
 
 What is *not* true is that the token can never reach the host. Inside the VM,
 the agent runs with `--dangerously-skip-permissions`, can read the token file,
-and can write anywhere under `/work` — which is the work Mac's filesystem, and
+and can write anywhere under `/work` — which is the host's filesystem, and
 its Time Machine backups. That needs no malice on anyone's part: repository
 content is untrusted input to a model, and the model's own output used to be
 written straight onto the host mount.
@@ -346,24 +367,24 @@ Two changes, and one honest limitation:
 The limitation: this is a backstop, not a boundary. It catches the accident and
 the obvious case. It would not stop a determined agent that encoded the value
 before writing it. The boundary that actually holds is the VM plus the egress
-allowlist; this check is there because the cost of a leaked personal credential
-on a work machine is high enough to be worth a cheap second look.
+allowlist; this check is there because the cost of a leaked subscription
+credential on the host is high enough to be worth a cheap second look.
 
 ## What the guest can still see: names
 
-Lima's host resolver answers the guest's DNS queries using the work Mac's own
+Lima's host resolver answers the guest's DNS queries using the host's own
 resolver configuration. Two consequences follow, and both are accepted rather
 than fixed.
 
 The guest can **resolve** internal names, including split-horizon names that
-only exist on the corporate network. It cannot connect to them — the allowlist
+only exist on a private network. It cannot connect to them — the allowlist
 governs where packets may go, and an internal address is not on it — but
 existence and address are learnable. In the other direction, each lookup reaches
-the employer's resolver with the VM as its origin.
+the host's resolver with the VM as its origin.
 
 This is accepted because the alternative is worse for the actual use case:
 turning off the host resolver and pinning a public one in `dns:` would break the
-common case where the app under test is reachable only through the corporate
+common case where the app under test is reachable only through a private
 resolver, which is precisely what `allowlist.local` exists to support. The thing
 that limits damage is the allowlist, not the resolver. If a deployment does not
 need internal names at all, setting `hostResolver.enabled: false` with an
@@ -419,9 +440,10 @@ the host, run again, see the change.
 **The config sync copies an allowlist of names, never a directory.** The
 source is a subdirectory of a mount the user edits by hand, and the obvious
 implementation — copy `claude/` into `$CLAUDE_CONFIG_DIR` — is one careless
-`cp` away from carrying `.credentials.json` from a personal Mac into a VM
-pointed at a work repository. That is the inward direction of the threat model,
-the one that is easy to forget because nothing visibly breaks when it fails.
+`cp` away from carrying `.credentials.json` from the host into a VM pointed at
+a repository that is not the host's own. That is the inward direction of the
+threat model, the one that is easy to forget because nothing visibly breaks
+when it fails.
 
 So the names that may cross are written down — `CLAUDE.md`, `settings.json`,
 `governor.json`, `rules/*.md` — and everything else stays behind. Credential

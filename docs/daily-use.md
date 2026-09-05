@@ -208,7 +208,7 @@ It prints the version before and after. Updates come from
 
 If you use the governor plugin, the guest is a good place for it: the workers
 it pins to cheap models are the ones doing the bulk of the work, and the budget
-it enforces is the same subscription your personal machine draws on. Two things
+it enforces is the same subscription any other device draws on. Two things
 to know. Its configuration comes from `claude/governor.json` through the
 carry-over above. Its state — the ledger, the spend so far — lives in the guest
 under `~/.cache/governor` and **dies with the VM**, so a destroyed box takes
@@ -221,6 +221,15 @@ None of these is broken. They are the shape of the thing.
 - **One VM per repository.** Lima fixes mounts at create time, which is what
   makes "can it see X" answerable once instead of continuously. A second
   repository means a second `agentbox create`, and a second few minutes.
+- **A virtualenv or `node_modules` built inside the guest overwrites the
+  host's.** `/work` is a shared mount, not a clone, so an environment the
+  agent creates there lands at the same path the host uses, but built for the
+  guest's Linux rather than the host's macOS — a host `.venv/bin/pytest` can
+  come back reporting `bad interpreter: /work/.venv/bin/python3` afterward,
+  because the binaries underneath it are no longer the ones the host put
+  there. Keep environment directories out of the shared tree, or give each
+  side a distinct name (`.venv-host` on the host, say), and expect to
+  recreate the host's environment after a run that touched it.
 - **The app under test needs an allowlist entry.** So does anything a browser
   test talks to: a Playwright download host, a staging API, an internal package
   mirror. They go in `guest/allowlist.local`, one name per line. The symptom of
@@ -237,10 +246,10 @@ None of these is broken. They are the shape of the thing.
 - **Nothing pushes from the guest.** There is no git credential in there, and
   that is deliberate: you review the branch on the host and push it under your
   own identity.
-- **The quota is shared with your personal machine.** The token draws on the
-  same five-hour and weekly limits. A long unattended run in the VM is a run
-  you cannot do at home that evening. `agentbox run` defaults to `sonnet` for
-  that reason.
+- **The quota is shared with every other device on the account.** The token
+  draws on the same five-hour and weekly limits. A long unattended run in the
+  VM is a run you cannot do elsewhere that evening. `agentbox run` defaults to
+  `sonnet` for that reason.
 - **The interactive session is not scrubbed.** `agentbox run` checks its output
   for token fragments; `agentbox claude` hands you the terminal and cannot.
 - **First boot is slow, later boots are not.** The Ubuntu image is cached under

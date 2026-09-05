@@ -16,7 +16,7 @@ set -euo pipefail
 WORK_DIR="${AGENT_BOX_WORK:-/work}"
 
 # Run logs live in the guest home, NOT on the host mount. The model's own output
-# is untrusted text and /work is the work Mac's filesystem; a transcript written
+# is untrusted text and /work is the host's filesystem; a transcript written
 # there would land on that disk and in its backups. Only a scrubbed summary
 # crosses over.
 GUEST_RUNS_DIR="${HOME}/.agent-box/runs"

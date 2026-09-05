@@ -32,7 +32,12 @@ to decide yes or no on each line without asking a question.
 
 ## Tests to run
 
-Exact commands, copy-pasteable, in the order they should run.
+Exact commands, copy-pasteable, in the order they should run. If the task
+needs its own virtualenv or `node_modules`, have the agent build it under a
+guest-only path such as `~/.venvs/<repo>` rather than inside `/work` —
+`/work` is a shared mount, so an environment built there overwrites the
+host's copy at the same path with guest-native binaries. See "The friction,
+listed rather than debugged" in `docs/daily-use.md`.
 
 ```
 npm test
@@ -58,5 +63,5 @@ When to stop and report rather than improvise.
 
 ## Notes
 
-Nothing in this brief may name a customer, an employer system, or an internal
+Nothing in this brief may name a customer, an internal system, or an internal
 hostname. The repository is generic and this file travels with it.

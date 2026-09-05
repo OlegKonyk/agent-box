@@ -1,35 +1,55 @@
 # agent-box
 
-A disposable Linux VM that runs Claude Code against exactly one repository,
-with deny-by-default outbound network and a personal OAuth token that never
-touches the host disk.
+A safe box for an unattended coding agent.
 
-Built for running an agent on generic end-to-end test repositories from a
-work-managed Mac, under a personal subscription, without either side leaking
-into the other.
+For anyone who wants to let an agent run unattended without handing it their
+laptop.
 
-## The threat model, both ways
+The guarantee: the agent gets exactly one mounted repository and its own
+subscription token, deny-by-default outbound network, no reach into the rest
+of the host, no ability to push, and a scrubbed one-line summary as the only
+thing that comes back.
 
-The isolation has to cut in two directions, and most setups only do one. The
-agent must not see the host: not other repositories, not SSH keys, not browser
-profiles, not the corporate filesystem — so the VM mounts one repository and
-nothing else, and Lima fixes mounts at create time, which means the answer to
-"can it see X" is decided once and cannot drift. In the other direction, a
-personal subscription token must not end up on a work-managed machine's disk,
-in its backups, or in its logs — so the token is typed once, piped straight
-into the guest, and dies with the disk image. Between the two sits the egress
-allowlist: the agent can reach the model, GitHub, npm and PyPI, and nothing
-else, so a repository's contents cannot be posted somewhere by accident.
+## How it works
 
-## Install
+agent-box is a disposable Linux VM (Lima, on Apple's own virtualization
+framework) with Claude Code installed inside it. `bin/agentbox` fixes its
+mounts at creation time — the repository at `/work`, this checkout read-only,
+and an optional host config directory — so "can the agent see X" is decided
+once and cannot drift while the VM is running. The isolation cuts both ways:
+the agent must not reach anything on the host beyond that one repository — not
+other projects, not SSH keys, not browser profiles — and the subscription
+token must not reach anything the agent writes. The agent runs with
+`--dangerously-skip-permissions` and can write anywhere under `/work`, so its
+transcript stays sealed inside the VM and only a scrubbed summary, checked for
+fragments of the token, ever crosses to the host's disk. An egress allowlist
+sits in the middle: the agent can reach the model, GitHub, npm and PyPI, and
+nothing else, so a repository's contents cannot be posted somewhere by
+accident.
+
+## Before you point it at code you do not own
+
+Get permission first, in writing, from whoever owns the repository and the
+data in it. This tool enforces the technical boundary — one repository, one
+token, no host access, no push — but it cannot get you permission to run an
+agent against someone else's code, and nothing below substitutes for asking.
+What to ask for, and a template, are in
+**[docs/first-run.md](docs/first-run.md)**.
+
+## Quick start
 
 ```
 brew install lima gitleaks
 git clone <this repo> ~/dev/agent-box
+cd ~/dev/agent-box
+./bin/agentbox create ~/dev/my-e2e-tests
+./bin/agentbox token  ~/dev/my-e2e-tests        # paste a token from `claude setup-token`
+./bin/agentbox verify-auth ~/dev/my-e2e-tests   # the only real proof it works
 ```
 
-Then follow **[docs/first-run.md](docs/first-run.md)**, which covers sign-off,
-minting the token, host-side configuration, and the checks that prove it works.
+`create` takes a few minutes the first time, mostly downloading the Ubuntu
+image. Full walkthrough, including what each step actually checks:
+**[docs/first-run.md](docs/first-run.md)**.
 
 ## Commands
 
@@ -72,7 +92,7 @@ guest/install-plugins.sh     apply plugins.txt inside the guest
 host/preflight.sh       repository scan; reports paths only, never contents
 templates/brief.md      the task brief to copy and fill in
 test/smoke.sh           builds a real VM, checks it, destroys it
-docs/first-run.md       sign-off, token, daily loop, decommissioning
+docs/first-run.md       permission, token, daily loop, decommissioning
 docs/daily-use.md       the two modes, config carry-over, plugins, the friction
 docs/decisions.md       why it is built this way, and what was rejected
 ```
@@ -85,7 +105,7 @@ this repository. It is split in two on purpose:
   blocklist.txt              read on the host only, NEVER mounted
   guest/                     mounted read-only at /opt/agent-box-config
     allowlist.local          extra egress domains, one per line
-    ca.pem                   corporate TLS-intercept root, if any
+    ca.pem                   TLS-intercepting proxy root, if any
     plugins.txt              marketplaces to register, plugins to install
     plugin-dir/<name>/       plugin roots loaded per session, not installed
     claude/                  CLAUDE.md, settings.json, governor.json, rules/
@@ -93,37 +113,34 @@ this repository. It is split in two on purpose:
 
 - `~/.config/agent-box/guest/` is mounted read-only into the VM at
   `/opt/agent-box-config`.
-- `~/.config/agent-box/blocklist.txt` holds the terms that must never leave. It
-  is read on the host only and is **never** mounted, because it is the one file
-  whose contents an agent must not see.
+- `~/.config/agent-box/blocklist.txt` is a local term blocklist: names,
+  hostnames or codenames you never want to leave this machine. It is read on
+  the host only and is **never** mounted, because it is the one file whose
+  contents an agent must not see.
 
 Both distinctions are deliberate: see [docs/decisions.md](docs/decisions.md).
 What of `claude/` crosses into the guest, and what is refused, is in
 [docs/daily-use.md](docs/daily-use.md).
 
-## What this is not
+## Limits and known weaknesses
 
-The guest user has passwordless sudo, because Lima's provisioning needs it. An
-agent that decided to disable its own firewall could. The firewall is a guard
-rail against a capable tool doing something careless, not a sandbox against a
-hostile one — the VM boundary is what protects the host.
+- **The guest user has passwordless sudo.** Lima's provisioning needs it, so a
+  capable agent could disable its own firewall. The firewall is a guard rail
+  against carelessness, not a sandbox against a hostile tool — the VM boundary
+  is what protects the host. Tracked as
+  [issue #1](https://github.com/OlegKonyk/agent-box/issues/1).
+- **The interactive session is not scrubbed.** `agentbox run` checks its
+  output for token fragments before reporting success; `agentbox claude` hands
+  you the terminal and cannot.
+- **DNS resolves through the host's resolver.** The guest can resolve internal
+  names it cannot connect to, and each lookup reaches the host's resolver with
+  the VM as its origin. See "What the guest can still see: names" in
+  [docs/decisions.md](docs/decisions.md).
+- **MDM and corporate proxies are untested.** Some device-management profiles
+  restrict the virtualization framework this depends on, and a
+  TLS-intercepting proxy needs its root certificate supplied by hand. Neither
+  has been verified against a real deployment. See "Known unknowns" in
+  [docs/first-run.md](docs/first-run.md).
 
-The token never touches the host filesystem, but it is not sealed away from the
-agent either: inside the VM the agent can read the token file and can write to
-`/work`, which is the host's disk. Run transcripts are therefore kept in the
-guest home and only a scrubbed summary crosses over, and every run is checked
-afterwards for token fragments in the log and the diffs. That check is a
-backstop, not a boundary. `docs/decisions.md` states the residual risk in full.
-
-## Test
-
-```
-test/smoke.sh
-```
-
-Creates a real Lima instance from a throwaway repository, verifies the guest is
-non-root, that `/work` is shared and `/opt/agent-box` is read-only, that the
-host home directory is not mounted, that the firewall is active and blocking,
-that Claude Code is installed, and that a run without a token is refused. Then
-it destroys the instance. Lima's downloaded base images, cached under
-`~/Library/Caches/lima/download`, are left in place.
+`test/smoke.sh` builds a real Lima instance from a throwaway repository,
+checks the mounts, the firewall and the non-root user, and destroys it again.

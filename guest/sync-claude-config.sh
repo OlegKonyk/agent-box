@@ -15,11 +15,11 @@
 #
 # The copy is an ALLOWLIST of names, not a mirror. The source directory is a
 # subdirectory of a mount the host user edits by hand; a blind copy would
-# happily carry a `.credentials.json` from the personal Mac into a VM running
-# against a work repository, which is the exact direction of leak this whole
-# project exists to prevent. So the names that may cross are written down here,
-# and anything credential-shaped is refused out loud rather than ignored
-# quietly — a silent skip looks identical to a successful copy.
+# happily carry a `.credentials.json` from the host into a VM running against
+# a repository that is not the host's own, which is the exact direction of
+# leak this whole project exists to prevent. So the names that may cross are
+# written down here, and anything credential-shaped is refused out loud rather
+# than ignored quietly — a silent skip looks identical to a successful copy.
 
 set -uo pipefail
 
