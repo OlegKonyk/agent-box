@@ -448,10 +448,29 @@ else
     # half-written event stream, and writing a summary for something still
     # going. The loop keeps waiting until the process is actually reaped, and
     # the last `wait` is the one that carries its real status.
+    # Bounded, and it stops on 127. `wait` returns 127 immediately, without
+    # blocking, for a pid this shell does not own — which is what the CLI's pid
+    # becomes the moment it is reaped and the number is reused by something
+    # else on the box. `kill -0` would then keep succeeding against the
+    # stranger, and the loop would spin at a full core with the run stuck at
+    # `running` and its exit trap never reached.
+    REAPS=0
+    RUN_STATUS=0
     while :; do
         wait "$CLAUDE_PID"
-        RUN_STATUS=$?
+        WAIT_RC=$?
+        # 127 means this shell does not own that pid — which is what the CLI's
+        # pid becomes once it has been reaped and the number is reused by
+        # something else on the box. Break WITHOUT taking 127 as the run's
+        # status: the last real wait already gave us that.
+        [ "$WAIT_RC" -ne 127 ] || break
+        RUN_STATUS=$WAIT_RC
         kill -0 "$CLAUDE_PID" 2>/dev/null || break
+        REAPS=$((REAPS + 1))
+        if [ "$REAPS" -ge 100 ]; then
+            printf 'agent-run: gave up waiting for the CLI to be reaped after %s interrupted waits\n' "$REAPS"
+            break
+        fi
     done
     rm -f "${RUN_DIR}/claude-pid"
     CLAUDE_PID=""

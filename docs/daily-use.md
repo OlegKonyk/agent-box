@@ -107,7 +107,7 @@ and exits 130.
 | `running` | the process is alive and the run is going |
 | `done` | it ended on its own with exit 0 |
 | `failed` | it ended on its own with a non-zero exit |
-| `stopped` | `stop-run` interrupted it and watched it end |
+| `stopped` | `stop-run` interrupted it and it ended, whether or not the CLI had started |
 | `lost` | it said running, and neither its tmux session nor its recorded pid was there |
 | `unknown` | there is no status file to read |
 
@@ -199,8 +199,12 @@ says where its operands begin:
 that has finished stays visible with its state, its exit code and its total
 duration in `elapsed_s`. It is `null` only when the box has never run anything,
 or is not running. `state` is one of `running`, `done`, `failed`, `stopped`,
-`lost` or `unknown`, and `exit_code` is null for all but `done` and `failed`. `sessions` is `null`, never `[]`, when the list could not be
-read: an empty array means the box genuinely has no sessions.
+`lost` or `unknown`. `exit_code` is the code the run exited with, and it is
+null only where there is no such code: `running`, `lost`, `unknown`, and a stop
+the stopper had to record itself because the run never got to. A stopped run
+that recorded its own exit therefore has a number there, usually 1 or 130.
+`sessions` is `null`, never `[]`, when the list could not be read: an empty
+array means the box genuinely has no sessions.
 
 `--watch` needs a named box. A one-shot `agentbox status` across every VM is
 cheap; a loop across every VM is a python process and a tmux client inside each

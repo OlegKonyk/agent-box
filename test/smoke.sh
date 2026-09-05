@@ -2172,6 +2172,112 @@ if [ -n "$E14_RUNID" ]; then
     fi
 fi
 
+printf -- '\n--- (a5) a CLI that ignores signals: no stop is claimed, no marker is left ---\n'
+# `stop-run` must never report a stop it did not achieve, and must not leave
+# `stop-requested` behind when it gives up: a marker left on disk turns the
+# run's next genuine failure into a reported stop, and `run --wait` would then
+# return 130 where the run had actually failed.
+guest bash -l > /dev/null 2>&1 <<'SH'
+cat > /tmp/abx-claude-deaf <<'INNER'
+#!/bin/bash
+case "${1:-}" in
+    --version) printf '2.1.261-standin (Claude Code)\n'; exit 0 ;;
+    --help)    printf -- '--include-hook-events --settings --verbose\n'; exit 0 ;;
+esac
+trap '' INT TERM
+printf '{"type":"system","subtype":"init","model":"stand-in","claude_code_version":"stand-in"}\n'
+while :; do sleep 5; done
+INNER
+chmod +x /tmp/abx-claude-deaf
+cp /tmp/abx-claude-deaf "$HOME/.local/bin/claude"
+chmod +x "$HOME/.local/bin/claude"
+SH
+DEAF_OUT="${TMP_ROOT}/issue14-deaf.out"
+run_bounded 90 "$DEAF_OUT" "$AGENTBOX" run "$CLEAN_REPO" "${TMP_ROOT}/noop-brief.md"
+D14_RUNID=$(sed -n 's/^agentbox: run \([0-9-]*\) started.*/\1/p' "$DEAF_OUT" | head -1)
+printf 'runid: %s\n' "${D14_RUNID:-<none>}"
+if [ -n "$D14_RUNID" ]; then
+    for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        guest sh -c "grep -q '\"subtype\":\"init\"' \$HOME/.agent-box/runs/${D14_RUNID}/events.jsonl 2>/dev/null" && break
+        sleep 2
+    done
+    DEAF_STOP="${TMP_ROOT}/issue14-deaf-stop.out"
+    run_bounded 120 "$DEAF_STOP" "$AGENTBOX" stop-run "$CLEAN_REPO" "$D14_RUNID"
+    deaf_rc=$BOUNDED_RC
+    cat "$DEAF_STOP"
+    if [ "$deaf_rc" -ne 0 ]; then
+        ok "stop-run reported failure rather than claiming a stop it did not achieve"
+    else
+        bad "stop-run exited 0 for a CLI that ignored both signals"
+    fi
+    if grep -q 'STILL RUNNING' "$DEAF_STOP"; then
+        ok "stop-run said the CLI survived SIGINT and SIGTERM"
+    else
+        bad "stop-run did not say the CLI had survived"
+    fi
+    DEAF_STATE=$(guest /opt/agent-box/guest/run-ctl.sh state "$D14_RUNID" 2>/dev/null | tr -d '\r\n')
+    printf 'derived state: %s\n' "$DEAF_STATE"
+    if [ "$DEAF_STATE" = "running" ]; then
+        ok "the run is still recorded as running, which is the truth"
+    else
+        bad "the run was recorded '${DEAF_STATE}' while its CLI was still alive"
+    fi
+    if guest sh -c "test -e \$HOME/.agent-box/runs/${D14_RUNID}/stop-requested"; then
+        bad "the abandoned stop left stop-requested on disk"
+    else
+        ok "the abandoned stop withdrew its stop-requested marker"
+    fi
+    # This stand-in cannot be asked to leave, so it is killed by the pid the
+    # run recorded — not by closing the session, which would leave it orphaned
+    # in its own process group. The run then finishes on its own terms, and
+    # that is the point of the next assertion: an abandoned stop must not come
+    # back to relabel the failure that follows it.
+    guest bash -l > /dev/null 2>&1 <<SH
+p=\$(cat "\$HOME/.agent-box/runs/${D14_RUNID}/claude-pid" 2>/dev/null)
+case "\$p" in ''|*[!0-9]*) ;; *) kill -9 "\$p" 2>/dev/null ;; esac
+SH
+    for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        DEAF_AFTER=$(guest /opt/agent-box/guest/run-ctl.sh state "$D14_RUNID" 2>/dev/null | tr -d '\r\n')
+        [ "$DEAF_AFTER" = "running" ] || break
+        sleep 2
+    done
+    printf 'state once the CLI was killed: %s\n' "$DEAF_AFTER"
+    if [ "$DEAF_AFTER" = "exit:stopped" ]; then
+        bad "the withdrawn stop came back: a later failure was recorded as a stop"
+    else
+        ok "the later failure was recorded as a failure, not as the abandoned stop"
+    fi
+    if "$AGENTBOX" runs "$CLEAN_REPO" | grep -qE "${D14_RUNID}.*failed"; then
+        ok "runs shows it failed rather than stopped"
+    else
+        bad "runs does not show it as failed"
+    fi
+fi
+
+printf -- '\n--- (a6) the two derivation rules agree, including exit:lost with a marker ---\n'
+# run-ctl derives the state for `run --wait` and the notification watcher;
+# run-format derives it for `runs` and `status --json`. A run whose finish()
+# wrote its marker and then died before its status is exactly the case where
+# the two used to disagree: one said stopped, the other said lost.
+AGREE_ID=20260102-111111
+guest bash -l > /dev/null 2>&1 <<SH
+set -u
+d="\$HOME/.agent-box/runs/${AGREE_ID}"
+rm -rf "\$d"; mkdir -p "\$d"; chmod 700 "\$d"
+printf 'exit:lost\n' > "\$d/status"
+printf '2026-01-02T11:11:11Z\n' > "\$d/stopped"
+printf '{"runid":"${AGREE_ID}","model":"sonnet","branch":null,"brief":"agree","started_at":"2026-01-02T11:11:11Z","tmux":null,"max_turns":null,"max_budget_usd":null,"claude_version":null}\n' > "\$d/meta.json"
+SH
+AGREE_CTL=$(guest /opt/agent-box/guest/run-ctl.sh state "$AGREE_ID" 2>/dev/null | tr -d '\r\n')
+AGREE_FMT=$("$AGENTBOX" runs "$CLEAN_REPO" --json 2>/dev/null | jq -r --arg r "$AGREE_ID" 'map(select(.runid == $r))[0].state // "missing"')
+printf 'run-ctl says %s; run-format says %s\n' "$AGREE_CTL" "$AGREE_FMT"
+if [ "$AGREE_CTL" = "exit:lost" ] && [ "$AGREE_FMT" = "lost" ]; then
+    ok "exit:lost with a stop marker reads lost from both derivation rules"
+else
+    bad "the two rules disagree: run-ctl '${AGREE_CTL}' vs run-format '${AGREE_FMT}'"
+fi
+guest sh -c "rm -rf \$HOME/.agent-box/runs/${AGREE_ID}"
+
 printf -- '\n--- (b) the CLI exits 0 but says is_error: that is a failed run ---\n'
 # shellcheck disable=SC2016  # $HOME must expand in the guest.
 guest bash -l -c 'cp /tmp/abx-claude-fail "$HOME/.local/bin/claude"; chmod +x "$HOME/.local/bin/claude"'
@@ -2216,7 +2322,7 @@ printf -- '\n--- the real CLI is put back ---\n'
 # shellcheck disable=SC2016  # $HOME must expand in the guest.
 guest bash -l -c 'mv -f "$HOME/.local/bin/claude.real" "$HOME/.local/bin/claude"' || true
 STANDIN_INSTALLED=0
-guest sh -c 'rm -f /tmp/abx-claude-stop /tmp/abx-claude-fail /tmp/abx-claude-slowhelp'
+guest sh -c 'rm -f /tmp/abx-claude-stop /tmp/abx-claude-fail /tmp/abx-claude-slowhelp /tmp/abx-claude-deaf'
 REAL_VER=$("$LIMACTL" shell --workdir /work "$INSTANCE" -- bash -lc 'claude --version' 2>&1)
 printf '%s\n' "$REAL_VER"
 if printf '%s' "$REAL_VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+' && ! printf '%s' "$REAL_VER" | grep -q standin; then

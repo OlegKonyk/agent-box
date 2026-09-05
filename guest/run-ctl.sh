@@ -171,14 +171,24 @@ cmd_stop() {
         tries=$((tries + 1))
     done
 
-    if ! command -v pgrep >/dev/null 2>&1; then
-        # Checked directly. The signalled count cannot detect this: the CLI's
-        # own pid is always in the list, so the count is never zero, and the
-        # warning that used to key off it could not fire.
-        printf 'run-ctl: WARNING: pgrep is not installed, so only the CLI itself will be signalled, not its children\n' >&2
+    if [ -z "$claude_pid" ] && [ -z "$pane_pid" ]; then
+        # Nothing to signal at all. Saying a stop was requested when none was
+        # delivered leaves a marker that turns the run's next genuine failure
+        # into a reported stop, so the request is withdrawn along with the
+        # attempt.
+        rm -f "${dir}/stop-requested"
+        printf 'run-ctl: %s has a session but no process to signal; nothing was stopped\n' "$runid" >&2
+        return 1
     fi
 
     if [ -n "$claude_pid" ]; then
+        if ! command -v pgrep >/dev/null 2>&1; then
+            # Probed directly. The signalled count cannot detect this: the
+            # CLI's own pid is always in the list, so the count is never zero.
+            # Inside this branch, because in the other one there is no CLI to
+            # signal and the sentence would not be true.
+            printf 'run-ctl: WARNING: pgrep is not installed, so only the CLI itself will be signalled, not its children\n' >&2
+        fi
         for pid in $(descendants_deepest_first "$claude_pid"); do
             kill -INT "$pid" 2>/dev/null && signalled=$((signalled + 1))
         done
@@ -235,6 +245,11 @@ cmd_stop() {
             tries=$((tries + 1))
         done
         if kill -0 "$claude_pid" 2>/dev/null; then
+            # The stop did not take, so the request is withdrawn. Left on disk
+            # it would make the run's next failure — for any unrelated reason —
+            # record itself as a stop, and `run --wait` would return 130 where
+            # the run had actually failed.
+            rm -f "${dir}/stop-requested"
             printf 'run-ctl: %s is STILL RUNNING: the CLI (pid %s) survived SIGINT and SIGTERM.\n' \
                 "$runid" "$claude_pid" >&2
             printf 'run-ctl: the run is left recorded as running. It is still spending; stop it by hand.\n' >&2
@@ -255,8 +270,22 @@ cmd_stop() {
     done
 
     if [ "$gone" -ne 1 ]; then
+        rm -f "${dir}/stop-requested"
         printf 'run-ctl: %s did not stop: its session or its process is still there after %ss.\n' \
             "$runid" "$((waited + tries))" >&2
+        printf 'run-ctl: the run is left recorded as running rather than claimed to be stopped.\n' >&2
+        return 1
+    fi
+
+    # process_tree_gone short-circuits to "gone" on the session check alone
+    # when there is no pane pid, which is not proof that the run's own process
+    # has finished. Writing a status on that basis can land on top of an
+    # `exit:3` the run wrote a moment later, and the leak refusal keys on that
+    # exact string. Without the proof, this command does not write.
+    if [ -z "$pane_pid" ]; then
+        rm -f "${dir}/stop-requested"
+        printf 'run-ctl: %s: tmux reported no pane process, so there is no proof the run has ended.\n' \
+            "$runid" >&2
         printf 'run-ctl: the run is left recorded as running rather than claimed to be stopped.\n' >&2
         return 1
     fi
@@ -452,7 +481,14 @@ derived_state() {
     local dir="${1:?}" raw
     raw=$(abx_status_read "$dir")
     case "$raw" in
-        exit:3) ;;
+        # Two exemptions, and run-format.py tests both before it looks at the
+        # marker. exit:3 because the leak is the headline. exit:lost because a
+        # lost run's fate is by definition unknown: the marker and the status
+        # are written two statements apart in finish(), so a marker with
+        # `exit:lost` beside it means finish() started and did not get to
+        # write its status — exactly the case where claiming a clean stop
+        # would be a guess.
+        exit:3|exit:lost) ;;
         exit:*) [ ! -e "${dir}/stopped" ] || raw="exit:stopped" ;;
     esac
     printf '%s' "$raw"
