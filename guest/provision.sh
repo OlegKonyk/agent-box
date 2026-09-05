@@ -104,7 +104,14 @@ trap close_network_on_exit EXIT
 # 1. Packages
 # ---------------------------------------------------------------------------
 
-REQUIRED_PKGS=(iptables ipset dnsutils jq curl git ca-certificates)
+# tmux is not decoration: `agentbox run` is detached by default and every
+# interactive session is meant to be left and come back to, so a box without it
+# has no way to hold a run that outlives the shell that started it.
+# procps is not decoration either: `agentbox stop-run` finds the CLI by walking
+# the pane's process tree with pgrep, and without it only the wrapper script is
+# signalled — the model never sees the interrupt, the wait runs its full course
+# and the session is killed mid-write.
+REQUIRED_PKGS=(iptables ipset dnsutils jq curl git ca-certificates tmux procps)
 # `aggregate` merges the GitHub CIDR list; the firewall works without it.
 OPTIONAL_PKGS=(aggregate)
 
@@ -194,6 +201,8 @@ chmod 0644 /etc/profile.d/agent-box.sh
 install -d -m 0700 -o "$BOX_USER" -g "$BOX_USER" "${BOX_HOME}/.config/agent-box"
 install -d -m 0700 -o "$BOX_USER" -g "$BOX_USER" "${BOX_HOME}/.agent-box"
 install -d -m 0700 -o "$BOX_USER" -g "$BOX_USER" "${BOX_HOME}/.agent-box/runs"
+install -d -m 0700 -o "$BOX_USER" -g "$BOX_USER" "${BOX_HOME}/.agent-box/sessions"
+install -d -m 0700 -o "$BOX_USER" -g "$BOX_USER" "${BOX_HOME}/.agent-box/briefs"
 
 # A generic git identity, so a brief that asks the agent to commit works instead
 # of stopping at "Please tell me who you are" or improvising one. Deliberately

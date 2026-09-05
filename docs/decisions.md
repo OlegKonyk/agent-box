@@ -577,3 +577,177 @@ written, which does mean a `hooks` or `statusLine` entry naming a host path
 will not work in the guest. That is left as the operator's problem rather than
 guessed at, because rewriting someone's commands is a worse failure than
 letting one of them not run.
+
+## Why tmux and `-p`, and not `claude --bg`
+
+The CLI has a background mode of its own: `claude --bg` starts a session
+detached, `claude agents --json` lists them, and `claude attach`, `logs`, `stop`
+and `rm` drive them. On paper that is exactly the feature this section is
+about, and it was the first thing tried.
+
+Three things ruled it out for now.
+
+The caps only exist for `-p`. `--max-budget-usd` — and `--max-turns`, wherever
+it lands — are documented as working with `--print` only. A box whose whole
+premise is an unattended agent on a shared subscription quota needs a spend
+ceiling more than it needs a nicer process model.
+
+`--bg` with bypassed permissions needs a disclaimer accepted interactively
+first, in the guest, before it will start. An unattended box that requires
+somebody to have clicked through something once is a box with an undocumented
+manual step in it, and the step is invisible until the first run fails.
+
+And the background daemon is a research preview. A preview is a fine thing to
+build on when the alternative is nothing; here the alternative is tmux, which
+is thirty years old, is one apt package, and gives the same detach-and-return
+behaviour for interactive sessions and headless runs with the same commands.
+
+So: `-p` inside a tmux session, `agentbox attach` to look, `agentbox stop-run`
+to interrupt. Worth revisiting when the daemon leaves preview and the caps work
+outside `--print`; the shape of `runs`, `logs` and `stop-run` would not have to
+change, only what they drive.
+
+Remote Control was considered for the same job and is not available at all: it
+needs a browser login, and the CLI refuses it for a setup token, which is the
+only credential this VM has.
+
+## Why the sensors are stream-json and hooks, and never the transcript
+
+Three things could tell you what a run is doing. Two are used.
+
+`--output-format stream-json --verbose` gives one JSON object per line as the
+run happens: the `system` init, each `assistant` message with its text and its
+tool calls, each `user` message carrying a tool result, and a final `result`
+carrying turns, cost, duration and whether the CLI considered the run to have
+failed. `--include-hook-events` folds the hook lifecycle into the same stream.
+This is a documented output format with a `--output-format` flag in front of
+it, which is as close to a contract as the CLI offers.
+
+Hooks give the other half. A hook command receives one JSON object on stdin
+with the event name, the session, and for tool events the tool name, its input
+and its response. `guest/hook-event.sh` turns each into one line of
+`hooks.jsonl`. It always exits 0, because a PreToolUse hook that exits non-zero
+blocks the tool, and an observer that can stop the thing it is observing is not
+an observer.
+
+The third is the transcript JSONL the CLI keeps under
+`$CLAUDE_CONFIG_DIR/projects/`, and it is deliberately not read. It is internal
+state, its shape changes between releases, and nothing promises otherwise. A
+log built on it works until the next `agentbox update` and then produces
+either an error or, worse, a plausible-looking wrong answer. The two sensors
+above are narrower and they are what the CLI says it emits.
+
+One consequence worth naming: only the `assistant` and `user` events carry a
+timestamp of their own. `system` and `result` events inherit the last one seen,
+which keeps the stream in its own order while letting hook lines and console
+lines — both stamped as they are written — land between the stream events they
+happened between. It is a merge by time where there is a time and by order
+where there is not, and it is honest about which is which rather than
+inventing precision.
+
+## Why the formatter and the status script run in the guest
+
+`agentbox logs`, `agentbox runs` and `agentbox status` all print text the model
+produced. The one thing that must never reach the host's terminal is a fragment
+of the OAuth token, and the only way to guarantee that is to redact before the
+bytes cross — scrubbing on the host would mean the unscrubbed bytes had already
+crossed, into a terminal, into scrollback, and into whatever is recording it.
+
+So `guest/run-format.py` and `guest/box-status.sh` run inside the guest, read
+the token file for the same head and tail `abx_scrub_token` uses, and print
+only redacted text. The host CLI formats nothing it did not already know: it
+knows the instance name, the repository path and the Lima state, and everything
+else arrives as a finished line or a finished JSON object.
+
+That has a second consequence, and it is the more important one. Everything a
+user interface would need is already in `runs --json`, `logs --json` and
+`status --json`. A UI is therefore a renderer of those three commands. It does
+not talk to `limactl`, it does not read anything inside the guest, and it is
+not a second place where the scrub has to be got right. There is exactly one
+boundary, it is in the guest, and adding a front end does not add another.
+
+## `--settings` merges hook arrays; it does not replace them
+
+`guest/agent-run.sh` and `guest/claude-session.sh` both pass
+`--settings /opt/agent-box/guest/hooks.settings.json`, and the whole
+watch-and-steer design assumes that adds the sensor's hooks to whatever the
+operator's own `settings.json` declares. If it replaced them instead, an
+operator with their own hooks block would silently get no `hooks.jsonl`, and
+nothing would report it: the only note in the code fires when the settings
+FILE is missing, not when its contents are displaced.
+
+Measured on 2026-09-05 against Claude Code 2.1.261, the version the guest
+installs. A `SessionStart` hook in `$CLAUDE_CONFIG_DIR/settings.json` writing
+one marker file, a different `SessionStart` hook in the file passed to
+`--settings` writing another, one `claude -p` run:
+
+```
+--- SessionStart hook events in the stream ---
+   2 hook_response SessionStart:startup
+   2 hook_started SessionStart:startup
+--- markers written ---
+extra.marker
+user.marker
+```
+
+Both fired. `--settings` merges. The comment in `guest/lib.sh` that says so is
+therefore correct, and it is now correct on the record rather than on
+assumption. Worth re-measuring if the CLI's settings resolution ever changes;
+the symptom of a regression is an empty `hooks.jsonl` on a box whose operator
+has their own hooks.
+
+## Why the repository's own settings.json is refused, and the operator's is not
+
+`sync-claude-config.sh` marks `/work` trusted before every launch, and its own
+comment says that is what makes a repository's `.claude/settings.json` live
+rather than inert. Nothing filtered that file. It arrives on a mount, so the
+sync never sees it.
+
+The repository is untrusted input by this project's own threat model. A
+`settings.json` it ships can carry an `env` block with an API key that outranks
+the subscription token, or a `hooks` block whose commands run in a process tree
+that holds `CLAUDE_CODE_OAUTH_TOKEN`. The egress allowlist is what contains the
+damage, which is not the same as preventing it.
+
+So `abx_assert_settings_carry_no_credential` now reads three files, not one:
+the guest's own `settings.json`, `/work/.claude/settings.json` and
+`/work/.claude/settings.local.json`. The credential keys are refused in all
+three. `hooks` is refused only in the repository's two, and the asymmetry is
+the point: in the operator's own configuration a hook is a choice they made,
+and in the repository's it is a command chosen by whoever wrote the repository
+for a folder this VM marks trusted on the operator's behalf. Refusing is
+abrupt, and it is the right kind of abrupt — the message names the file and the
+key, so the operator can read the hook and decide, which is the decision that
+was previously being made for them by default.
+
+## Why nothing the guest writes is used before it is matched against a shape
+
+The agent runs as the guest user, with `--dangerously-skip-permissions` and a
+Bash tool. Every file the host CLI reads out of the guest is therefore a file
+the agent can write: `~/.agent-box/runs/<runid>/status` is an ordinary file in
+its own home.
+
+That was not a theoretical concern. `--notify`'s watcher read that status file
+and spliced the value into an `osascript -e` program as a double-quoted
+AppleScript string literal. A double quote in the value closes the literal, and
+what follows is parsed as AppleScript, where `do shell script` runs a command
+**on the host, as the host user, outside the VM**. Reproduced on this machine:
+the payload's `do shell script` created the file it named. The guest's
+default-deny egress is irrelevant to it, because the fetch would happen on the
+host; so is the token never touching the host, because the host's `~/.ssh` and
+the blocklist the whole mount split exists to protect are both readable once
+code runs there.
+
+Two defences now, deliberately not one:
+
+- **The shape.** `running`, `exit:stopped`, or `exit:` and digits. Anything else
+  becomes `unknown`, and the offending value is reported as unrecognised rather
+  than echoed, because echoing it is most of what makes it dangerous. The same
+  discipline covers run ids (`%Y%m%d-%H%M%S`), session names and model names.
+- **The interface.** `osascript` receives the text as an argument through
+  `on run argv` and `--`, never as program text. Numeric comparisons on a
+  guest-derived value use `case` patterns, never `[ -eq ]`, whose arithmetic
+  evaluator word-expands an array subscript and so runs `$(...)` inside it.
+
+Either alone would close today's hole. Both, because the first is a policy that
+a later change could widen and the second is a property of how the call is made.

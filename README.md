@@ -63,17 +63,34 @@ One instance per repository, named `agent-box-<repo basename>`.
 | `agentbox token <repo>` | Read an OAuth token from the terminal into the VM. Never echoed, never stored on the host. |
 | `agentbox verify-auth <repo>` | Prove the token authenticates, with one real model call. |
 | `agentbox claude <repo> [args]` | Interactive Claude Code in the VM, in `/work`. Arguments pass through to the CLI. |
-| `agentbox shell <repo>` | Interactive shell in the VM, in `/work`. |
-| `agentbox run <repo> <brief.md> [--model M]` | Run one headless task from a brief. Default model `sonnet`. |
+| `agentbox session <repo> [brief.md]` | The same, in a tmux session you can detach from and come back to. |
+| `agentbox shell <repo>` | Interactive shell in the VM, in `/work`, in a tmux session. |
+| `agentbox attach <repo> [session\|runid] [-r]` | Attach to a session. A run's session is read-only. |
+| `agentbox sessions <repo> [--json]` | List the VM's tmux sessions, with age and last activity. |
+| `agentbox run <repo> <brief.md> [options]` | Start one headless task from a brief and return at once. Default model `sonnet`. |
+| `agentbox runs <repo> [--json]` | List this VM's runs, newest first, with state, turns and cost. |
+| `agentbox logs <repo> [runid] [-f] [--json]` | Read a run back, formatted and scrubbed inside the guest. |
+| `agentbox stop-run <repo> [runid]` | Interrupt the newest running task, or a named one. Nothing is reverted. |
 | `agentbox plugins <repo> [--update]` | Apply `plugins.txt` inside the VM. |
 | `agentbox update <repo>` | Update Claude Code inside the VM, printing the version before and after. |
 | `agentbox stop <repo\|name>` | Stop the VM. |
 | `agentbox destroy <repo\|name>` | Stop and delete the VM, and remind you to revoke the token. |
-| `agentbox status` | List all Lima instances. |
+| `agentbox status [repo] [--json] [--watch [SECS]]` | One line per box: current run, sessions, firewall. |
 | `agentbox firewall-check <repo\|name>` | Re-run the egress verification inside the VM. |
 
-The last three also take a bare instance name, so a VM can still be shut down
-and deleted after its repository directory is gone.
+`run` takes `--model M`, `--max-turns N`, `--max-budget-usd X`, `--wait` and
+`--notify`. `stop`, `destroy` and `firewall-check` also take a bare instance
+name, so a VM can still be shut down and deleted after its repository directory
+is gone. Every subcommand stops reading options at a literal `--`, so a caller
+that builds a command line rather than typing it can always say where its
+operands begin: `agentbox runs --json -- <repo>`. For `agentbox claude` the
+`--` may only come before the repository, because everything after it belongs
+to the CLI.
+
+Runs are detached: `agentbox run` returns as soon as the task has started, and
+`runs`, `logs -f`, `stop-run` and `status --watch` are how you follow it. The
+whole loop is in [docs/daily-use.md](docs/daily-use.md) under "Watching and
+steering".
 
 ## Layout
 
@@ -87,6 +104,11 @@ guest/lib.sh            the preconditions and token handling the next three shar
 guest/agent-run.sh      one headless task, as the non-root guest user
 guest/claude-session.sh one interactive session, as the non-root guest user
 guest/verify-auth.sh    one small model call, to prove the token works
+guest/run-ctl.sh        start, stop and list the guest's tmux sessions
+guest/hook-event.sh     the hook command; one JSON line per hook event
+guest/hooks.settings.json    the hooks block, merged in with --settings
+guest/run-format.py     merge the sensors and print them, scrubbed, in the guest
+guest/box-status.sh     one JSON or text line describing this box
 guest/sync-claude-config.sh  carry named config files in; mark /work trusted
 guest/install-plugins.sh     apply plugins.txt inside the guest
 host/preflight.sh       repository scan; reports paths only, never contents
@@ -129,9 +151,21 @@ What of `claude/` crosses into the guest, and what is refused, is in
   against carelessness, not a sandbox against a hostile tool — the VM boundary
   is what protects the host. Tracked as
   [issue #1](https://github.com/OlegKonyk/agent-box/issues/1).
-- **The interactive session is not scrubbed.** `agentbox run` checks its
-  output for token fragments before reporting success; `agentbox claude` hands
-  you the terminal and cannot.
+- **Three commands hand you a terminal and cannot scrub it.** `agentbox claude`
+  and `agentbox session` give the CLI your screen. `agentbox attach` draws a
+  pane's raw bytes, including a run's pane. Everything `agentbox logs`,
+  `agentbox runs`, `agentbox sessions` and `agentbox status` print is redacted
+  inside the guest before it crosses, and `agentbox run` checks its output for
+  the token before reporting success — but there is no boundary to filter at
+  when a live pane is being drawn on your screen.
+- **`logs` refuses a run whose leak check fired.** If a run exited 3, its
+  events are not printed: you get a banner telling you to rotate the token.
+  `--force-unsafe` prints them anyway.
+- **Remote Control is not available in here.** It needs a browser login, and
+  the CLI refuses it for a setup token, which is the only credential this VM
+  has. `agentbox session` plus `agentbox attach` is the substitute: a session
+  you can leave and come back to, over `limactl shell` rather than over the
+  internet.
 - **DNS resolves through the host's resolver.** The guest can resolve internal
   names it cannot connect to, and each lookup reaches the host's resolver with
   the VM as its origin. See "What the guest can still see: names" in
