@@ -99,10 +99,22 @@ mounts:
 - location: "{{.Param.box}}"
   mountPoint: "/opt/agent-box"
   writable: false
-# The host's ~/.config/agent-box/guest: allowlist.local and ca.pem, and nothing
-# else. Mounted rather than copied into this checkout, so that site-specific
-# strings never enter a git repository at all — not even an ignored directory
-# inside one.
+# The host's ~/.config/agent-box/guest, and nothing outside it. Five things
+# live there, all optional:
+#
+#   allowlist.local      extra egress domains, one per line
+#   ca.pem               a corporate TLS-intercept root
+#   plugins.txt          marketplaces to register and plugins to install
+#   plugin-dir/<name>/   plugin roots loaded per session with --plugin-dir
+#   claude/              CLAUDE.md, settings.json, governor.json, rules/*.md,
+#                        copied into the guest's config directory by
+#                        guest/sync-claude-config.sh — an allowlist of names
+#                        with settings.json filtered, not a mirror. What
+#                        crosses and what is refused: docs/daily-use.md.
+#
+# Mounted rather than copied into this checkout, so that site-specific strings
+# never enter a git repository at all — not even an ignored directory inside
+# one.
 #
 # The subdirectory matters. blocklist.txt — the literal list of terms that must
 # never leave — stays in the PARENT directory, is read on the host by
@@ -125,6 +137,12 @@ mountType: "virtiofs"
 env:
   DISABLE_TELEMETRY: "1"
   DISABLE_ERROR_REPORTING: "1"
+  # No background self-update: a run must not have its binary replaced under
+  # it, and a blocked update would show up as an unexplained slow start rather
+  # than as an error. `agentbox update <repo>` does it on purpose. Set here as
+  # well as by the provisioner, so it holds from the very first boot — before
+  # provisioning has appended anything to /etc/environment.
+  DISABLE_AUTOUPDATER: "1"
 
 # Lima otherwise copies the host's http_proxy / https_proxy / no_proxy into the
 # guest's /etc/environment. On a managed Mac those routinely name internal

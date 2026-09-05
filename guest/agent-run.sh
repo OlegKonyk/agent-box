@@ -14,7 +14,6 @@
 set -euo pipefail
 
 WORK_DIR="${AGENT_BOX_WORK:-/work}"
-TOKEN_FILE="${HOME}/.config/agent-box/token"
 
 # Run logs live in the guest home, NOT on the host mount. The model's own output
 # is untrusted text and /work is the work Mac's filesystem; a transcript written
@@ -22,15 +21,18 @@ TOKEN_FILE="${HOME}/.config/agent-box/token"
 # crosses over.
 GUEST_RUNS_DIR="${HOME}/.agent-box/runs"
 
-# The native installer puts claude in ~/.local/bin, which a non-login shell
-# does not pick up. `limactl shell <inst> -- agent-run.sh` is such a shell.
-export PATH="${HOME}/.local/bin:${PATH}"
-
 MODEL="sonnet"
 SLUG=""
 BRIEF_SRC="-"
 
 die() { printf 'agent-run: %s\n' "$*" >&2; exit 1; }
+
+# PATH, the token file, and the preconditions that every path exporting the
+# token has to satisfy. Shared with verify-auth.sh and claude-session.sh so the
+# three cannot drift apart into being differently strict.
+ABX_LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=guest/lib.sh
+. "${ABX_LIB_DIR}/lib.sh"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -48,25 +50,18 @@ done
 # Preconditions. All of them, before anything is changed.
 # ---------------------------------------------------------------------------
 
-[ "$(id -u)" -ne 0 ] || die "refusing to run as root: Claude Code rejects --dangerously-skip-permissions for root, and the whole point of the guest user is that it is not root"
+# Not root, a 0600 token, no API key outranking it, claude on PATH, and the
+# firewall up — `die`, not `warn`: this turns an agent loose, and an agent with
+# unrestricted egress is the thing the VM exists to prevent.
+abx_assert_environment die
 
 [ -d "$WORK_DIR" ] || die "${WORK_DIR} is not mounted"
 git -C "$WORK_DIR" rev-parse --git-dir >/dev/null 2>&1 || die "${WORK_DIR} is not a git repository"
 
-[ -f "$TOKEN_FILE" ] || die "no token at ${TOKEN_FILE}. Run 'agentbox token <repo>' on the host first."
-token_mode=$(stat -c '%a' "$TOKEN_FILE")
-[ "$token_mode" = "600" ] || die "${TOKEN_FILE} has mode ${token_mode}; expected 600"
-
-# An API key silently outranks the OAuth token, which would bill an API account
-# instead of drawing on the subscription. Refuse rather than surprise.
-[ -z "${ANTHROPIC_API_KEY:-}" ] || die "ANTHROPIC_API_KEY is set; it would override the subscription token. Unset it."
-[ -z "${ANTHROPIC_AUTH_TOKEN:-}" ] || die "ANTHROPIC_AUTH_TOKEN is set; it would override the subscription token. Unset it."
-
-if ! systemctl is-active --quiet agent-box-firewall.service; then
-    die "the egress firewall is not active; refusing to run an agent with unrestricted network"
-fi
-
-command -v claude >/dev/null 2>&1 || die "claude is not on PATH"
+# Session-only plugin roots from the read-only host config mount. Read before
+# anything is changed, so a malformed one fails here rather than mid-run.
+PLUGIN_ARGS=()
+mapfile -t PLUGIN_ARGS < <(abx_plugin_dir_args)
 
 # ---------------------------------------------------------------------------
 # The brief
@@ -142,22 +137,17 @@ printf 'agent-run: branch %s created from %s (%s)\n' "$BRANCH" "$ORIGINAL_REF" "
 # Run
 # ---------------------------------------------------------------------------
 
-# Read the token without it ever appearing in argv, in a log, or on a terminal.
-CLAUDE_CODE_OAUTH_TOKEN=$(cat "$TOKEN_FILE")
-export CLAUDE_CODE_OAUTH_TOKEN
+# Read the token without it ever appearing in argv, in a log, or on a terminal,
+# and keep its head and tail for the leak check below.
+abx_export_token
 
-# Kept for the leak check below. Eight characters at each end is enough to
-# recognise the credential without reconstituting it, and neither variable is
-# ever printed.
-TOK_HEAD="${CLAUDE_CODE_OAUTH_TOKEN:0:8}"
-TOK_TAIL="${CLAUDE_CODE_OAUTH_TOKEN: -8}"
-
+abx_report_plugin_dirs "${PLUGIN_ARGS[@]}"
 printf 'agent-run: model %s, brief %d bytes\n' "$MODEL" "$(wc -c < "$BRIEF_FILE")"
 
 set +e
 (
     cd "$WORK_DIR" || exit 1
-    claude -p \
+    claude "${PLUGIN_ARGS[@]}" -p \
         --model "$MODEL" \
         --dangerously-skip-permissions \
         --output-format json \
@@ -167,7 +157,7 @@ RUN_STATUS=$?
 set -e
 
 chmod 600 "$RUN_LOG"
-unset CLAUDE_CODE_OAUTH_TOKEN
+abx_forget_token
 
 # ---------------------------------------------------------------------------
 # Leak check
@@ -182,7 +172,7 @@ unset CLAUDE_CODE_OAUTH_TOKEN
 leak_hit=0
 check_stream_for_token() {
     local what="$1"
-    if grep -qF -e "$TOK_HEAD" -e "$TOK_TAIL"; then
+    if grep -qF -e "$ABX_TOK_HEAD" -e "$ABX_TOK_TAIL"; then
         printf 'agent-run: SECURITY: the token appears in %s\n' "$what" >&2
         leak_hit=1
     fi
@@ -213,8 +203,8 @@ check_stream_for_token "git status output"  < <(git -C "$WORK_DIR" status --shor
 check_stream_for_token "the unstaged diff"  < <(git -C "$WORK_DIR" diff 2>/dev/null)
 check_stream_for_token "the staged diff"    < <(git -C "$WORK_DIR" diff --cached 2>/dev/null)
 
-TOK_HEAD=""; TOK_TAIL=""
-unset TOK_HEAD TOK_TAIL
+ABX_TOK_HEAD=""; ABX_TOK_TAIL=""
+unset ABX_TOK_HEAD ABX_TOK_TAIL
 
 # ---------------------------------------------------------------------------
 # Summary
