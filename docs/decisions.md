@@ -380,3 +380,178 @@ keeps it out of the work repository's own config.
 
 `safe.directory` is set for `/work` for a mechanical reason: over virtiofs the
 tree is owned by the host uid, and git otherwise refuses to operate in it.
+
+## Why plugins are installed inside the guest, and why the config sync is an allowlist
+
+Two related choices, one about where plugins come from and one about what may
+follow you in from the host.
+
+**Plugins install from a public marketplace, inside the VM.** The obvious
+alternative was to mount the host's `~/.claude/plugins` read-only and let the
+guest use it directly. Rejected, for three reasons. It carries installed state
+that is specific to another machine — cache layouts, versions, a marketplace
+registered from a local checkout path that does not exist in the guest — so it
+is not even portable. It widens the read-only mount from a handful of files the
+user wrote to a directory the CLI manages on its own, which makes "what can the
+agent see" a question about someone else's implementation detail. And it hides
+provenance: a plugin that arrives by mount has no version and no source, where
+one installed from `konyklabs/claude-plugins` has both, in a file that can be
+read back with `claude plugin list`.
+
+The install runs after the firewall comes up, deliberately. It pulls from
+GitHub, which the allowlist permits through the ranges fetched from
+`api.github.com/meta`, so every first boot is a live test of that rule. When
+the GitHub range rule breaks, it says so during provisioning rather than the
+next time someone needs a package.
+
+The marketplace is public, which is the part that makes this work without a
+credential: nothing about registering `konyklabs/claude-plugins` needs an
+account. `plugins.txt` is applied during provisioning, before the token has
+been typed in, and again on demand through `agentbox plugins`.
+
+A plugin still being written on the host does not want any of that. For those
+there is `--plugin-dir`, which loads one plugin root for one session, installs
+nothing and writes nothing: the roots live under
+`~/.config/agent-box/guest/plugin-dir/`, arrive through the same read-only
+mount as the allowlist, and are passed to every session the box starts. Edit on
+the host, run again, see the change.
+
+**The config sync copies an allowlist of names, never a directory.** The
+source is a subdirectory of a mount the user edits by hand, and the obvious
+implementation — copy `claude/` into `$CLAUDE_CONFIG_DIR` — is one careless
+`cp` away from carrying `.credentials.json` from a personal Mac into a VM
+pointed at a work repository. That is the inward direction of the threat model,
+the one that is easy to forget because nothing visibly breaks when it fails.
+
+So the names that may cross are written down — `CLAUDE.md`, `settings.json`,
+`governor.json`, `rules/*.md` — and everything else stays behind. Credential
+and history-shaped names are not merely skipped, they are refused out loud:
+a silent skip and a successful copy look identical in a log, and the one case
+where the operator must not be left guessing is the one where a credential was
+in the directory.
+
+Trust is marked in the same script, for a mechanical reason. Claude Code will
+not act in a folder it has not been told to trust, a repository's own
+`.claude/settings.json` is inert until it has been, and `-p` cannot ask. There
+is exactly one folder in this VM and `host/preflight.sh` scanned it on the host
+before the VM was allowed to mount it, so the decision is made here, visibly,
+rather than by a flag buried in a launch command.
+
+## Why there is an interactive `agentbox claude`, given `agentbox run`
+
+`agentbox run` is the mode with the safety rails: a branch per run, the JSON
+transcript sealed inside the VM, a scrubbed summary as the only thing written
+to the host, and a check of that summary and both diffs for token fragments
+before it will report success. Everything about it assumes the output is
+untrusted and the host's disk is precious.
+
+`agentbox claude` has none of that, on purpose. It hands the terminal to the
+CLI, which is what makes an interactive session useful and also what makes it
+unscrubbable: there is no boundary to filter at when the model's output is
+being drawn on the operator's screen in real time. The choice was between
+having no interactive mode at all — which sends people to `agentbox shell`
+followed by a `claude` that cannot authenticate, or worse, to exporting the
+token by hand — and having one that is honest about what it does not do.
+
+What it does keep is every precondition `agent-run` insists on, from the same
+`guest/lib.sh`: not root, a 0600 token file, no `ANTHROPIC_API_KEY` quietly
+outranking the subscription, the firewall active. Those live in one file rather
+than three copies precisely because three copies is how one of them ends up
+being the lenient one.
+
+## Why background self-update is off in the guest
+
+`DISABLE_AUTOUPDATER=1` is set both in the Lima template's `env:` block, so it
+holds from the first boot, and by the provisioner, so it survives Lima
+rewriting `/etc/environment`.
+
+An automatic update is a new binary arriving over the network in the middle of
+a run, changing the thing being tested while it is being tested. That is
+unwelcome in any VM whose whole purpose is a reproducible box. It is worse
+here, because the failure mode of a *blocked* update is not an error: it is a
+slow start, or a hang, with nothing pointing at the network. `agentbox update`
+does it deliberately and prints the version either side, which turns an
+invisible background action into a visible one with evidence.
+
+## Why settings.json is parsed rather than trusted, and where that is enforced
+
+The carry-over allowlist matches file names. `settings.json` is on it, because
+it is the file that makes the guest CLI behave the way its owner expects. It is
+also a file that can hold a credential, which means a name-based allowlist
+alone does not deliver what the entry above promises.
+
+Three keys, all ordinary content of that format:
+
+- `env` is merged into the CLI's own process environment, so
+  `"env": {"ANTHROPIC_API_KEY": "..."}` is a literal key.
+- `apiKeyHelper` is a shell command the CLI runs to mint one.
+- `awsAuthRefresh` and `awsCredentialExport` do the same for Bedrock.
+
+The `env` case is the sharp one, because of *when* it takes effect.
+`abx_assert_environment` refuses to run when `ANTHROPIC_API_KEY` is set in the
+shell environment, and says why: an API key silently outranks the OAuth token
+and bills an API account instead of drawing on the subscription. A key arriving
+through `settings.json` is injected by the CLI *after* that check has passed.
+The refusal is intact and the thing it refuses walks in behind it.
+
+So the file is parsed, not copied: those keys are removed, along with any value
+anywhere in the document that starts with `sk-ant-`, and each removal is named
+in the log the way a refusal is. The host's own file is never touched.
+
+The same check then runs again in `abx_assert_environment`, against the
+installed copy, and refuses to launch. Two places, deliberately: the filter
+covers the file that crosses the mount, and the assertion covers a
+`settings.json` written or edited inside the guest, which the filter never
+sees. A guarantee enforced only at the point of copying is a guarantee about
+copying, not about running.
+
+## Why the trust merge locks, and never renames the file aside
+
+`sync-claude-config.sh` runs before every launch and does a read-modify-write
+of `.claude.json`, a file Claude Code also writes. An earlier version answered
+a parse failure by renaming the file aside and starting fresh. That is the
+worst available response to the most likely cause.
+
+The most likely cause is not corruption. It is catching the file mid-write —
+an interactive session in one terminal, `agentbox run` in another. Renaming
+then takes a live session's config, with every other project's trust decision
+and history in it, and puts it in a `.corrupt-<epoch>` file nobody will ever
+look at; the running CLI writes its own state over the two-key replacement, and
+the loss is permanent and silent.
+
+Now: an flock on a sibling lockfile serialises this script against itself, and
+a parse failure means re-read once after a short pause and then, if it still
+does not parse, say so and exit non-zero **without touching the file**. The
+caller already treats a failed sync as non-fatal, so the cost is one launch
+running with the trust flag unset — recoverable on the next command. Displacing
+a live config is not recoverable at all.
+
+The lock cannot serialise this script against the CLI, which is why the second
+half matters more than the first.
+
+## Why settings.json is merged, not copied: the file has two owners
+
+Carrying `settings.json` across looks like copying one file. It is not, because
+two parties write to it.
+
+The operator writes their preferences. The CLI writes `enabledPlugins` and
+`extraKnownMarketplaces`, which is where `claude plugin install` records what
+it installed. A wholesale copy makes the host the only author and destroys the
+CLI's half — so the guest installs its plugins during provisioning, the next
+launch syncs the config over the top, and every one of them is quietly
+disabled. `claude plugin list` still reports them as installed. The smoke test
+caught exactly this, which is why it now asserts the plugin is *enabled* rather
+than merely present.
+
+The same two keys are wrong in the other direction as well. The host's
+`extraKnownMarketplaces` names a directory on the host — a path that does not
+exist in the guest, and one there is no reason to write into a VM. That makes
+these keys machine-specific state, the same category as the `plugins/`
+directory that was already on the refused list.
+
+So they are guest-owned: dropped from the incoming file, preserved from the
+guest's own. Everything else in the file is the operator's and crosses as
+written, which does mean a `hooks` or `statusLine` entry naming a host path
+will not work in the guest. That is left as the operator's problem rather than
+guessed at, because rewriting someone's commands is a worse failure than
+letting one of them not run.

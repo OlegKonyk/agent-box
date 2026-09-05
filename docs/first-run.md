@@ -83,6 +83,32 @@ only. `agentbox create` refuses to start if it finds this file inside `guest/`. 
 identifies the employer. `agentbox preflight` scans every repository for these
 before it is mounted and reports **paths only**, never the term itself.
 
+**`~/.config/agent-box/guest/plugins.txt`** — optional. Marketplaces to register
+and plugins to install inside the VM, one directive per line, `#` for comments.
+
+```
+marketplace konyklabs/claude-plugins
+install governor@konyklabs-plugins
+```
+
+The marketplace **name** comes from the marketplace's own manifest and is not
+always the repository name: `konyklabs/claude-plugins` registers as
+`konyklabs-plugins`. If you are unsure, add it once inside the VM and read the
+name back with `claude plugin marketplace list`. The file is applied on first
+boot and on demand with `agentbox plugins <repo>`.
+
+**`~/.config/agent-box/guest/plugin-dir/<name>/`** — optional. A plugin root you
+are still writing, `.claude-plugin/plugin.json` and all. Nothing is installed:
+each such directory is passed to the CLI as `--plugin-dir` for that session
+only, straight from the read-only mount.
+
+**`~/.config/agent-box/guest/claude/`** — optional. The pieces of your own
+Claude Code setup you want in the VM: `CLAUDE.md`, `settings.json`,
+`governor.json` and `rules/*.md`. Those names and nothing else — the copy is an
+allowlist, and a `.credentials.json` or a `*.token` left in there is refused
+with a message rather than skipped in silence. What crosses and what does not
+is listed in [daily-use.md](daily-use.md).
+
 **`~/.config/agent-box/guest/ca.pem`** — only if your network intercepts TLS. If
 `curl https://api.anthropic.com` on the host fails with a certificate error,
 you are behind such a proxy; export its root certificate and put it here. It is
@@ -141,6 +167,11 @@ To look around inside the VM for any other reason:
 ```
 
 ## 5. The daily loop
+
+Two modes, and the friction to expect from each, are in
+**[daily-use.md](daily-use.md)**. The short version: `agentbox claude <repo>`
+for an interactive session, and the brief-driven loop below for anything you
+mean to review as a diff.
 
 1. Copy `templates/brief.md`, fill it in. The whole file becomes the prompt, so
    vagueness in it becomes guesswork in the VM.
