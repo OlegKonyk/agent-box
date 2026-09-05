@@ -107,12 +107,29 @@ and exits 130.
 | `running` | the process is alive and the run is going |
 | `done` | it ended on its own with exit 0 |
 | `failed` | it ended on its own with a non-zero exit |
-| `stopped` | `stop-run` interrupted it and watched it end |
+| `stopped` | `stop-run` interrupted it and it ended, whether or not the CLI had started |
 | `lost` | it said running, and neither its tmux session nor its recorded pid was there |
 | `unknown` | there is no status file to read |
 
+A stop is recorded by the run itself, not deduced by the thing that stopped it:
+`stop-run` leaves a `stop-requested` marker in the run directory before it
+sends a signal, and the run leaves a `stopped` marker of its own on the way out
+if it did not finish cleanly. The status file keeps the code the run actually
+exited with, so a stopped run has an `exit_code` like any other; `stopped` is
+what the marker says, not what the code says. One status is never
+reinterpreted: `exit:3` is the leak check saying it found the token, and a run
+that was also stopped still reads `failed` with exit 3, so the refusal in
+`logs` still fires. It has to work that way because Claude Code exits 0 when it is
+interrupted and says so only in its result event, so a stopper watching from
+outside sees what looks like a successful run.
+
 `lost` is what a run becomes when the VM was stopped underneath it, or its
-process died without running its exit handler. `runs`, `status` and
+process died without running its exit handler.
+
+`stop-run` will not claim to have stopped a run whose CLI is still alive. It
+escalates from an interrupt to a terminate, and if the process survives both it
+says so and leaves the run recorded as running rather than reporting a stop
+that did not happen. `runs`, `status` and
 `agentbox start` each reconcile that before answering, so a run does not sit at
 `running` for ever and `logs -f` does not block on one.
 
@@ -182,8 +199,12 @@ says where its operands begin:
 that has finished stays visible with its state, its exit code and its total
 duration in `elapsed_s`. It is `null` only when the box has never run anything,
 or is not running. `state` is one of `running`, `done`, `failed`, `stopped`,
-`lost` or `unknown`, and `exit_code` is null for all but `done` and `failed`. `sessions` is `null`, never `[]`, when the list could not be
-read: an empty array means the box genuinely has no sessions.
+`lost` or `unknown`. `exit_code` is the code the run exited with, and it is
+null only where there is no such code: `running`, `lost`, `unknown`, and a stop
+the stopper had to record itself because the run never got to. A stopped run
+that recorded its own exit therefore has a number there, usually 1 or 130.
+`sessions` is `null`, never `[]`, when the list could not be read: an empty
+array means the box genuinely has no sessions.
 
 `--watch` needs a named box. A one-shot `agentbox status` across every VM is
 cheap; a loop across every VM is a python process and a tmux client inside each

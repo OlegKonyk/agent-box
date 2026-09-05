@@ -751,3 +751,73 @@ Two defences now, deliberately not one:
 
 Either alone would close today's hole. Both, because the first is a policy that
 a later change could widen and the second is a property of how the call is made.
+
+## Why a run records its own stop, instead of the stopper recording it
+
+`agentbox stop-run` used to work the way it reads: send SIGINT, wait for the
+status file to move, and if it moved, report what it now says. That was wrong
+in a way nothing caught until a real run on a real box, and it is issue #14.
+
+Claude Code 2.1.261 in `-p` mode **exits 0 when it is interrupted**. It says
+what happened only in its result event:
+
+```
+20:38:53  result  error_during_execution  turns=3  cost=$0.0205  duration=21s  is_error=true
+20:38:53  status  exit:0  done
+```
+
+So `agent-run.sh` recorded `exit:0`, the stop loop saw a status appear and
+announced that the run had "ended by itself", and `runs`, `status --json` and
+the summary all agreed it was `done`. Every one of them was reporting a stopped
+run as a successful one.
+
+Two things were wrong, and they need different fixes.
+
+**The outcome is the CLI's verdict, not its exit status.** `agent-run.sh` now
+reads `is_error` and `subtype` out of the result event and, when the process
+exited 0 but the result says otherwise, records the run as failed and prints
+one line saying why. A missing result event counts the same way: with
+`--output-format stream-json` the CLI always emits one, so its absence means
+the stream was cut off.
+
+**The stop is recorded by the run, because only the run knows both halves.**
+The stopper knows it asked; the run knows how it ended. Neither alone can tell
+an interrupted run from one that happened to finish in the same second, and the
+stopper is the one that cannot see the difference. So `run-ctl.sh stop` writes
+`stop-requested` into the run directory before it sends any signal, and
+`agent-run.sh`'s exit trap writes `exit:stopped` if that file is there and the
+run did not end cleanly. The stopper then reads the answer rather than guessing
+it, and "ended by itself" is reserved for the one case where it is true.
+
+The alternative was to have the stopper write `exit:stopped` whenever it had
+signalled and the run subsequently ended. That is the version the review round
+already rejected for a different reason: it overwrites the record of a run that
+finished on its own terms a moment before the signal landed. Both failures come
+from the same mistake, which is inferring a run's fate from outside it.
+
+## Why the stop is a marker beside the exit code, not a status instead of it
+
+The first version of the fix above wrote `exit:stopped` over whatever code the
+run had finished with. That looked tidy and lost two things.
+
+It lost the reason a run failed. A run that failed on its own terms in the same
+second as a stop was recorded as `stopped` with no exit code at all, and the
+failure went with it.
+
+And it lost a guarantee. `exit:3` is what the leak check writes when it found
+the OAuth token in output that reaches the host, and `agentbox logs` refuses to
+print a run whose status is exactly that. A stop that landed on a leaking run
+replaced the 3, the refusal never fired, and the credential the exit-3 path
+exists to withhold was printed to the terminal it exists to protect. The two
+mechanisms were fighting over one field.
+
+So the status file keeps the exit code, always, and the stop is a separate
+marker file the run writes beside it. `run-format.py` derives the state from
+the two: `exit:stopped` still means stopped, because the stopper's own fallback
+writes it when the run never got to record anything; a marker beside any other
+code means stopped as well; and `exit:3` means failed whatever else is there,
+because the leak is the headline and nothing may reinterpret it.
+
+The general rule is worth stating on its own: a value with downstream meaning
+does not get overwritten to express something else. If two facts need
+recording, record two facts.

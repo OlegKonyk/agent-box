@@ -111,14 +111,56 @@ finish() {
     if [ "${CONSOLE_REDIRECTED:-0}" -eq 1 ]; then
         exec 1>&3 2>&4
         if [ -n "${TEE_PID:-}" ]; then
+            # Bounded, because the reader only sees EOF when EVERY write end
+            # closes — and a child the CLI leaves behind inherits this script's
+            # stderr, so it holds one. Waiting for that would keep the run at
+            # `running` for as long as the orphan lives. Five seconds is far
+            # more than draining what is already buffered takes.
+            local drained=0
+            while [ "$drained" -lt 5 ]; do
+                kill -0 "$TEE_PID" 2>/dev/null || break
+                sleep 1
+                drained=$((drained + 1))
+            done
+            kill "$TEE_PID" 2>/dev/null || true
             wait "$TEE_PID" 2>/dev/null || true
         else
             sleep 1
         fi
     fi
+    # The exit code the run really finished with, always. The stop, when there
+    # was one, is recorded ALONGSIDE it rather than in its place.
+    #
+    # Writing `exit:stopped` over the code destroyed information, and in one
+    # case destroyed a guarantee: exit 3 is what the leak check writes when it
+    # found the token in output that reaches the host, and `logs` refuses to
+    # print a run whose status is exit:3. A stop that landed on a leaking run
+    # replaced that 3 with `stopped`, the refusal never fired, and the very
+    # credential the exit-3 path exists to withhold was printed.
+    #
+    # So: 3 is never rewritten by anything, and neither is any other code. The
+    # marker is what says a stop happened; run-format.py derives the state from
+    # the two together.
+    if [ -e "${RUN_DIR}/stop-requested" ] && ! run_ended_cleanly "$rc"; then
+        printf '%s\n' "$(abx_now_iso)" > "${RUN_DIR}/stopped"
+        chmod 600 "${RUN_DIR}/stopped" 2>/dev/null || true
+    fi
     abx_status_write "$RUN_DIR" "exit:${rc}"
-    rm -f "${RUN_DIR}/pid"
+    rm -f "${RUN_DIR}/pid" "${RUN_DIR}/claude-pid"
     exit "$rc"
+}
+
+# Clean means: the process exited 0, the CLI did not flag an error, and its
+# result was `success`. Any field that was never read is not evidence either
+# way, so an unset one does not make a run dirty on its own.
+# shellcheck disable=SC2329  # called from the EXIT trap.
+run_ended_cleanly() {
+    [ "${1:-1}" -eq 0 ] || return 1
+    [ "${RUN_IS_ERROR:-}" != "true" ] || return 1
+    case "${RUN_SUBTYPE:-}" in
+        ''|-|success) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 trap finish EXIT
 
@@ -167,7 +209,19 @@ CONSOLE_REDIRECTED=1
 # fall through to bash's default would kill the script between the model
 # stopping and the summary being written, which is exactly the run whose state
 # someone wants to see.
-trap 'INTERRUPTED=1' INT
+#
+# It also forwards. A SIGINT that reaches this script and stops here achieves
+# nothing: the CLI keeps running, keeps spending, and — once the session is
+# closed — keeps running orphaned in its own process group while the run is
+# recorded as stopped. So the signal is passed on to the CLI's process group,
+# and if the CLI has not started yet, the flag makes sure it never does.
+# shellcheck disable=SC2329  # invoked by the INT trap below.
+on_int() {
+    INTERRUPTED=1
+    [ -n "${CLAUDE_PID:-}" ] || return 0
+    kill -INT -"$CLAUDE_PID" 2>/dev/null || kill -INT "$CLAUDE_PID" 2>/dev/null || true
+}
+trap on_int INT
 
 CLAUDE_VERSION=$(claude --version 2>/dev/null | head -1 || true)
 
@@ -354,13 +408,73 @@ if [ -n "$MAX_TURNS" ]; then
     fi
 fi
 
+# The CLI's own pid, recorded, so that `stop-run` can interrupt the CLI and
+# nothing else.
+#
+# It used to signal every process under the tmux pane. Two of those are not the
+# CLI: this script, and the console tee reading the other end of its stdout.
+# Killing the tee left this script writing into a pipe with no reader, so its
+# next line raised SIGPIPE and it died without its EXIT trap — no summary, no
+# status of its own, and the run recorded by the stopper as a guess. That is
+# the second half of issue #14.
+#
+# `exec` inside the subshell, so the recorded pid IS the CLI rather than a
+# shell that happens to be its parent. `set -m` for the launch, so the CLI gets
+# its own process group and a DEFAULT SIGINT disposition: a background command
+# in a shell without job control has SIGINT set to ignore, and a stop that the
+# CLI cannot receive is not a stop.
 set +e
-(
-    cd "$WORK_DIR" || exit 1
-    claude "${PLUGIN_ARGS[@]}" "${SETTINGS_ARGS[@]}" "${CLAUDE_ARGS[@]}" \
-        "$(cat "$BRIEF_FILE")"
-) > "$EVENTS_FILE"
-RUN_STATUS=$?
+if [ "$INTERRUPTED" -eq 1 ] || [ -e "${RUN_DIR}/stop-requested" ]; then
+    # A stop arrived while this run was still in its preconditions. Starting
+    # the CLI now would spend the subscription on work nobody is waiting for,
+    # and would leave it running after the stop had been reported.
+    printf 'agent-run: a stop was requested before the CLI started; not launching it\n'
+    INTERRUPTED=1
+    RUN_STATUS=130
+else
+    set -m
+    (
+        cd "$WORK_DIR" || exit 1
+        exec claude "${PLUGIN_ARGS[@]}" "${SETTINGS_ARGS[@]}" "${CLAUDE_ARGS[@]}" \
+            "$(cat "$BRIEF_FILE")"
+    ) > "$EVENTS_FILE" &
+    CLAUDE_PID=$!
+    set +m
+    printf '%s\n' "$CLAUDE_PID" > "${RUN_DIR}/claude-pid"
+
+    # In a loop, because a trapped signal makes `wait` return early with 128+n
+    # while the CLI is still very much alive. Taking that as the exit status
+    # meant tearing down a running run: removing its pid file, parsing a
+    # half-written event stream, and writing a summary for something still
+    # going. The loop keeps waiting until the process is actually reaped, and
+    # the last `wait` is the one that carries its real status.
+    # Bounded, and it stops on 127. `wait` returns 127 immediately, without
+    # blocking, for a pid this shell does not own — which is what the CLI's pid
+    # becomes the moment it is reaped and the number is reused by something
+    # else on the box. `kill -0` would then keep succeeding against the
+    # stranger, and the loop would spin at a full core with the run stuck at
+    # `running` and its exit trap never reached.
+    REAPS=0
+    RUN_STATUS=0
+    while :; do
+        wait "$CLAUDE_PID"
+        WAIT_RC=$?
+        # 127 means this shell does not own that pid — which is what the CLI's
+        # pid becomes once it has been reaped and the number is reused by
+        # something else on the box. Break WITHOUT taking 127 as the run's
+        # status: the last real wait already gave us that.
+        [ "$WAIT_RC" -ne 127 ] || break
+        RUN_STATUS=$WAIT_RC
+        kill -0 "$CLAUDE_PID" 2>/dev/null || break
+        REAPS=$((REAPS + 1))
+        if [ "$REAPS" -ge 100 ]; then
+            printf 'agent-run: gave up waiting for the CLI to be reaped after %s interrupted waits\n' "$REAPS"
+            break
+        fi
+    done
+    rm -f "${RUN_DIR}/claude-pid"
+    CLAUDE_PID=""
+fi
 set -e
 
 chmod 600 "$EVENTS_FILE"
@@ -399,6 +513,44 @@ RUN_SUBTYPE=$(result_field subtype)
 RUN_IS_ERROR=$(result_field is_error)
 
 # ---------------------------------------------------------------------------
+# What the run's outcome actually was
+# ---------------------------------------------------------------------------
+#
+# Claude Code 2.1.261 in `-p` mode exits 0 when it is interrupted, and says so
+# only in the result event: `subtype: error_during_execution`, `is_error: true`.
+# Trusting the exit status alone recorded those runs as `done` with exit 0 —
+# issue #14, seen on a real box. The result event is the CLI's own verdict on
+# its own run, and it outranks a process exit status that is not telling us
+# anything.
+#
+# A missing result event counts as a failure too: with --output-format
+# stream-json the CLI always emits one, so its absence means the stream was cut
+# off, and a cut-off run is not a successful run.
+if [ "$RUN_STATUS" -eq 0 ]; then
+    if [ "$RUN_IS_ERROR" = "true" ]; then
+        printf 'agent-run: the CLI exited 0 but its result says is_error=true; recording this run as failed\n'
+        RUN_STATUS=1
+    elif [ "$RUN_SUBTYPE" != "success" ]; then
+        printf 'agent-run: the CLI exited 0 but its result was %s, not success; recording this run as failed\n' \
+            "$RUN_SUBTYPE"
+        RUN_STATUS=1
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Was a stop asked for?
+# ---------------------------------------------------------------------------
+#
+# `run-ctl.sh stop` writes this file before it sends a signal, so the run finds
+# out from the run directory rather than the stopper having to infer what
+# happened from the outside. The stopper cannot tell an interrupted run from a
+# run that happened to finish in the same second; the run can.
+if [ -e "${RUN_DIR}/stop-requested" ]; then
+    INTERRUPTED=1
+    printf 'agent-run: a stop was requested for this run\n'
+fi
+
+# ---------------------------------------------------------------------------
 # Leak check
 # ---------------------------------------------------------------------------
 #
@@ -425,18 +577,29 @@ check_stream_for_token() {
 CHANGED=$(git -C "$WORK_DIR" status --short 2>/dev/null || true)
 FILES_CHANGED=$(printf '%s' "$CHANGED" | grep -c . || true)
 
+# The same word `runs` and `status --json` will use, so that the summary a
+# person reads and the record a program reads cannot disagree.
+if [ "$INTERRUPTED" -eq 1 ] && ! run_ended_cleanly "$RUN_STATUS"; then
+    RUN_STATE="stopped"
+elif [ "$RUN_STATUS" -eq 0 ]; then
+    RUN_STATE="done"
+else
+    RUN_STATE="failed"
+fi
+
 {
     printf 'runid     : %s\n' "$RUNID"
     printf 'branch    : %s\n' "$BRANCH"
     printf 'started   : %s\n' "$ORIGINAL_REF"
     printf 'model     : %s\n' "$MODEL"
+    printf 'state     : %s\n' "$RUN_STATE"
     printf 'exit code : %d\n' "$RUN_STATUS"
     printf 'result    : %s\n' "$RUN_SUBTYPE"
     printf 'is_error  : %s\n' "$RUN_IS_ERROR"
     printf 'turns     : %s\n' "$RUN_TURNS"
     printf 'cost usd  : %s\n' "$RUN_COST"
     printf 'files     : %s changed\n' "$FILES_CHANGED"
-    if [ "$INTERRUPTED" -eq 1 ] || [ "$RUN_STATUS" -eq 130 ]; then
+    if [ "$RUN_STATE" = "stopped" ]; then
         printf 'note      : interrupted. Nothing was reverted: the work tree is still on\n'
         printf '            %s, with whatever the run had done to it.\n' "$BRANCH"
     fi
@@ -471,6 +634,7 @@ check_stream_for_token "the staged diff"    < <(git -C "$WORK_DIR" diff --cached
 printf '\n----- agent-run summary -----\n'
 printf 'runid     : %s\n' "$(abx_scrub_token "$RUNID")"
 printf 'branch    : %s\n' "$(abx_scrub_token "$BRANCH")"
+printf 'state     : %s\n' "$RUN_STATE"
 printf 'exit code : %d\n' "$RUN_STATUS"
 printf 'turns     : %s\n' "$(abx_scrub_token "$RUN_TURNS")"
 printf 'cost usd  : %s\n' "$(abx_scrub_token "$RUN_COST")"

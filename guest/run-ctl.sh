@@ -118,7 +118,7 @@ cmd_stop() {
     dir=$(abx_run_dir "$runid")
     [ -d "$dir" ] || die "no such run: ${runid}"
 
-    state=$(abx_status_read "$dir")
+    state=$(derived_state "$dir")
     if [ "$state" != "running" ]; then
         die "run ${runid} already ended with ${state}; refusing to overwrite its record"
     fi
@@ -135,32 +135,70 @@ cmd_stop() {
         return 0
     fi
 
-    # Every process under the session's pane, deepest first. claude is the
-    # deepest one, so it is interrupted before the script that launched it and
-    # gets the chance to finish its result event; agent-run.sh's EXIT trap then
-    # records the status whatever happens next.
+    # Before any signal, and after the check above: the run reads this file in
+    # its exit trap and records `exit:stopped` itself. The stopper cannot tell
+    # an interrupted run from one that happened to finish in the same second,
+    # and Claude Code exits 0 on an interrupt (issue #14), so inferring it from
+    # out here recorded stopped runs as `done`. The run knows; this is how it
+    # is told to look.
+    printf '%s\n' "$(abx_now_iso)" > "${dir}/stop-requested"
+    chmod 600 "${dir}/stop-requested" 2>/dev/null || true
+
+    # The CLI, and only the CLI.
     #
-    # By position in the tree rather than by name: the CLI is a single native
-    # binary in some installs and a node process in others, and a stop that
-    # only works for one of those is a stop that silently does not work.
-    local pids="" pid signalled=0
+    # Signalling every process under the pane hits two things that are not the
+    # CLI: agent-run.sh itself, and the console tee holding the read end of its
+    # stdout. Killing the tee left agent-run.sh writing into a pipe nobody was
+    # reading, so it died of SIGPIPE without running its exit trap — no
+    # summary, and no status written by the one process that knew what had
+    # happened. That is why the run records its own pid for the CLI, and why
+    # this walks down from there rather than down from the pane.
+    local claude_pid="" pid signalled=0 tries=0
+
     pane_pid=$(tmux list-panes -t "=${session}" -F '#{pane_pid}' 2>/dev/null | head -1)
-    if [ -n "$pane_pid" ]; then
-        pids=$(descendants_deepest_first "$pane_pid")
-    fi
-    for pid in $pids; do
-        [ "$pid" = "$pane_pid" ] && continue
-        kill -INT "$pid" 2>/dev/null && signalled=$((signalled + 1))
+
+    # The pid file appears a second or two into a run, after the preconditions
+    # and the branch. Waiting for it is the difference between interrupting the
+    # CLI and interrupting the script that is about to start it — and the
+    # second of those used to let the CLI be launched anyway, by a script whose
+    # only reaction to the signal was to set a flag.
+    while [ "$tries" -lt 10 ]; do
+        claude_pid=$(read_claude_pid "$dir")
+        [ -z "$claude_pid" ] || break
+        # It may already be over rather than not yet begun.
+        [ "$(abx_status_read "$dir")" = "running" ] || break
+        sleep 1
+        tries=$((tries + 1))
     done
-    if [ "$signalled" -eq 0 ]; then
-        # pgrep missing, or the pane holds nothing but the script. Say so: the
-        # difference between "the model was interrupted" and "the wrapper was
-        # killed" is the difference between a clean stop and a truncated
-        # events.jsonl, and it must not be silent.
-        printf 'run-ctl: WARNING: found no process under the pane to interrupt; is procps installed?\n' >&2
+
+    if [ -z "$claude_pid" ] && [ -z "$pane_pid" ]; then
+        # Nothing to signal at all. Saying a stop was requested when none was
+        # delivered leaves a marker that turns the run's next genuine failure
+        # into a reported stop, so the request is withdrawn along with the
+        # attempt.
+        rm -f "${dir}/stop-requested"
+        printf 'run-ctl: %s has a session but no process to signal; nothing was stopped\n' "$runid" >&2
+        return 1
     fi
-    if [ -n "$pane_pid" ]; then
-        kill -INT "$pane_pid" 2>/dev/null || true
+
+    if [ -n "$claude_pid" ]; then
+        if ! command -v pgrep >/dev/null 2>&1; then
+            # Probed directly. The signalled count cannot detect this: the
+            # CLI's own pid is always in the list, so the count is never zero.
+            # Inside this branch, because in the other one there is no CLI to
+            # signal and the sentence would not be true.
+            printf 'run-ctl: WARNING: pgrep is not installed, so only the CLI itself will be signalled, not its children\n' >&2
+        fi
+        for pid in $(descendants_deepest_first "$claude_pid"); do
+            kill -INT "$pid" 2>/dev/null && signalled=$((signalled + 1))
+        done
+        [ "$signalled" -gt 0 ] || printf 'run-ctl: WARNING: could not signal the CLI (pid %s)\n' "$claude_pid" >&2
+    else
+        # No CLI, after waiting for one. The run is in its preconditions or on
+        # its way out; the script's own handler forwards a later signal and,
+        # if the CLI has not started, makes sure it never does.
+        printf 'run-ctl: no CLI process for %s; interrupting the run script\n' "$runid"
+        [ -z "$pane_pid" ] || kill -INT "$pane_pid" 2>/dev/null || true
     fi
 
     waited=0
@@ -176,16 +214,55 @@ cmd_stop() {
     state=$(abx_status_read "$dir")
     if [ "$state" != "running" ]; then
         tmux kill-session -t "=${session}" 2>/dev/null || true
-        printf 'run-ctl: %s ended by itself after %ss with %s; nothing was reverted\n' \
-            "$runid" "$waited" "$state"
+        if [ -e "${dir}/stopped" ]; then
+            printf 'run-ctl: %s stopped after %ss (%s). Nothing was reverted: the work tree is as the run left it.\n' \
+                "$runid" "$waited" "$state"
+        elif [ "$state" = "exit:0" ]; then
+            # "By itself" is reserved for a run that really did finish on its
+            # own terms while we were waiting, which is the one case where this
+            # command changed nothing.
+            printf 'run-ctl: %s ended by itself after %ss with %s; nothing was reverted\n' \
+                "$runid" "$waited" "$state"
+        else
+            printf 'run-ctl: %s ended after %ss with %s; nothing was reverted\n' \
+                "$runid" "$waited" "$state"
+        fi
         return 0
+    fi
+
+    # Still running after twenty seconds. Escalate on the CLI before touching
+    # the session: closing the session while the CLI is alive orphans it in its
+    # own process group, where it goes on running and going on spending, and
+    # this command would meanwhile be reporting the run as stopped.
+    claude_pid=$(read_claude_pid "$dir")
+    if [ -n "$claude_pid" ]; then
+        printf 'run-ctl: %s did not answer SIGINT; sending SIGTERM to the CLI\n' "$runid" >&2
+        kill -TERM -"$claude_pid" 2>/dev/null || kill -TERM "$claude_pid" 2>/dev/null || true
+        tries=0
+        while [ "$tries" -lt 10 ]; do
+            kill -0 "$claude_pid" 2>/dev/null || break
+            sleep 1
+            tries=$((tries + 1))
+        done
+        if kill -0 "$claude_pid" 2>/dev/null; then
+            # The stop did not take, so the request is withdrawn. Left on disk
+            # it would make the run's next failure — for any unrelated reason —
+            # record itself as a stop, and `run --wait` would return 130 where
+            # the run had actually failed.
+            rm -f "${dir}/stop-requested"
+            printf 'run-ctl: %s is STILL RUNNING: the CLI (pid %s) survived SIGINT and SIGTERM.\n' \
+                "$runid" "$claude_pid" >&2
+            printf 'run-ctl: the run is left recorded as running. It is still spending; stop it by hand.\n' >&2
+            return 1
+        fi
     fi
 
     tmux kill-session -t "=${session}" 2>/dev/null || true
 
     # exit:stopped is a claim that the run is over, so it is written only once
     # that has been observed: no session, and no surviving pane process.
-    local gone=0 tries=0
+    local gone=0
+    tries=0
     while [ "$tries" -lt 10 ]; do
         if process_tree_gone "$pane_pid" "$session"; then gone=1; break; fi
         sleep 1
@@ -193,15 +270,53 @@ cmd_stop() {
     done
 
     if [ "$gone" -ne 1 ]; then
+        rm -f "${dir}/stop-requested"
         printf 'run-ctl: %s did not stop: its session or its process is still there after %ss.\n' \
             "$runid" "$((waited + tries))" >&2
         printf 'run-ctl: the run is left recorded as running rather than claimed to be stopped.\n' >&2
         return 1
     fi
 
+    # process_tree_gone short-circuits to "gone" on the session check alone
+    # when there is no pane pid, which is not proof that the run's own process
+    # has finished. Writing a status on that basis can land on top of an
+    # `exit:3` the run wrote a moment later, and the leak refusal keys on that
+    # exact string. Without the proof, this command does not write.
+    if [ -z "$pane_pid" ]; then
+        rm -f "${dir}/stop-requested"
+        printf 'run-ctl: %s: tmux reported no pane process, so there is no proof the run has ended.\n' \
+            "$runid" >&2
+        printf 'run-ctl: the run is left recorded as running rather than claimed to be stopped.\n' >&2
+        return 1
+    fi
+
+    # One last read. The run could have finished in the moment between the loop
+    # above and here, and its own exit code outranks anything written from out
+    # here — exit 3 above all, which is the leak check's and must never be
+    # replaced.
+    state=$(abx_status_read "$dir")
+    if [ "$state" != "running" ]; then
+        printf 'run-ctl: %s ended with %s as its session was closed; nothing was reverted\n' \
+            "$runid" "$state"
+        return 0
+    fi
+
+    # Worded differently from the branch above on purpose. There, the run
+    # recorded its own stop and this command only reported it. Here it did not,
+    # so the session was closed and the status written from outside — a
+    # materially weaker claim, and one an operator should be able to tell apart.
     abx_status_write "$dir" "exit:stopped"
-    printf 'run-ctl: %s stopped after %ss. Nothing was reverted: the work tree is as the run left it.\n' \
+    printf 'run-ctl: %s stopped after %ss by closing its session; it did not record its own exit. Nothing was reverted.\n' \
         "$runid" "$waited"
+}
+
+# The CLI's pid as the run recorded it, if it is still alive. Empty otherwise.
+read_claude_pid() {
+    local dir="${1:?}" pid
+    pid=$(cat "${dir}/claude-pid" 2>/dev/null | head -1) || pid=""
+    case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+    kill -0 "$pid" 2>/dev/null || return 0
+    printf '%s' "$pid"
 }
 
 # No tmux session, and no pane process. Both, because either alone can be true
@@ -355,16 +470,39 @@ last_event_json() {
 # latest
 # ---------------------------------------------------------------------------
 
-# The raw contents of a run's status file: `running`, `exit:<code>` or
-# `exit:stopped`. The host reads this to decide what `run --wait` should exit
-# with and when a `--notify` watcher should fire.
+# The state a caller should act on, derived exactly the way run-format.py
+# derives it — the two must agree, because one drives `run --wait` and the
+# notification watcher and the other drives `runs` and `status --json`.
+#
+# The status file keeps the code the run exited with; a `stopped` marker beside
+# it says the run was interrupted. `exit:3` is never reinterpreted: it is the
+# leak check's, and `logs` keys its refusal off exactly that string.
+derived_state() {
+    local dir="${1:?}" raw
+    raw=$(abx_status_read "$dir")
+    case "$raw" in
+        # Two exemptions, and run-format.py tests both before it looks at the
+        # marker. exit:3 because the leak is the headline. exit:lost because a
+        # lost run's fate is by definition unknown: the marker and the status
+        # are written two statements apart in finish(), so a marker with
+        # `exit:lost` beside it means finish() started and did not get to
+        # write its status — exactly the case where claiming a clean stop
+        # would be a guess.
+        exit:3|exit:lost) ;;
+        exit:*) [ ! -e "${dir}/stopped" ] || raw="exit:stopped" ;;
+    esac
+    printf '%s' "$raw"
+}
+
+# What the host reads to decide what `run --wait` should exit with and when a
+# `--notify` watcher should fire.
 cmd_state() {
     local runid="${1:-}"
     if [ -z "$runid" ]; then
         runid=$(cmd_latest) || true
         [ -n "$runid" ] || { printf 'unknown\n'; return 0; }
     fi
-    abx_status_read "$(abx_run_dir "$runid")"
+    printf '%s\n' "$(derived_state "$(abx_run_dir "$runid")")"
 }
 
 # `runs`, with the orphan reconciliation in front of it, in one round trip.

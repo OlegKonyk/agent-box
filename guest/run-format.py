@@ -329,10 +329,23 @@ class Run:
             )
         return "unknown"
 
+    @property
+    def was_stopped(self):
+        """Did `stop-run` interrupt this run?
+
+        A separate file, not a status of its own, because the status has to go
+        on carrying the exit code the run really finished with. Writing
+        `exit:stopped` over that code lost information in every case and lost a
+        guarantee in one: `exit:3` means the leak check found the token, and
+        `logs` refuses to print such a run. A stop that landed on a leaking run
+        used to erase the 3 and with it the refusal.
+        """
+        return os.path.exists(os.path.join(self.dir, "stopped"))
+
     # running  the process is alive and the run is going
     # done     it ended on its own with exit 0
     # failed   it ended on its own with a non-zero exit
-    # stopped  `agentbox stop-run` interrupted it and observed it end
+    # stopped  `agentbox stop-run` interrupted it and it ended
     # lost     it said running, and neither its tmux session nor its recorded
     #          pid was there; what happened to it is not known
     # unknown  there is no status file to read
@@ -345,13 +358,25 @@ class Run:
             return "stopped"
         if status == "exit:lost":
             return "lost"
+        if status == "exit:3":
+            # A leaking run is `failed`, whether or not it was also stopped.
+            # The leak is the headline and the refusal below keys off the
+            # status, so nothing may reinterpret this one.
+            return "failed"
         if status.startswith("exit:"):
+            if self.was_stopped:
+                return "stopped"
             return "done" if status == "exit:0" else "failed"
         return "unknown"
 
     @property
     def exit_code(self):
-        """The numeric code, or None for running, stopped, lost and unknown."""
+        """The code the run exited with, or None when there is not one.
+
+        A stopped run now HAS one, because the stop no longer overwrites it:
+        it is null only when the status itself carries no number, which is
+        `running`, `exit:stopped`, `exit:lost` and `unknown`.
+        """
         status = self.status
         if not status.startswith("exit:"):
             return None
