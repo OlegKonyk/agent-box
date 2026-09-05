@@ -48,6 +48,10 @@ TOKEN_FILE = os.environ.get(
 TEXT_LIMIT = 160
 DETAIL_LIMIT = 120
 
+# System events the CLI emits for its own bookkeeping, several per turn, that
+# tell an operator nothing: token-count estimates while the model thinks.
+NOISY_SYSTEM_SUBTYPES = frozenset({"thinking_tokens"})
+
 # Hook events that say something the stream does not. PreToolUse and
 # PostToolUse are left out on purpose: the stream already carries the tool call
 # and its result, and printing both makes every tool use three lines.
@@ -549,6 +553,8 @@ class Run:
             elif subtype == "hook_started":
                 # The response carries everything the start does, plus the
                 # outcome. Printing both doubles every hook.
+                return
+            elif subtype in NOISY_SYSTEM_SUBTYPES:
                 return
             elif subtype == "hook_response":
                 outcome = obj.get("outcome")
