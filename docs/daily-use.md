@@ -438,6 +438,18 @@ the whole design: that guest port becomes reachable by any process on your Mac
 for as long as the VM runs. Forward the ports you actually want to look at, not
 a range.
 
+**Which bind addresses a forwarded port reaches.** Both of the forms you would
+normally write work — `ports: ["3000:3000"]`, which publishes on `0.0.0.0`, and
+`ports: ["127.0.0.1:3000:3000"]`. The one that does not is publishing to the
+guest's own interface address, `ports: ["192.168.5.15:3000:3000"]`; that socket
+answers inside the guest and nowhere else, and nothing reports why. `agentbox
+create` prints this beside the widening warning.
+
+**A port you did not forward is not reachable, even published on `0.0.0.0`.**
+That is enforced rather than assumed: `AGENTBOX-FWD` drops new connections
+arriving on the uplink, so a container published the default way is reachable
+from inside the guest and from nowhere else. The smoke test asserts both halves.
+
 **What containers can and cannot reach.** The same allowlist as the guest, and
 that is enforced rather than assumed: `AGENTBOX-FWD` is jumped to from
 `DOCKER-USER` rule 1, before any of Docker's own rules. So:
@@ -450,11 +462,24 @@ that is enforced rather than assumed: `AGENTBOX-FWD` is jumped to from
 | Docker Hub, ghcr.io, `download.docker.com` | works; that is how images are pulled |
 | anything else | rejected immediately, the same as from the guest |
 
-`agentbox firewall-check <repo>` proves it each time it runs: it makes sure
-`alpine:3` is present, pulling it through the allowlist if it is not, and then
-checks that a container cannot reach `example.com` and can reach
-`api.anthropic.com`. On an instance without Docker those three checks print
-`SKIP` with the reason, rather than quietly passing.
+`agentbox firewall-check <repo>` rebuilds the allowlist and then checks it,
+including from inside a container: that one cannot reach `example.com` and can
+reach `api.anthropic.com`. Three things make those two lines honest to read.
+
+They are **advisory**. They leave the machine, so they can fail for reasons that
+have nothing to do with this box, and a probe that needs the internet is not
+allowed to decide whether the box is safe to use. They print `WARN`, and the
+command's verdict is set by the ruleset checks alone.
+
+They are **skipped, out loud, rather than silently**: `SKIP` with the reason on
+an instance without Docker, on one whose daemon is not up yet, and on one where
+`alpine:3` is not present locally. The check deliberately does not pull it —
+see the next paragraph.
+
+And **nothing here pulls an image**. `docker system prune -af --volumes` below
+will delete `alpine:3`, and a firewall that re-pulled it every fifteen minutes
+because you tidied your disk would be a bad trade. Run one container of any
+kind, or `docker pull alpine:3` once, and the probes resume.
 
 **Rosetta, for amd64 images.** `--rosetta` at create time, and then
 `docker run --platform linux/amd64 …` works on Apple silicon. It needs Rosetta

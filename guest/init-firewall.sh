@@ -76,6 +76,31 @@ log() { printf '%s\n' "$*"; }
 
 docker_installed() { command -v docker >/dev/null 2>&1; }
 
+# A REACHABLE daemon, not an installed binary. The distinction is the whole of
+# finding B2, and it is a boot-time deadlock rather than a cosmetic one:
+# docker.service carries `After=agent-box-firewall.service`, so while this unit
+# runs at boot the daemon is queued behind it. docker.socket, however, is
+# already listening — so an unbounded `docker image inspect` connects, systemd
+# queues the docker.service start job that cannot run until this unit finishes,
+# and the unit waits for a reply that cannot come. Measured on a --docker box:
+# ten minutes in, `docker image inspect alpine:3` still running as a child of
+# init-firewall.sh, `docker.service start waiting` behind
+# `agent-box-firewall.service start running`, multi-user.target blocked, and
+# TimeoutStartUSec=infinity, so nothing would ever have broken it.
+#
+# The bound is what makes this safe: `timeout` turns the deadlock into a
+# five-second skip. Every other container call below is bounded for the same
+# reason — the firewall unit must never be held open by the runtime it exists
+# to constrain.
+DOCKER_INFO_TIMEOUT=5
+# 30s each, per the review. Nothing here pulls, so a probe is one container
+# start plus one bounded wget; 30 seconds is generous for that and short enough
+# that two of them cannot meaningfully delay a boot.
+DOCKER_PROBE_TIMEOUT=30
+docker_daemon_up() {
+    timeout "$DOCKER_INFO_TIMEOUT" docker info >/dev/null 2>&1
+}
+
 # The chain exists only once dockerd has run at least once.
 chain_exists() {
     local ipt="$1" chain="$2"
@@ -157,7 +182,7 @@ PROBE_IMAGE="alpine:3"
 # "connected", "blocked" or "error: ..." on stdout.
 container_probe() {
     local url="$1" out rc
-    out=$(docker run --rm --network bridge "$PROBE_IMAGE" \
+    out=$(timeout "$DOCKER_PROBE_TIMEOUT" docker run --rm --network bridge "$PROBE_IMAGE" \
               wget -T 5 -q -O /dev/null "$url" 2>&1) && rc=0 || rc=$?
     if [ "$rc" -eq 0 ]; then
         printf 'connected'
@@ -171,7 +196,17 @@ container_probe() {
 }
 
 verify() {
-    local failures=0
+    # Two counters, and the split is the whole of finding C1. `failures` are
+    # assertions about the RULESET — readable from the kernel, needing no
+    # network, and true or false regardless of what any remote host is doing.
+    # `warnings` are probes that leave the machine. A probe that needs the
+    # internet cannot be the thing that decides whether the box is safe to use:
+    # this function's return value is the unit's exit status, and a failed unit
+    # aborts provisioning, hard-closes the guest and makes guest/lib.sh refuse
+    # every run. Docker Hub having a bad minute is not a reason to do any of
+    # that. Only `failures` sets the exit status; `warnings` are reported, in
+    # the log and in `agentbox firewall-check`'s output, and that is all.
+    local failures=0 warnings=0
 
     # --- the mechanism itself ---------------------------------------------
 
@@ -202,6 +237,36 @@ verify() {
         log "FAIL  out-chain-first    OUTPUT rule 1 is not the ${CHAIN_OUT} jump"
         failures=$((failures + 1))
     fi
+
+    # The two chains say "this interface is not egress" in different languages.
+    # AGENTBOX-FWD asks the routing table (`! -o $UPLINK`); AGENTBOX-OUT names
+    # docker0 and the `br+` wildcard, which in iptables is a prefix match on
+    # "br". Those accepts sit AHEAD of the ipset match and the terminal REJECT,
+    # so if the uplink itself were ever matched by one of them, every packet
+    # leaving this guest would be accepted unfiltered and every other check here
+    # would still pass. It is not the case on any box this has run on — the
+    # uplink is eth0 — and it costs one comparison to know rather than assume.
+    #
+    # The alternative, using `! -o $UPLINK` in AGENTBOX-OUT too, was considered
+    # and rejected: it would accept traffic out of ANY future interface,
+    # including a tunnel, which is a wider hole than the one being closed.
+    # Naming the bridges explicitly is deny-by-default for interfaces nobody
+    # anticipated; this check is what makes the naming safe.
+    local vuplink
+    vuplink=$(uplink_iface)
+    case "$vuplink" in
+        br*|docker0)
+            log "FAIL  uplink-not-bridge  the uplink is '${vuplink}', which ${CHAIN_OUT}'s bridge accepts would match, bypassing the allowlist"
+            failures=$((failures + 1))
+            ;;
+        "")
+            log "FAIL  uplink-not-bridge  no default route, so the uplink cannot be identified"
+            failures=$((failures + 1))
+            ;;
+        *)
+            log "PASS  uplink-not-bridge  the uplink '${vuplink}' is not matched by ${CHAIN_OUT}'s bridge accepts"
+            ;;
+    esac
 
     if iptables -S "$CHAIN_OUT" 2>/dev/null | grep -q -- "--match-set ${IPSET_NAME} dst -j ACCEPT"; then
         log "PASS  allowlist-rule     the ${IPSET_NAME} ipset is referenced"
@@ -264,6 +329,17 @@ verify() {
         log "SKIP  docker-user-jump   Docker is not installed on this instance"
         log "SKIP  docker-egress      Docker is not installed on this instance"
         log "SKIP  docker-allowed     Docker is not installed on this instance"
+    elif ! docker_daemon_up; then
+        # Not a failure, and saying so is the point. At boot the daemon is
+        # ordered after this unit deliberately, so DOCKER-USER does not exist
+        # yet and no container can run; the jump is installed by the
+        # ExecStartPost hook the moment dockerd starts. Failing here would put
+        # the unit in `failed`, and guest/lib.sh refuses to start an agent on a
+        # box whose firewall unit is not active — a false report of an
+        # unprotected box, on a box that is in fact protected.
+        log "SKIP  docker-user-jump   the Docker daemon is not running (checked for ${DOCKER_INFO_TIMEOUT}s)"
+        log "SKIP  docker-egress      the Docker daemon is not running"
+        log "SKIP  docker-allowed     the Docker daemon is not running"
     else
         if chain_exists iptables "$DOCKER_USER"; then
             if [ "$(first_rule iptables "$DOCKER_USER")" = "-A ${DOCKER_USER} -j ${CHAIN_FWD}" ]; then
@@ -277,40 +353,51 @@ verify() {
             failures=$((failures + 1))
         fi
 
-        # Pulling the probe image is itself the registry test: the pull leaves
-        # the guest through AGENTBOX-OUT and only succeeds if the Docker Hub
-        # names are on the allowlist.
-        local probe_pull=""
-        if ! docker image inspect "$PROBE_IMAGE" >/dev/null 2>&1; then
-            probe_pull=$(docker pull -q "$PROBE_IMAGE" 2>&1) || probe_pull="FAILED: ${probe_pull}"
-        fi
-        if printf '%s' "$probe_pull" | grep -q '^FAILED'; then
-            log "FAIL  docker-egress      could not pull ${PROBE_IMAGE}: ${probe_pull}"
-            log "FAIL  docker-allowed     could not pull ${PROBE_IMAGE}"
-            failures=$((failures + 2))
+        # This unit does NOT pull. It used to, on the reasoning that the pull
+        # was itself the registry test — and that made a Docker Hub hiccup able
+        # to decide whether a new box was usable, because verify() is the
+        # script's exit status, provisioning restarts this unit under `set -e`,
+        # and the EXIT trap's second failure hard-closes the guest. An
+        # anonymous 429 from Docker Hub would have left a ten-minute
+        # `agentbox create` exiting non-zero and a brand-new VM on loopback and
+        # ssh only. The timer would also have re-pulled every fifteen minutes,
+        # on a box whose own documentation recommends `docker system prune -af`,
+        # which deletes the image.
+        #
+        # So: probe with what is already here, and say so when there is nothing
+        # to probe with. `docker pull alpine:3` as a registry test lives in the
+        # smoke test, where a failure is a test result rather than a boot
+        # outcome.
+        if ! timeout "$DOCKER_INFO_TIMEOUT" docker image inspect "$PROBE_IMAGE" >/dev/null 2>&1; then
+            log "SKIP  docker-egress      ${PROBE_IMAGE} is not present locally; not pulling from inside the firewall unit"
+            log "SKIP  docker-allowed     ${PROBE_IMAGE} is not present locally"
         else
             local r
             r=$(container_probe https://example.com)
             if [ "$r" = "blocked" ]; then
                 log "PASS  docker-egress      a container could not reach https://example.com"
             else
-                log "FAIL  docker-egress      a container reaching https://example.com: ${r}"
-                failures=$((failures + 1))
+                log "WARN  docker-egress      a container reaching https://example.com: ${r}"
+                warnings=$((warnings + 1))
             fi
 
             r=$(container_probe https://api.anthropic.com/)
             if [ "$r" = "connected" ]; then
                 log "PASS  docker-allowed     a container reached https://api.anthropic.com/"
             else
-                log "FAIL  docker-allowed     a container could not reach https://api.anthropic.com/: ${r}"
-                failures=$((failures + 1))
+                log "WARN  docker-allowed     a container could not reach https://api.anthropic.com/: ${r}"
+                warnings=$((warnings + 1))
             fi
         fi
     fi
 
     if [ "$failures" -ne 0 ]; then
-        log "firewall verification: ${failures} check(s) FAILED"
+        log "firewall verification: ${failures} check(s) FAILED, ${warnings} warning(s)"
         return 1
+    fi
+    if [ "$warnings" -ne 0 ]; then
+        log "firewall verification: ruleset checks all PASS, ${warnings} advisory warning(s) — see WARN above"
+        return 0
     fi
     log "firewall verification: all checks PASS"
     return 0
@@ -347,11 +434,31 @@ fi
 # api.github.com and must never be on the critical path of starting a daemon.
 
 docker_hook() {
-    local ipt rc=0 uplink
+    local ipt rc=0 uplink fatal
     uplink=$(uplink_iface)
 
     for ipt in iptables ip6tables; do
-        ensure_chain "$ipt" "$CHAIN_FWD"
+        # The v4 arm has to succeed; the v6 arm must never be able to take the
+        # daemon down with it. Docker's own daemon.json here sets "ipv6": false
+        # and Engine 28 still creates the v6 chains, so the v6 arm normally
+        # works — but "normally" is not a thing to hang a service start on. A
+        # kernel without ip6_tables, or an Engine built with v6 management off,
+        # would make this hook exit non-zero, and an ExecStartPost that exits
+        # non-zero makes systemd stop the service. A box created --docker would
+        # then have no Docker at all, explained by one journal line from a
+        # firewall script. v6 egress is closed by policy in any case, so a
+        # missing v6 DOCKER-USER is a warning, not a failure.
+        fatal=1
+        [ "$ipt" = "iptables" ] || fatal=0
+        if ! command -v "$ipt" >/dev/null 2>&1; then
+            log "WARN: docker-hook: ${ipt} is not installed; skipping"
+            continue
+        fi
+        ensure_chain "$ipt" "$CHAIN_FWD" || {
+            log "WARN: docker-hook: could not ensure ${CHAIN_FWD} in ${ipt}"
+            [ "$fatal" -eq 1 ] && rc=1
+            continue
+        }
         # An empty chain would let everything through to DOCKER-FORWARD. If the
         # full rebuild has not run yet, close the chain rather than leave it
         # open, and let the next timer tick fill it in properly.
@@ -366,18 +473,22 @@ docker_hook() {
                 "$ipt" -A "$CHAIN_FWD" -j REJECT --reject-with icmp6-adm-prohibited
             fi
         fi
-        "$ipt" -P FORWARD DROP
+        "$ipt" -P FORWARD DROP || true
         if chain_exists "$ipt" "$DOCKER_USER"; then
-            ensure_jump_first "$ipt" "$DOCKER_USER" "$CHAIN_FWD"
+            ensure_jump_first "$ipt" "$DOCKER_USER" "$CHAIN_FWD" || true
             if [ "$(first_rule "$ipt" "$DOCKER_USER")" = "-A ${DOCKER_USER} -j ${CHAIN_FWD}" ]; then
                 log "docker-hook: ${ipt} ${DOCKER_USER} rule 1 is the ${CHAIN_FWD} jump"
-            else
+            elif [ "$fatal" -eq 1 ]; then
                 log "ERROR: docker-hook could not place the ${CHAIN_FWD} jump in ${ipt} ${DOCKER_USER}" >&2
                 rc=1
+            else
+                log "WARN: docker-hook could not place the ${CHAIN_FWD} jump in ${ipt} ${DOCKER_USER}"
             fi
-        else
+        elif [ "$fatal" -eq 1 ]; then
             log "ERROR: docker-hook found no ${DOCKER_USER} chain in ${ipt}" >&2
             rc=1
+        else
+            log "WARN: docker-hook found no ${DOCKER_USER} chain in ${ipt} (v6 egress is closed by policy)"
         fi
     done
     return "$rc"
@@ -756,9 +867,26 @@ done
     # --- what containers may forward --------------------------------------
     #
     # Reached from DOCKER-USER rule 1, which FORWARD jumps to before anything of
-    # Docker's own. Anything not leaving by the uplink — container to container,
-    # a published port coming the other way — is returned unjudged, because it
-    # is not egress and DOCKER-FORWARD is the chain that decides it.
+    # Docker's own.
+    #
+    # Rule 1 is inbound, and it is here because the rest of this chain judges
+    # egress only. `docker run -p 8080:80` publishes on 0.0.0.0 by default;
+    # Docker DNATs such a packet in PREROUTING, so it is FORWARDed (in = uplink,
+    # out = a docker bridge) and never reaches INPUT, whose DROP policy is what
+    # implements "nothing the guest listens on is reachable from outside it".
+    # Without this rule the RETURN below would hand that packet to
+    # DOCKER-FORWARD, which accepts published-port traffic by construction. NEW
+    # only: the reply leg of a container's own outbound connection also arrives
+    # on the uplink, and is ESTABLISHED.
+    #
+    # Lima's own --forward is unaffected, and the reason is structural rather
+    # than lucky: it is served over ssh, so the connection to the published port
+    # is opened by sshd INSIDE the guest and leaves through OUTPUT, never
+    # crossing FORWARD from the uplink. Measured both ways in the smoke test.
+    printf -- '-A %s -i %s -m conntrack --ctstate NEW -j DROP\n' "$CHAIN_FWD" "$UPLINK"
+    # Anything not leaving by the uplink — container to container, a published
+    # port coming the other way — is returned unjudged, because it is not egress
+    # and DOCKER-FORWARD is the chain that decides it.
     printf -- '-A %s ! -o %s -j RETURN\n' "$CHAIN_FWD" "$UPLINK"
     printf -- '-A %s -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n' "$CHAIN_FWD"
     while read -r ns; do

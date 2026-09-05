@@ -46,6 +46,12 @@ INSTANCE="agent-box-${SMOKE_ID}"
 DOCKER_REPO="${TMP_ROOT}/dk-${SMOKE_ID}"
 DOCKER_INSTANCE="agent-box-dk-${SMOKE_ID}"
 FORWARD_PORT=3999
+# A SECOND forwarded port, carrying a container published the ordinary way
+# (`-p N:80`, which binds 0.0.0.0), and one port deliberately left out of
+# --forward. Together they pin down both halves of the claim the whole design
+# rests on: what --forward reaches, and what nothing reaches.
+FORWARD_PORT2=3998
+UNFORWARDED_PORT=3997
 
 PASS=0
 FAIL=0
@@ -478,7 +484,7 @@ FW_OUT="${TMP_ROOT}/firewall.out"
 rc=$?
 cat "$FW_OUT"
 if [ "$rc" -eq 0 ]; then ok "firewall-check exited 0"; else bad "firewall-check exited ${rc}"; fi
-for check in policy-drop policy-drop-v6 allowlist-rule literal-ip-denied foreign-dns-denied egress-denied anthropic-allowed github-allowed; do
+for check in policy-drop policy-drop-v6 allowlist-rule literal-ip-denied foreign-dns-denied egress-denied anthropic-allowed github-allowed uplink-not-bridge; do
     if grep -q "^PASS  ${check}" "$FW_OUT"; then
         ok "firewall check ${check}"
     else
@@ -2523,6 +2529,56 @@ cat "$FW_OUT2"
 if [ "$rc" -eq 0 ]; then ok "firewall-check still passes after the rebuild"; else bad "firewall-check failed after the rebuild"; fi
 
 # ===========================================================================
+step "9b. resize changes the VM's shape and the box comes back"
+# ===========================================================================
+#
+# `resize` is new in this branch, is documented in README and daily-use.md as
+# the answer to a full disk, and had no coverage at all — only its error paths,
+# exercised on the host. The happy path is the stop, the `limactl edit --set`,
+# the restart, and whether the guest agrees afterwards.
+#
+# Memory rather than disk: it moves in both directions, so the box is left as it
+# was found, and it does not depend on the guest growing a filesystem.
+
+RESIZE_BEFORE=$("$LIMACTL" list --format '{{.Memory}}' "$INSTANCE" 2>/dev/null)
+printf 'memory before: %s\n' "$RESIZE_BEFORE"
+
+RESIZE_OUT="${TMP_ROOT}/resize.out"
+run_bounded 900 "$RESIZE_OUT" "$AGENTBOX" resize "$CLEAN_REPO" --memory 7GiB
+resize_rc=$BOUNDED_RC
+tail -5 "$RESIZE_OUT"
+if [ "$resize_rc" -eq 0 ]; then
+    ok "agentbox resize exited 0"
+else
+    bad "agentbox resize exited ${resize_rc}"
+fi
+
+RESIZE_AFTER=$("$LIMACTL" list --format '{{.Memory}}' "$INSTANCE" 2>/dev/null)
+printf 'memory after: %s\n' "$RESIZE_AFTER"
+# limactl prints it humanised, so compare on the number rather than the string.
+if printf '%s' "$RESIZE_AFTER" | grep -q '7'; then
+    ok "limactl reports the new memory size after the resize"
+else
+    bad "limactl still reports ${RESIZE_AFTER} after a resize to 7GiB"
+fi
+
+if wait_for_guest 180; then
+    ok "the box answers again after the resize"
+else
+    bad "the box does not answer after the resize"
+fi
+GUESTMEM_OUT="${TMP_ROOT}/guest-mem.out"
+guest bash -c "awk '/MemTotal/ {print \"GUEST_MEMTOTAL_KB=\" \$2}' /proc/meminfo" > "$GUESTMEM_OUT" 2>&1
+cat "$GUESTMEM_OUT"
+GUESTMEM_KB=$(sed -n 's/^GUEST_MEMTOTAL_KB=//p' "$GUESTMEM_OUT" | head -1)
+# 7GiB is 7340032 KiB; the guest always reports a little less than the whole.
+if [ -n "$GUESTMEM_KB" ] && [ "$GUESTMEM_KB" -gt 6500000 ]; then
+    ok "the guest itself sees the larger memory (${GUESTMEM_KB} kB)"
+else
+    bad "the guest does not see the larger memory (${GUESTMEM_KB:-<unread>} kB)"
+fi
+
+# ===========================================================================
 step "10. destroy the instance, by bare name"
 # ===========================================================================
 #
@@ -2564,7 +2620,7 @@ printf 'It is slower than the first create; it is not stuck.\n'
 DK_CREATE_OUT="${TMP_ROOT}/dk-create.out"
 DK_TS=$(date +%s)
 run_bounded 2400 "$DK_CREATE_OUT" "$AGENTBOX" create "$DOCKER_REPO" \
-    --docker --playwright --rosetta --forward "$FORWARD_PORT"
+    --docker --playwright --rosetta --forward "${FORWARD_PORT},${FORWARD_PORT2}"
 dk_rc=$BOUNDED_RC
 cat "$DK_CREATE_OUT"
 printf 'docker-profile create took %s seconds\n' "$(( $(date +%s) - DK_TS ))"
@@ -2575,7 +2631,7 @@ if grep -q 'WARNING: --forward' "$DK_CREATE_OUT"; then
 else
     bad "--forward printed no warning"
 fi
-if grep -qE "^  forwarded +${FORWARD_PORT}\$" "$DK_CREATE_OUT"; then
+if grep -qE "^  forwarded +${FORWARD_PORT} ${FORWARD_PORT2}\$" "$DK_CREATE_OUT"; then
     ok "the summary records the forwarded port"
 else
     bad "the summary does not record the forwarded port"
@@ -2656,7 +2712,14 @@ docker run --rm alpine:3 wget -T 5 -q -O /dev/null https://api.anthropic.com/ 2>
 echo "ANTHROPIC_RC=$?"
 ' > "$CEG_OUT" 2>&1
 cat "$CEG_OUT"
-if grep -q '^EXAMPLE_RC=0' "$CEG_OUT"; then
+# Positively, both halves. `if grep EXAMPLE_RC=0 then bad else ok` scored the
+# ABSENCE of evidence as the pass: a regression that stopped every `docker run`
+# from working at all — the socket-owner drop-in is exactly the kind of thing
+# that could — would have printed this as a PASS on a box where containers were
+# never tested. The line has to be there, and it has to say non-zero.
+if ! grep -q '^EXAMPLE_RC=' "$CEG_OUT"; then
+    bad "the container egress probe produced no EXAMPLE_RC line; containers were not tested"
+elif grep -q '^EXAMPLE_RC=0' "$CEG_OUT"; then
     bad "a container reached https://example.com"
 else
     ok "a container could not reach https://example.com"
@@ -2671,6 +2734,7 @@ fi
 
 printf -- '\n--- two containers on a user-defined network reach each other ---\n'
 C2C_OUT="${TMP_ROOT}/c2c.out"
+# shellcheck disable=SC2016  # every expansion here is the guest's, not this shell's.
 run_bounded 300 "$C2C_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c '
 set -e
 docker network create abxnet >/dev/null 2>&1 || true
@@ -2678,9 +2742,11 @@ docker rm -f abxsrv >/dev/null 2>&1 || true
 docker run -d --name abxsrv --network abxnet alpine:3 \
     sh -c "while true; do printf \"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO\" | nc -l -p 8000; done" >/dev/null
 sleep 3
-docker run --rm --network abxnet alpine:3 wget -T 5 -q -O - http://abxsrv:8000/
-echo ""
-echo "C2C_RC=$?"
+# $? of the docker run, not of the echo that used to sit between them: the
+# old form always reported 0, so half the assertion below could never fail.
+c2c_out=$(docker run --rm --network abxnet alpine:3 wget -T 5 -q -O - http://abxsrv:8000/ 2>&1); c2c_rc=$?
+printf "%s\n" "$c2c_out"
+echo "C2C_RC=$c2c_rc"
 docker rm -f abxsrv >/dev/null 2>&1 || true
 '
 cat "$C2C_OUT"
@@ -2733,18 +2799,118 @@ else
     bad "the forwarded port does not answer on the host"
 fi
 
+printf -- '\n--- the default holds: what --forward reaches, and what nothing reaches ---\n'
+# Three claims are made in three places — lima/agent-box.yaml, README's Limits,
+# and docs/decisions.md — that nothing the guest listens on is reachable from
+# outside it unless --forward said so. `docker run -p N:80` publishes on
+# 0.0.0.0, Docker DNATs the inbound packet in PREROUTING, and it is then
+# FORWARDed rather than INPUTed: it never meets the INPUT DROP policy those
+# claims rest on. AGENTBOX-FWD rule 1 is what makes them true, and this is the
+# test of it. The forwarded twin is published exactly the same way, so the two
+# differ only in whether the port was named at create time.
+PUB_OUT="${TMP_ROOT}/published.out"
+run_bounded 300 "$PUB_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c "
+sudo iptables -S AGENTBOX-FWD | sed -n '2p' | sed 's/^/FWD_RULE1=/'
+UPLINK=\$(ip route | awk '/^default/ {print \$5; exit}')
+echo \"UPLINK=\$UPLINK\"
+ip -4 -o addr show dev \"\$UPLINK\" | awk '{print \$4}' | cut -d/ -f1 | sed 's/^/GUEST_ADDR=/'
+docker rm -f abx-unforwarded abx-forwarded >/dev/null 2>&1 || true
+docker run -d --name abx-unforwarded -p ${UNFORWARDED_PORT}:80 python:3-alpine python -m http.server 80 >/dev/null
+docker run -d --name abx-forwarded   -p ${FORWARD_PORT2}:80   python:3-alpine python -m http.server 80 >/dev/null
+sleep 4
+docker ps --format '{{.Names}} {{.Ports}}'
+for i in \$(seq 1 15); do
+    a=\$(curl -sS -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:${UNFORWARDED_PORT}/ 2>/dev/null || true)
+    b=\$(curl -sS -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:${FORWARD_PORT2}/ 2>/dev/null || true)
+    [ \"\$a\" = 200 ] && [ \"\$b\" = 200 ] && break
+    sleep 2
+done
+echo \"GUEST_UNFORWARDED=\$a\"
+echo \"GUEST_FORWARDED=\$b\"
+"
+cat "$PUB_OUT"
+
+# Rule 1, by shape. A published port reachable from nowhere proves nothing if
+# the reason is that the container never came up.
+if grep -qE '^FWD_RULE1=-A AGENTBOX-FWD -i [a-z0-9]+ -m conntrack --ctstate NEW -j DROP$' "$PUB_OUT"; then
+    ok "AGENTBOX-FWD rule 1 drops NEW connections arriving on the uplink"
+else
+    bad "AGENTBOX-FWD rule 1 is not the inbound drop"
+fi
+if grep -q '^GUEST_UNFORWARDED=200' "$PUB_OUT"; then
+    ok "the unforwarded container is published and answers inside the guest"
+else
+    bad "the unforwarded container does not answer inside the guest; the checks below would be vacuous"
+fi
+if grep -q '^GUEST_FORWARDED=200' "$PUB_OUT"; then
+    ok "the forwarded container is published and answers inside the guest"
+else
+    bad "the forwarded container does not answer inside the guest"
+fi
+
+GUEST_ADDR=$(sed -n 's/^GUEST_ADDR=//p' "$PUB_OUT" | head -1)
+printf 'the guest is at %s\n' "${GUEST_ADDR:-<unknown>}"
+if [ -n "$GUEST_ADDR" ]; then
+    VM_HTTP=$(curl -sS -m 8 -o /dev/null -w '%{http_code}' "http://${GUEST_ADDR}:${UNFORWARDED_PORT}/" 2>/dev/null || true)
+    printf 'host curl http://%s:%s/ -> %s\n' "$GUEST_ADDR" "$UNFORWARDED_PORT" "${VM_HTTP:-<no answer>}"
+    if [ "$VM_HTTP" = "200" ]; then
+        bad "a published container port is reachable from the Mac at the VM's address"
+    else
+        ok "a published container port is NOT reachable from the Mac at the VM's address"
+    fi
+else
+    bad "could not read the guest's address, so the VM-address check did not run"
+fi
+
+LOOP_HTTP=$(curl -sS -m 8 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${UNFORWARDED_PORT}/" 2>/dev/null || true)
+printf 'host curl http://127.0.0.1:%s/ -> %s\n' "$UNFORWARDED_PORT" "${LOOP_HTTP:-<no answer>}"
+if [ "$LOOP_HTTP" = "200" ]; then
+    bad "a port that was never named to --forward answers on the host"
+else
+    ok "a port that was never named to --forward does not answer on the host"
+fi
+
+# And the other half: --forward still works for the ORDINARY publish form, so
+# rule 1 has not broken the one hole the design deliberately keeps. Lima serves
+# a forwarded port over ssh, from inside the guest, so it never crosses FORWARD
+# from the uplink — this is the assertion that says so out loud.
+FWD2_HTTP=""
+for _try in 1 2 3 4 5 6 7 8 9 10; do
+    FWD2_HTTP=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${FORWARD_PORT2}/" 2>/dev/null || true)
+    [ "$FWD2_HTTP" = "200" ] && break
+    sleep 2
+done
+printf 'host curl http://127.0.0.1:%s/ -> %s\n' "$FORWARD_PORT2" "${FWD2_HTTP:-<no answer>}"
+if [ "$FWD2_HTTP" = "200" ]; then
+    ok "a 0.0.0.0-published port that WAS named to --forward answers on the host"
+else
+    bad "--forward no longer reaches a container published the ordinary way"
+fi
+
 printf -- '\n--- a daemon restart leaves no unfiltered window ---\n'
 # ExecStartPost, not the 15-minute timer. `systemctl restart docker` returning
 # means the hook has already run, so the jump must be back immediately — not
 # eventually.
 RESTART_OUT="${TMP_ROOT}/docker-restart.out"
+# shellcheck disable=SC2016  # every expansion here is the guest's, not this shell's.
 run_bounded 300 "$RESTART_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c '
-sudo iptables -D DOCKER-USER -j AGENTBOX-FWD 2>/dev/null || true
+# The deletion is asserted, not swallowed. `|| true` on it meant that if the
+# rule ever stopped matching this exact form, the chain would still hold the
+# jump, the pre-restart print below would contain it, and the whole check would
+# pass without the ExecStartPost hook having been exercised at all.
+if sudo iptables -D DOCKER-USER -j AGENTBOX-FWD 2>/dev/null; then
+    echo "DELETE_RC=0"
+else
+    echo "DELETE_RC=1"
+fi
 echo "--- jump deliberately removed ---"
 sudo iptables -S DOCKER-USER
 sudo systemctl restart docker
 echo "RESTART_RC=$?"
 echo "--- immediately after the restart returned ---"
+# Rule 1 specifically, which is what the spec asks for and what the earlier
+# check does. `-S` prints the chain declaration first, so the 2nd line is rule 1.
+echo "POST_RULE1=$(sudo iptables -S DOCKER-USER | sed -n "2p")"
 sudo iptables -S DOCKER-USER
 docker run --rm alpine:3 echo CONTAINER_STILL_RUNS
 '
@@ -2754,10 +2920,15 @@ if grep -q '^RESTART_RC=0' "$RESTART_OUT"; then
 else
     bad "systemctl restart docker did not exit 0"
 fi
-if [ "$(grep -c -- '-A DOCKER-USER -j AGENTBOX-FWD' "$RESTART_OUT")" -ge 1 ]; then
-    ok "the AGENTBOX-FWD jump was back in DOCKER-USER as soon as the restart returned"
+if grep -q '^DELETE_RC=0' "$RESTART_OUT"; then
+    ok "the AGENTBOX-FWD jump was really removed before the restart"
 else
-    bad "the AGENTBOX-FWD jump was not restored by the restart"
+    bad "the jump could not be removed, so the restart check would prove nothing"
+fi
+if grep -qx 'POST_RULE1=-A DOCKER-USER -j AGENTBOX-FWD' "$RESTART_OUT"; then
+    ok "DOCKER-USER rule 1 is the AGENTBOX-FWD jump as soon as the restart returned"
+else
+    bad "DOCKER-USER rule 1 is not the AGENTBOX-FWD jump after the restart"
 fi
 if grep -q 'CONTAINER_STILL_RUNS' "$RESTART_OUT"; then
     ok "a container still runs after the daemon restart"
@@ -2811,7 +2982,7 @@ cat "$DFW_OUT"
 if [ "$dfw_rc" -eq 0 ]; then ok "firewall-check exited 0 on the Docker instance"; else bad "firewall-check exited ${dfw_rc} on the Docker instance"; fi
 for check in policy-drop policy-drop-v6 forward-drop out-chain-first allowlist-rule \
              literal-ip-denied foreign-dns-denied egress-denied anthropic-allowed github-allowed \
-             docker-user-jump docker-egress docker-allowed; do
+             uplink-not-bridge docker-user-jump docker-egress docker-allowed; do
     if grep -q "^PASS  ${check}" "$DFW_OUT"; then
         ok "firewall check ${check} (docker instance)"
     else
@@ -2901,6 +3072,9 @@ for u in http://ports.ubuntu.com/ \
          https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt \
          https://cdn.playwright.dev/ \
          https://ghcr.io/v2/ \
+         https://pkg-containers.githubusercontent.com/ \
+         https://production.cloudflare.docker.com/ \
+         https://production.cloudfront.docker.com/ \
          https://auth.docker.io/ \
          https://registry-1.docker.io/v2/; do
     code=000
@@ -2913,13 +3087,38 @@ for u in http://ports.ubuntu.com/ \
 done
 '
 grep '^REACH' "$AL_OUT" || cat "$AL_OUT"
-for host in ports.ubuntu.com download.docker.com nodejs.org cdn.playwright.dev ghcr.io auth.docker.io registry-1.docker.io; do
+# The three added last are the ones the review found unexercised: the two Docker
+# Hub blob CDNs (one of which was added only after a real pull was redirected to
+# it and refused) and the ghcr blob host, whose entry the allowlist's own comment
+# flags as community-sourced.
+for host in ports.ubuntu.com download.docker.com nodejs.org cdn.playwright.dev ghcr.io \
+            auth.docker.io registry-1.docker.io pkg-containers.githubusercontent.com \
+            production.cloudflare.docker.com production.cloudfront.docker.com; do
     if grep -E "^REACH [1-5][0-9][0-9] " "$AL_OUT" | grep -q -- "${host}"; then
         ok "allowlisted and reachable: ${host}"
     else
         bad "allowlisted but NOT reachable: ${host}"
     fi
 done
+
+printf -- '\n--- a real pull from ghcr.io, not just a reachable /v2/ ---\n'
+# `https://ghcr.io/v2/` answering 401 proves the registry API is reachable; it
+# does NOT prove a layer can be fetched, because the blobs come from
+# pkg-containers.githubusercontent.com. Nothing in the suite pulled from ghcr,
+# so that entry was carried on a community-sourced comment. distroless/static is
+# a few hundred kilobytes and has a linux/arm64 manifest.
+GHCR_OUT="${TMP_ROOT}/ghcr-pull.out"
+run_bounded 300 "$GHCR_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c '
+docker rmi ghcr.io/distroless/static:latest >/dev/null 2>&1 || true
+if docker pull -q ghcr.io/distroless/static:latest; then echo "GHCR_PULL_RC=0"; else echo "GHCR_PULL_RC=1"; fi
+docker image inspect ghcr.io/distroless/static:latest --format "GHCR_ARCH={{.Architecture}}" 2>&1 | tail -1
+'
+cat "$GHCR_OUT"
+if grep -q '^GHCR_PULL_RC=0' "$GHCR_OUT"; then
+    ok "a real layer pull from ghcr.io succeeded through the allowlist"
+else
+    bad "pulling from ghcr.io failed; ghcr.io and pkg-containers.githubusercontent.com are on the allowlist but untested until now"
+fi
 
 printf -- '\n--- and a name that is not on it still is not ---\n'
 NAL_OUT="${TMP_ROOT}/allowlist-negative.out"
@@ -2933,6 +3132,132 @@ fi
 
 printf -- '\n--- tear the stack down ---\n'
 dguest bash -c 'cd /tmp/abx-stack && docker compose down 2>&1 | tail -2; docker network rm abxnet >/dev/null 2>&1; true'
+
+# ===========================================================================
+step "12d. a --docker box comes back from a stop/start without deadlocking"
+# ===========================================================================
+#
+# The regression test for a boot deadlock that this suite could not have caught,
+# because it only ever created a --docker instance and destroyed it — step 9's
+# stop/start runs on the plain box.
+#
+# docker.service carries `After=agent-box-firewall.service`, so at boot the
+# daemon is queued behind the firewall unit. docker.socket is listening anyway,
+# so an unbounded `docker image inspect` inside verify() connected, systemd
+# queued the docker.service start job that could not run until the firewall unit
+# finished, and the unit waited for a reply that could never come. Measured
+# before the fix: ten minutes in, `docker.service start waiting` behind
+# `agent-box-firewall.service start running`, multi-user.target blocked,
+# TimeoutStartUSec=infinity, and guest/lib.sh refusing every run because a unit
+# stuck in `activating` is not active.
+#
+# So the assertions below are about the unit and the job queue, not about a
+# symptom: a box can look reachable while its boot is still wedged.
+
+DK_STOP_OUT="${TMP_ROOT}/dk-stop.out"
+run_bounded 300 "$DK_STOP_OUT" "$AGENTBOX" stop "$DOCKER_INSTANCE"
+dk_stop_rc=$BOUNDED_RC
+tail -3 "$DK_STOP_OUT"
+if [ "$dk_stop_rc" -eq 0 ]; then
+    ok "agentbox stop exited 0 on the Docker instance"
+else
+    bad "agentbox stop exited ${dk_stop_rc} on the Docker instance"
+fi
+
+DK_START_OUT="${TMP_ROOT}/dk-start.out"
+DK_START_T0=$(date +%s)
+run_bounded 900 "$DK_START_OUT" "$AGENTBOX" start "$DOCKER_REPO"
+dk_start_rc=$BOUNDED_RC
+printf 'docker-profile restart took %s seconds\n' "$(( $(date +%s) - DK_START_T0 ))"
+tail -3 "$DK_START_OUT"
+if [ "$dk_start_rc" -eq 0 ]; then
+    ok "agentbox start exited 0 on the Docker instance"
+else
+    bad "agentbox start exited ${dk_start_rc} on the Docker instance"
+fi
+
+# Independently of what limactl reported. The guest-side facts below are the
+# deadlock test; `agentbox start`'s exit status also depends on Lima's own
+# readiness probes, which is a different thing and is asserted separately above.
+dk_up=0
+for _try in $(seq 1 30); do
+    if "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- true >/dev/null 2>&1; then
+        dk_up=1; break
+    fi
+    sleep 5
+done
+if [ "$dk_up" -eq 1 ]; then
+    ok "the Docker instance answers again after the restart"
+else
+    bad "the Docker instance never answered after the restart"
+fi
+
+DK_BOOT_OUT="${TMP_ROOT}/dk-boot.out"
+# shellcheck disable=SC2016  # every expansion here is the guest's, not this shell's.
+run_bounded 180 "$DK_BOOT_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c '
+echo "FW_STATE=$(systemctl is-active agent-box-firewall.service)"
+echo "DOCKER_STATE=$(systemctl is-active docker.service)"
+echo "QUEUED_JOBS=$(systemctl list-jobs --no-legend 2>/dev/null | wc -l | tr -d " ")"
+systemctl list-jobs --no-pager 2>&1 | sed "s/^/JOBS: /"
+# The exact expression guest/lib.sh gates every run on.
+if systemctl is-active --quiet agent-box-firewall.service; then
+    echo "RUN_GATE=passes"
+else
+    echo "RUN_GATE=fails"
+fi
+echo "--- the docker checks on this boot ---"
+sudo journalctl -u agent-box-firewall.service -b --no-pager 2>&1 \
+    | grep -E "docker-user-jump|docker-egress|docker-allowed" | tail -6
+'
+cat "$DK_BOOT_OUT"
+
+if grep -q '^FW_STATE=active' "$DK_BOOT_OUT"; then
+    ok "the firewall unit is active after the restart, not activating or failed"
+else
+    bad "the firewall unit is not active after the restart: $(sed -n 's/^FW_STATE=//p' "$DK_BOOT_OUT")"
+fi
+if grep -q '^DOCKER_STATE=active' "$DK_BOOT_OUT"; then
+    ok "docker.service started after the restart"
+else
+    bad "docker.service did not start after the restart"
+fi
+if grep -q '^QUEUED_JOBS=0' "$DK_BOOT_OUT"; then
+    ok "systemd has no jobs still waiting, so the boot completed"
+else
+    bad "systemd still has queued jobs after the restart, which is the deadlock's signature"
+fi
+if grep -q '^RUN_GATE=passes' "$DK_BOOT_OUT"; then
+    ok "the run precondition guest/lib.sh applies passes immediately after start"
+else
+    bad "the run precondition fails after start; agentbox run would refuse on a protected box"
+fi
+# SKIP at boot is the correct outcome, PASS is correct once the daemon is up,
+# and FAIL is the bug. Any FAIL among the three is what put the unit in failed.
+if grep -qE '^(FAIL)  docker-(user-jump|egress|allowed)' "$DK_BOOT_OUT"; then
+    bad "a container check FAILED on the boot-time firewall run"
+else
+    ok "no container check FAILED on the boot-time firewall run"
+fi
+
+# And the thing the deadlock actually broke, end to end: agent-run's own
+# precondition. RUN_GATE above evaluates the exact expression guest/lib.sh
+# applies, which is the load-bearing assertion. This one drives the real command
+# and asserts the firewall is not what it complains about — the box has no
+# token, so it must stop at the token and nowhere else.
+DK_RUN_OUT="${TMP_ROOT}/dk-run.out"
+printf 'Do nothing.\n' > "${TMP_ROOT}/dk-noop-brief.md"
+run_bounded 240 "$DK_RUN_OUT" "$AGENTBOX" run "$DOCKER_REPO" "${TMP_ROOT}/dk-noop-brief.md" --wait
+cat "$DK_RUN_OUT"
+if grep -q 'egress firewall is not active' "$DK_RUN_OUT"; then
+    bad "agent-run refused on the firewall right after a restart, which is the deadlock's symptom"
+else
+    ok "agent-run did not refuse on the firewall after a restart"
+fi
+if grep -q 'no token at' "$DK_RUN_OUT"; then
+    ok "agent-run got as far as the token check on the restarted Docker box"
+else
+    bad "agent-run stopped somewhere other than the token check"
+fi
 
 # ===========================================================================
 step "13. destroy the Docker instance"

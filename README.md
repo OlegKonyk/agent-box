@@ -77,7 +77,7 @@ One instance per repository, named `agent-box-<repo basename>`.
 | `agentbox stop <repo\|name>` | Stop the VM. |
 | `agentbox destroy <repo\|name>` | Stop and delete the VM, and remind you to revoke the token. |
 | `agentbox status [repo] [--json] [--watch [SECS]]` | One line per box: current run, sessions, firewall. |
-| `agentbox firewall-check <repo\|name>` | Re-run the egress verification inside the VM. |
+| `agentbox firewall-check <repo\|name>` | Rebuild the egress allowlist and re-verify it, inside the VM. The container probes are advisory. |
 
 `run` takes `--model M`, `--max-turns N`, `--max-budget-usd X`, `--wait` and
 `--notify`. `resize`, `stop`, `destroy` and `firewall-check` also take a bare
@@ -104,7 +104,7 @@ decided when it is made, not adjusted while it runs.
 | `--docker` | Docker Engine, buildx and compose inside the guest. Containers are held to the same egress allowlist as the guest itself. |
 | `--playwright` | Node 22 from nodejs.org, plus the system libraries `playwright install-deps` installs. Browsers are not baked in: each repository's own Playwright downloads the builds it was pinned against, on first use. |
 | `--rosetta` | Run `linux/amd64` images on Apple silicon. Needs Rosetta 2 on the Mac; `softwareupdate --install-rosetta` if Lima stalls at "Installing rosetta". |
-| `--forward PORT[,PORT...]` | Forward guest `127.0.0.1:PORT` to host `127.0.0.1:PORT`. A widening — see Limits below. |
+| `--forward PORT[,PORT...]` | Forward guest `127.0.0.1:PORT` to host `127.0.0.1:PORT`. Reaches a guest socket bound to `127.0.0.1` or `0.0.0.0`, not one bound only to the guest's own address. A widening — see Limits below. |
 | `--cpus N` | Default 4. |
 | `--memory SIZE` | Default `6GiB`, or `8GiB` with `--docker`. |
 | `--disk SIZE` | Default `30GiB`, or `60GiB` with `--docker`. |
@@ -203,6 +203,19 @@ What of `claude/` crosses into the guest, and what is refused, is in
   root-equivalent on that guest. It changes nothing about the threat model,
   because that user already has passwordless sudo, but it is worth knowing it
   is there.
+- **Containers inherit the token.** The CLI is given its credential in its
+  environment, so everything it spawns for the length of a run can read it,
+  including `docker`. `docker compose` also interpolates it into a compose
+  file that asks for `${CLAUDE_CODE_OAUTH_TOKEN}`, with no `-e` and nothing
+  that looks unusual in the log. The VM boundary and the egress allowlist are
+  what contain it; the token is meant to be revocable, not secret from the
+  agent. See docs/decisions.md.
+- **A macvlan or ipvlan network escapes the allowlist.** Container egress is
+  filtered in `DOCKER-USER`, which only sees traffic that traverses `FORWARD` —
+  true of bridge networks, not of macvlan or ipvlan, whose packets leave
+  through a sub-interface of the NIC. `agentbox firewall-check` still passes,
+  because it probes on a bridge. The firewall is a guard rail against
+  carelessness; the VM is the boundary.
 - **DNS resolves through the host's resolver.** The guest can resolve internal
   names it cannot connect to, and each lookup reaches the host's resolver with
   the VM as its origin. See "What the guest can still see: names" in

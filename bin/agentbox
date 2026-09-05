@@ -64,7 +64,7 @@ usage: ${PROG} <command> [args]
   status [repo] [--json] [--watch [SECS]]
                                     one line per box: run, sessions, firewall
                                     (--watch needs a named box)
-  firewall-check <repo|name>        re-run the egress verification inside the VM
+  firewall-check <repo|name>        rebuild the allowlist and re-verify, in the VM
   help                              this message
 
 run options:
@@ -438,16 +438,35 @@ cmd_create() {
     local forward="" cpus="" memory="" disk=""
     # The operands are already out of the way; what is left is options, and
     # split_args has kept each valued option next to its value.
+    #
+    # `[ -n "${2:-}" ] || die` rather than `${2:?...}`: split_args guarantees a
+    # value is PRESENT, so the only case left is an empty one, and `${2:?}`
+    # answers that with bash's own diagnostic —
+    # `./bin/agentbox: line 447: 2: --memory needs a value` — instead of the
+    # `agentbox: ...` shape every other error in this file uses.
     set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
     while [ $# -gt 0 ]; do
         case "$1" in
             --docker)     docker=true; shift ;;
             --playwright) playwright=true; shift ;;
             --rosetta)    rosetta=true; shift ;;
-            --forward)    forward="${2:?--forward needs a port or comma-separated list}"; shift 2 ;;
-            --cpus)       cpus="${2:?--cpus needs a value}"; shift 2 ;;
-            --memory)     memory="${2:?--memory needs a value}"; shift 2 ;;
-            --disk)       disk="${2:?--disk needs a value}"; shift 2 ;;
+            --forward)
+                [ -n "${2:-}" ] || die "--forward needs a port or comma-separated list"
+                # Appended, not assigned. The flag is plural in spirit, the
+                # documented way to name several ports is a comma list, and
+                # `--forward 3000 --forward 8080` is the shape a reader reaches
+                # for first — which used to keep only the second one, silently.
+                if [ -n "$forward" ]; then forward="${forward},${2}"; else forward="$2"; fi
+                shift 2 ;;
+            --cpus)
+                [ -n "${2:-}" ] || die "--cpus needs a value"
+                cpus="$2"; shift 2 ;;
+            --memory)
+                [ -n "${2:-}" ] || die "--memory needs a value"
+                memory="$2"; shift 2 ;;
+            --disk)
+                [ -n "${2:-}" ] || die "--disk needs a value"
+                disk="$2"; shift 2 ;;
             *) die "unknown option: $1" ;;
         esac
     done
@@ -521,6 +540,10 @@ cmd_create() {
     info "profile: docker=${docker} playwright=${playwright} rosetta=${rosetta}"
     if [ "${#forward_ports[@]}" -gt 0 ]; then
         info "WARNING: --forward ${forward_ports[*]} opens a hole in the other direction. Every one of those guest ports becomes reachable from any process on this Mac at 127.0.0.1, for as long as the VM runs. The default is that nothing the guest listens on is reachable from the host at all."
+        # Measured, because the answer is not the obvious one and the failure is
+        # silent: a forwarded port whose guest socket is bound to the wrong
+        # address simply does not answer on the Mac, and nothing says why.
+        info "note: a forwarded port only reaches a guest socket bound to 127.0.0.1 or 0.0.0.0 — 'docker run -p ${forward_ports[0]}:...' and '-p 127.0.0.1:${forward_ports[0]}:...' both work, '-p <the guest's own address>:${forward_ports[0]}:...' does not."
     fi
 
     "$LIMACTL" create --tty=false "${create_args[@]}" "$LIMA_TEMPLATE"
@@ -558,9 +581,15 @@ cmd_resize() {
     set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
     while [ $# -gt 0 ]; do
         case "$1" in
-            --cpus)   cpus="${2:?--cpus needs a value}"; shift 2 ;;
-            --memory) memory="${2:?--memory needs a value}"; shift 2 ;;
-            --disk)   disk="${2:?--disk needs a value}"; shift 2 ;;
+            --cpus)
+                [ -n "${2:-}" ] || die "--cpus needs a value"
+                cpus="$2"; shift 2 ;;
+            --memory)
+                [ -n "${2:-}" ] || die "--memory needs a value"
+                memory="$2"; shift 2 ;;
+            --disk)
+                [ -n "${2:-}" ] || die "--disk needs a value"
+                disk="$2"; shift 2 ;;
             *) die "unknown option: $1" ;;
         esac
     done
@@ -1341,9 +1370,23 @@ cmd_firewall_check() {
     inst=$(instance_name "${ABX_POSV[0]}")
     require_limactl
     require_instance "$inst"
-    # Under sudo: the verification reads the live ruleset with `iptables -S`,
-    # which needs CAP_NET_ADMIN.
-    guest_shell "$inst" sudo /opt/agent-box/guest/init-firewall.sh --verify-only
+    # A full run: REBUILD the allowlist, then verify. Not `--verify-only`.
+    #
+    # Four places in the documentation offered this command as the fix for a
+    # problem only a rebuild solves — a name added to allowlist.local, or a CDN
+    # that handed out an address which was not in the ipset when it was last
+    # resolved — and `--verify-only` returns before the allowlist is even read.
+    # The operator saw every line PASS and the download was refused again, with
+    # nothing to say why. The command now does what every one of those sentences
+    # says it does.
+    #
+    # `--verify-only` stays as the guest-side flag for anything that wants the
+    # checks without the rebuild: it needs no DNS and no api.github.com, which
+    # is what makes it safe to call from a status path.
+    #
+    # Under sudo: the rebuild writes the ruleset and the verification reads it,
+    # and both need CAP_NET_ADMIN.
+    guest_shell "$inst" sudo /opt/agent-box/guest/init-firewall.sh
 }
 
 # ---------------------------------------------------------------------------

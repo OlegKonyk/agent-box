@@ -91,6 +91,15 @@ ssh:
 # directory, which Lima's default template mounts read-only. The agent sees one
 # repository, this checkout, and the host's agent-box config — nothing else
 # belonging to the host user.
+#
+# One exception, and it is named here because this comment is where a reviewer
+# comes to answer "what of the host can this VM see". `agentbox create
+# --rosetta` passes `limactl create --rosetta`, which exposes the host's Rosetta
+# runtime to the guest as a FOURTH virtiofs share and registers it with
+# binfmt_misc — guest/provision.sh checks /proc/sys/fs/binfmt_misc/rosetta,
+# which is the evidence it arrived. The content is Apple's own translation
+# binaries, not the user's data, and the share is absent without --rosetta. But
+# "exactly three mounts" is true only of a box created without it.
 param:
   # Placeholders only. bin/agentbox always overrides all three with --param, so
   # that `limactl validate` on the bare template still resolves to real paths.

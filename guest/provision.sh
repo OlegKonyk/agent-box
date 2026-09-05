@@ -176,21 +176,55 @@ REQUIRED_PKGS=(iptables ipset dnsutils jq curl git ca-certificates tmux procps)
 [ "$WANT_PLAYWRIGHT" = true ] && REQUIRED_PKGS+=(xz-utils python3-venv python3-pip)
 # `aggregate` merges the GitHub CIDR list; the firewall works without it.
 OPTIONAL_PKGS=(aggregate)
+# Attempted once, then never again, and this marker is what makes "once" true.
+# An optional package that is permanently unavailable — dropped from the
+# archive, missing on this architecture — is missing on every subsequent boot
+# too. Folded into the same `missing` list as the required ones, it would call
+# open_network_for_provisioning() at every single start, so a box would spend an
+# apt run with ACCEPT policies and the AGENTBOX chains flushed, every morning,
+# for ever, to retry something that cannot succeed. Only a missing REQUIRED
+# package may reopen the network now.
+OPTIONAL_MARKER=/var/lib/agent-box/optional-pkgs-attempted
+install -d -m 0755 /var/lib/agent-box
 
-missing=()
-for pkg in "${REQUIRED_PKGS[@]}" "${OPTIONAL_PKGS[@]}"; do
-    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q '^install ok installed$' || missing+=("$pkg")
+missing_required=()
+for pkg in "${REQUIRED_PKGS[@]}"; do
+    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q '^install ok installed$' || missing_required+=("$pkg")
+done
+missing_optional=()
+for pkg in "${OPTIONAL_PKGS[@]}"; do
+    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q '^install ok installed$' || missing_optional+=("$pkg")
 done
 
-if [ ${#missing[@]} -gt 0 ]; then
-    log "Installing: ${missing[*]}"
+try_optional=0
+if [ ${#missing_optional[@]} -gt 0 ] && [ ! -f "$OPTIONAL_MARKER" ]; then
+    try_optional=1
+fi
+
+if [ ${#missing_required[@]} -gt 0 ] || [ "$try_optional" -eq 1 ]; then
+    if [ ${#missing_required[@]} -gt 0 ]; then
+        log "Installing: ${missing_required[*]}"
+    fi
+    if [ "$try_optional" -eq 1 ]; then
+        log "Attempting optional packages, once: ${missing_optional[*]}"
+    fi
     open_network_for_provisioning
     export DEBIAN_FRONTEND=noninteractive
     apt-get -o DPkg::Lock::Timeout=180 update
-    apt-get -o DPkg::Lock::Timeout=180 install -y --no-install-recommends "${REQUIRED_PKGS[@]}"
-    # Optional packages best-effort, so a missing one cannot fail the boot.
-    apt-get -o DPkg::Lock::Timeout=180 install -y --no-install-recommends "${OPTIONAL_PKGS[@]}" \
-        || log "WARN: optional packages unavailable; continuing"
+    if [ ${#missing_required[@]} -gt 0 ]; then
+        apt-get -o DPkg::Lock::Timeout=180 install -y --no-install-recommends "${REQUIRED_PKGS[@]}"
+    fi
+    if [ "$try_optional" -eq 1 ]; then
+        # Best-effort, so a missing one cannot fail the boot — and recorded
+        # either way, because the marker means "attempted", not "succeeded".
+        if apt-get -o DPkg::Lock::Timeout=180 install -y --no-install-recommends "${OPTIONAL_PKGS[@]}"; then
+            printf 'installed %s at %s\n' "${OPTIONAL_PKGS[*]}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$OPTIONAL_MARKER"
+        else
+            log "WARN: optional packages unavailable; continuing, and not retrying on later boots"
+            log "WARN: to retry, delete ${OPTIONAL_MARKER} and start the box again"
+            printf 'attempted and FAILED %s at %s\n' "${OPTIONAL_PKGS[*]}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$OPTIONAL_MARKER"
+        fi
+    fi
 else
     log "All packages already present"
 fi
@@ -358,6 +392,22 @@ install_node22() {
     log "Node $(node --version) installed"
 }
 
+# Pinned, for the same reason the Node tarball is checksummed and the Docker
+# repository key's fingerprint is verified: this runs `npx` as ROOT, at a moment
+# when open_network_for_provisioning() has set all three policies to ACCEPT and
+# flushed the AGENTBOX chains, in a guest that has read-write virtiofs access to
+# the host's real repository directory at /work. `playwright@latest` resolves at
+# provision time and executes whatever was published; a version cannot be
+# tampered with retroactively.
+#
+# 1.63.0 was the `latest` dist-tag of the `playwright` package on
+# registry.npmjs.org, read on 2026-09-05. It governs only the apt system
+# libraries `install-deps` installs — the browser BUILDS come from each
+# repository's own Playwright version on first use, as docs/daily-use.md says,
+# and those libraries are compatible across nearby releases. Raise it
+# deliberately; do not float it.
+PLAYWRIGHT_VERSION="1.63.0"
+
 install_playwright_deps() {
     # A marker rather than a package query: the dependency list is Playwright's
     # and changes with its releases, so "did this already run" is the only
@@ -368,13 +418,13 @@ install_playwright_deps() {
         log "Playwright system libraries already installed ($(cat "$marker"))"
         return 0
     fi
-    log "Installing Playwright's system libraries with 'npx playwright install-deps'"
+    log "Installing Playwright's system libraries with 'npx playwright@${PLAYWRIGHT_VERSION} install-deps'"
     open_network_for_provisioning
     export DEBIAN_FRONTEND=noninteractive
     # npm's cache and prefix under /root, not the guest user's home: this runs
     # as root and must not leave root-owned files in a directory the agent uses.
-    if HOME=/root npm_config_cache=/root/.npm npx --yes playwright@latest install-deps; then
-        printf 'playwright@latest install-deps, %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$marker"
+    if HOME=/root npm_config_cache=/root/.npm npx --yes "playwright@${PLAYWRIGHT_VERSION}" install-deps; then
+        printf 'playwright@%s install-deps, %s\n' "$PLAYWRIGHT_VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$marker"
         log "Playwright system libraries installed"
     else
         log "ERROR: 'npx playwright install-deps' failed" >&2
@@ -577,11 +627,27 @@ systemctl enable --now agent-box-firewall.timer
 # `After=agent-box-firewall.service` orders the daemon behind the firewall on
 # every boot, so AGENTBOX-FWD exists before dockerd creates DOCKER-USER.
 #
-# `ExecStartPost=` puts the AGENTBOX-FWD jump at DOCKER-USER rule 1 as part of
+# `ExecStartPost=-` puts the AGENTBOX-FWD jump at DOCKER-USER rule 1 as part of
 # starting the daemon. Without it, a `systemctl restart docker` at 12:01 would
 # leave containers reaching whatever they liked until the 15-minute timer next
-# fired. With it there is no such window: the daemon is not considered started
-# until the hook has run.
+# fired.
+#
+# What closes that window, stated as the mechanism rather than as a slogan: the
+# hook runs before the daemon is considered started, so `systemctl restart
+# docker` does not RETURN until the jump is back. That is not the same as "no
+# window at all", which is what this comment used to claim and is an overclaim
+# — dockerd starts containers carrying a restart policy during its own startup,
+# which completes before ExecStartPost is invoked. What makes that harmless is a
+# separate fact, measured: Docker preserves DOCKER-USER's contents across a
+# daemon restart, so the jump is normally still in place throughout. The hook is
+# for the case where it was not — a fresh install, or a table flush followed by
+# a restart.
+#
+# The leading `-` is deliberate and is finding C3. Without it, an ExecStartPost
+# that exits non-zero makes systemd stop the service it just started: a hook
+# that could not manage the ip6tables side would take Docker down entirely on a
+# box created to run Docker. The hook itself now treats the v6 arm as advisory,
+# so both halves of that failure are closed, independently.
 #
 # Written after the firewall units exist, because the drop-in names one of them.
 
@@ -594,7 +660,7 @@ After=${FIREWALL_UNIT}
 Wants=${FIREWALL_UNIT}
 
 [Service]
-ExecStartPost=${BOX_DIR}/guest/init-firewall.sh --docker-hook
+ExecStartPost=-${BOX_DIR}/guest/init-firewall.sh --docker-hook
 EOF
 
     # The socket, owned by the guest user by name.
