@@ -794,3 +794,30 @@ signalled and the run subsequently ended. That is the version the review round
 already rejected for a different reason: it overwrites the record of a run that
 finished on its own terms a moment before the signal landed. Both failures come
 from the same mistake, which is inferring a run's fate from outside it.
+
+## Why the stop is a marker beside the exit code, not a status instead of it
+
+The first version of the fix above wrote `exit:stopped` over whatever code the
+run had finished with. That looked tidy and lost two things.
+
+It lost the reason a run failed. A run that failed on its own terms in the same
+second as a stop was recorded as `stopped` with no exit code at all, and the
+failure went with it.
+
+And it lost a guarantee. `exit:3` is what the leak check writes when it found
+the OAuth token in output that reaches the host, and `agentbox logs` refuses to
+print a run whose status is exactly that. A stop that landed on a leaking run
+replaced the 3, the refusal never fired, and the credential the exit-3 path
+exists to withhold was printed to the terminal it exists to protect. The two
+mechanisms were fighting over one field.
+
+So the status file keeps the exit code, always, and the stop is a separate
+marker file the run writes beside it. `run-format.py` derives the state from
+the two: `exit:stopped` still means stopped, because the stopper's own fallback
+writes it when the run never got to record anything; a marker beside any other
+code means stopped as well; and `exit:3` means failed whatever else is there,
+because the leak is the headline and nothing may reinterpret it.
+
+The general rule is worth stating on its own: a value with downstream meaning
+does not get overwritten to express something else. If two facts need
+recording, record two facts.

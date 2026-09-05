@@ -128,16 +128,24 @@ finish() {
             sleep 1
         fi
     fi
-    # A stop was asked for AND the run did not end cleanly: that is a stop, and
-    # it is recorded here because this is the only process that knows both
-    # halves. The CLI exits 0 on an interrupt (issue #14), so `rc` alone would
-    # call it a success; the result fields are consulted as well for the case
-    # where this trap runs before they were folded into `rc`.
+    # The exit code the run really finished with, always. The stop, when there
+    # was one, is recorded ALONGSIDE it rather than in its place.
+    #
+    # Writing `exit:stopped` over the code destroyed information, and in one
+    # case destroyed a guarantee: exit 3 is what the leak check writes when it
+    # found the token in output that reaches the host, and `logs` refuses to
+    # print a run whose status is exit:3. A stop that landed on a leaking run
+    # replaced that 3 with `stopped`, the refusal never fired, and the very
+    # credential the exit-3 path exists to withhold was printed.
+    #
+    # So: 3 is never rewritten by anything, and neither is any other code. The
+    # marker is what says a stop happened; run-format.py derives the state from
+    # the two together.
     if [ -e "${RUN_DIR}/stop-requested" ] && ! run_ended_cleanly "$rc"; then
-        abx_status_write "$RUN_DIR" "exit:stopped"
-    else
-        abx_status_write "$RUN_DIR" "exit:${rc}"
+        printf '%s\n' "$(abx_now_iso)" > "${RUN_DIR}/stopped"
+        chmod 600 "${RUN_DIR}/stopped" 2>/dev/null || true
     fi
+    abx_status_write "$RUN_DIR" "exit:${rc}"
     rm -f "${RUN_DIR}/pid" "${RUN_DIR}/claude-pid"
     exit "$rc"
 }
@@ -201,7 +209,19 @@ CONSOLE_REDIRECTED=1
 # fall through to bash's default would kill the script between the model
 # stopping and the summary being written, which is exactly the run whose state
 # someone wants to see.
-trap 'INTERRUPTED=1' INT
+#
+# It also forwards. A SIGINT that reaches this script and stops here achieves
+# nothing: the CLI keeps running, keeps spending, and — once the session is
+# closed — keeps running orphaned in its own process group while the run is
+# recorded as stopped. So the signal is passed on to the CLI's process group,
+# and if the CLI has not started yet, the flag makes sure it never does.
+# shellcheck disable=SC2329  # invoked by the INT trap below.
+on_int() {
+    INTERRUPTED=1
+    [ -n "${CLAUDE_PID:-}" ] || return 0
+    kill -INT -"$CLAUDE_PID" 2>/dev/null || kill -INT "$CLAUDE_PID" 2>/dev/null || true
+}
+trap on_int INT
 
 CLAUDE_VERSION=$(claude --version 2>/dev/null | head -1 || true)
 
@@ -404,18 +424,38 @@ fi
 # in a shell without job control has SIGINT set to ignore, and a stop that the
 # CLI cannot receive is not a stop.
 set +e
-set -m
-(
-    cd "$WORK_DIR" || exit 1
-    exec claude "${PLUGIN_ARGS[@]}" "${SETTINGS_ARGS[@]}" "${CLAUDE_ARGS[@]}" \
-        "$(cat "$BRIEF_FILE")"
-) > "$EVENTS_FILE" &
-CLAUDE_PID=$!
-set +m
-printf '%s\n' "$CLAUDE_PID" > "${RUN_DIR}/claude-pid"
-wait "$CLAUDE_PID"
-RUN_STATUS=$?
-rm -f "${RUN_DIR}/claude-pid"
+if [ "$INTERRUPTED" -eq 1 ] || [ -e "${RUN_DIR}/stop-requested" ]; then
+    # A stop arrived while this run was still in its preconditions. Starting
+    # the CLI now would spend the subscription on work nobody is waiting for,
+    # and would leave it running after the stop had been reported.
+    printf 'agent-run: a stop was requested before the CLI started; not launching it\n'
+    INTERRUPTED=1
+    RUN_STATUS=130
+else
+    set -m
+    (
+        cd "$WORK_DIR" || exit 1
+        exec claude "${PLUGIN_ARGS[@]}" "${SETTINGS_ARGS[@]}" "${CLAUDE_ARGS[@]}" \
+            "$(cat "$BRIEF_FILE")"
+    ) > "$EVENTS_FILE" &
+    CLAUDE_PID=$!
+    set +m
+    printf '%s\n' "$CLAUDE_PID" > "${RUN_DIR}/claude-pid"
+
+    # In a loop, because a trapped signal makes `wait` return early with 128+n
+    # while the CLI is still very much alive. Taking that as the exit status
+    # meant tearing down a running run: removing its pid file, parsing a
+    # half-written event stream, and writing a summary for something still
+    # going. The loop keeps waiting until the process is actually reaped, and
+    # the last `wait` is the one that carries its real status.
+    while :; do
+        wait "$CLAUDE_PID"
+        RUN_STATUS=$?
+        kill -0 "$CLAUDE_PID" 2>/dev/null || break
+    done
+    rm -f "${RUN_DIR}/claude-pid"
+    CLAUDE_PID=""
+fi
 set -e
 
 chmod 600 "$EVENTS_FILE"

@@ -48,9 +48,21 @@ step() { hr; printf '## %s\n' "$*"; hr; }
 ok()   { PASS=$((PASS + 1)); printf 'PASS  %s\n' "$*"; }
 bad()  { FAIL=$((FAIL + 1)); printf 'FAIL  %s\n' "$*"; }
 
+# Set while the stand-in CLI is in place, so that an abort restores the real
+# one rather than leaving it parked at claude.real.
+STANDIN_INSTALLED=0
+
 cleanup() {
     local rc=$?
     step "cleanup"
+    if [ "${STANDIN_INSTALLED:-0}" -eq 1 ]; then
+        printf 'restoring the real Claude Code in %s\n' "$INSTANCE"
+        # shellcheck disable=SC2016  # $HOME must expand in the guest.
+        "$LIMACTL" shell --workdir /work "$INSTANCE" -- \
+            bash -lc 'mv -f "$HOME/.local/bin/claude.real" "$HOME/.local/bin/claude"' \
+            >/dev/null 2>&1 || true
+        STANDIN_INSTALLED=0
+    fi
     if "$LIMACTL" list --quiet 2>/dev/null | grep -qxF "$INSTANCE"; then
         printf 'destroying %s\n' "$INSTANCE"
         "$AGENTBOX" destroy "$INSTANCE" || "$LIMACTL" delete --force "$INSTANCE" || true
@@ -1895,13 +1907,26 @@ printf '{"type":"system","subtype":"init","model":"stand-in","claude_code_versio
 printf '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":2,"duration_ms":500,"total_cost_usd":0}\n'
 exit 0
 INNER
-chmod +x /tmp/abx-claude-stop /tmp/abx-claude-fail
+# (c) slow preconditions: --help blocks for longer than run-ctl waits for the
+# pid file, so a stop lands while the run is still before its launch.
+cat > /tmp/abx-claude-slowhelp <<'INNER'
+#!/bin/bash
+case "${1:-}" in
+    --version) printf '2.1.261-standin (Claude Code)\n'; exit 0 ;;
+    --help)    sleep 12; printf -- '--include-hook-events --settings --verbose\n'; exit 0 ;;
+esac
+printf '{"type":"system","subtype":"init","model":"stand-in","claude_code_version":"stand-in"}\n'
+printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":10,"total_cost_usd":0}\n'
+exit 0
+INNER
+chmod +x /tmp/abx-claude-stop /tmp/abx-claude-fail /tmp/abx-claude-slowhelp
 mv "$HOME/.local/bin/claude" "$HOME/.local/bin/claude.real"
 cp /tmp/abx-claude-stop "$HOME/.local/bin/claude"
 chmod +x "$HOME/.local/bin/claude"
 claude --version
 SH
 cat "${TMP_ROOT}/standin-install.out"
+STANDIN_INSTALLED=1
 if grep -q 'standin' "${TMP_ROOT}/standin-install.out"; then
     ok "the stand-in CLI is in place"
 else
@@ -1965,21 +1990,32 @@ if [ -n "$S14_RUNID" ]; then
         ok "run-ctl no longer claims the run ended by itself"
     fi
 
+    # The DERIVED state, which is what the host acts on. The status file keeps
+    # the run's own exit code; the two assertions below check that pair.
     S14_STATE=$(guest /opt/agent-box/guest/run-ctl.sh state "$S14_RUNID" 2>/dev/null | tr -d '\r\n')
-    printf 'status file: %s\n' "$S14_STATE"
+    printf 'derived state: %s\n' "$S14_STATE"
     if [ "$S14_STATE" = "exit:stopped" ]; then
-        ok "the run recorded exit:stopped"
+        ok "the run's derived state is stopped"
     else
-        bad "the run recorded '${S14_STATE}', not exit:stopped"
+        bad "the run's derived state is '${S14_STATE}', not exit:stopped"
     fi
 
     S14_JSON="${TMP_ROOT}/issue14-runs.json"
     "$AGENTBOX" runs "$CLEAN_REPO" --json > "$S14_JSON" 2>&1
     cat "$S14_JSON"
-    if jq -e --arg r "$S14_RUNID" 'map(select(.runid == $r and .state == "stopped" and .exit_code == null)) | length == 1' "$S14_JSON" >/dev/null 2>&1; then
-        ok "runs --json reports it stopped with a null exit code"
+    # The exit code SURVIVES the stop now: the status file keeps the number and
+    # a separate marker says the run was stopped. Overwriting the code was how
+    # the leak check's exit 3 used to be erased.
+    if jq -e --arg r "$S14_RUNID" 'map(select(.runid == $r and .state == "stopped" and .exit_code == 1)) | length == 1' "$S14_JSON" >/dev/null 2>&1; then
+        ok "runs --json reports it stopped, keeping the exit code the run ended with"
     else
-        bad "runs --json does not report it stopped with a null exit code"
+        bad "runs --json does not report it stopped with its own exit code"
+    fi
+    S14_RAW=$(guest sh -c "cat \$HOME/.agent-box/runs/${S14_RUNID}/status" 2>/dev/null | tr -d '\r\n')
+    if [ "$S14_RAW" = "exit:1" ] && guest sh -c "test -f \$HOME/.agent-box/runs/${S14_RUNID}/stopped"; then
+        ok "the status file kept exit:1 and the stop is a marker beside it"
+    else
+        bad "the status file is '${S14_RAW}' and the stop marker is missing"
     fi
 
     S14_BRANCH=$(guest sh -c "jq -r '.branch // empty' \$HOME/.agent-box/runs/${S14_RUNID}/meta.json" 2>/dev/null | tr -d '\r\n')
@@ -2039,6 +2075,103 @@ else
     bad "run --wait printed no summary for the stopped run"
 fi
 
+printf -- '\n--- (a3) a stop that lands on a leaking run stays exit:3 ---\n'
+# The leak check and the stop used to fight over one field: the stop wrote
+# exit:stopped over the 3, `logs` gates its refusal on exactly `exit:3`, and so
+# the credential the exit-3 path exists to withhold was printed. The token is
+# put where the leak check will find it, in the unstaged diff.
+guest sh -c "cd /work && printf 'leaked: %s\\n' '${FAKE_TOKEN}' >> hello.txt"
+LEAKSTOP_OUT="${TMP_ROOT}/issue14-leakstop.out"
+run_bounded 90 "$LEAKSTOP_OUT" "$AGENTBOX" run "$CLEAN_REPO" "${TMP_ROOT}/noop-brief.md"
+cat "$LEAKSTOP_OUT"
+LS_RUNID=$(sed -n 's/^agentbox: run \([0-9-]*\) started.*/\1/p' "$LEAKSTOP_OUT" | head -1)
+printf 'runid: %s\n' "${LS_RUNID:-<none>}"
+if [ -n "$LS_RUNID" ]; then
+    for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        guest sh -c "grep -q '\"subtype\":\"init\"' \$HOME/.agent-box/runs/${LS_RUNID}/events.jsonl 2>/dev/null" && break
+        sleep 2
+    done
+    run_bounded 90 "${TMP_ROOT}/issue14-leakstop-stop.out" "$AGENTBOX" stop-run "$CLEAN_REPO" "$LS_RUNID"
+    cat "${TMP_ROOT}/issue14-leakstop-stop.out"
+    LS_STATE=$(guest /opt/agent-box/guest/run-ctl.sh state "$LS_RUNID" 2>/dev/null | tr -d '\r\n')
+    printf 'status file: %s\n' "$LS_STATE"
+    if [ "$LS_STATE" = "exit:3" ]; then
+        ok "a stop that coincided with a leak left the status at exit:3"
+    else
+        bad "the leaking run recorded '${LS_STATE}'; exit:3 was overwritten"
+    fi
+    if "$AGENTBOX" runs "$CLEAN_REPO" | grep -qE "${LS_RUNID}.*failed"; then
+        ok "runs reports the leaking run as failed, not stopped"
+    else
+        bad "runs does not report the leaking run as failed"
+    fi
+    LS_LOGS="${TMP_ROOT}/issue14-leakstop-logs.out"
+    run_bounded 60 "$LS_LOGS" "$AGENTBOX" logs "$CLEAN_REPO" "$LS_RUNID"
+    cat "$LS_LOGS"
+    if grep -q 'leak check found the OAuth token' "$LS_LOGS"; then
+        ok "logs still refuses the run and prints the leak banner"
+    else
+        bad "logs did not print the leak banner; the stop disabled the refusal"
+    fi
+    if grep -qF "$FAKE_TOKEN" "$LS_LOGS" || grep -qF "$FAKE_HEAD" "$LS_LOGS" || grep -qF "$FAKE_TAIL" "$LS_LOGS"; then
+        bad "SECURITY: logs printed the credential for the stopped leaking run"
+    else
+        ok "logs printed no credential for the stopped leaking run"
+    fi
+fi
+guest sh -c 'cd /work && git checkout -- . 2>/dev/null; true'
+
+printf -- '\n--- (a4) a stop before the CLI starts must not start it ---\n'
+# run-ctl waits for the pid file, and when it never appears it interrupts the
+# run script instead. The script must then SKIP the launch: interrupting a
+# script whose only reaction was to set a flag used to let the CLI start
+# anyway, and closing the session afterwards orphaned it in its own process
+# group, still running and still spending, while the run was reported stopped.
+# shellcheck disable=SC2016  # $HOME must expand in the guest.
+guest bash -l -c 'cp /tmp/abx-claude-slowhelp "$HOME/.local/bin/claude"; chmod +x "$HOME/.local/bin/claude"'
+EARLY_OUT="${TMP_ROOT}/issue14-early.out"
+run_bounded 90 "$EARLY_OUT" "$AGENTBOX" run "$CLEAN_REPO" "${TMP_ROOT}/noop-brief.md"
+cat "$EARLY_OUT"
+E14_RUNID=$(sed -n 's/^agentbox: run \([0-9-]*\) started.*/\1/p' "$EARLY_OUT" | head -1)
+printf 'runid: %s\n' "${E14_RUNID:-<none>}"
+if [ -n "$E14_RUNID" ]; then
+    EARLY_STOP="${TMP_ROOT}/issue14-early-stop.out"
+    run_bounded 120 "$EARLY_STOP" "$AGENTBOX" stop-run "$CLEAN_REPO" "$E14_RUNID"
+    cat "$EARLY_STOP"
+    if grep -q 'no CLI process' "$EARLY_STOP"; then
+        ok "stop-run waited for the pid, found none, and said so"
+    else
+        bad "stop-run did not report the missing CLI process"
+    fi
+    # Wait for the run to finish reacting.
+    for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        E14_STATE=$(guest /opt/agent-box/guest/run-ctl.sh state "$E14_RUNID" 2>/dev/null | tr -d '\r\n')
+        [ "$E14_STATE" = "running" ] || break
+        sleep 2
+    done
+    printf 'status file: %s\n' "$E14_STATE"
+    E14_EVENTS=$(guest sh -c "wc -c < \$HOME/.agent-box/runs/${E14_RUNID}/events.jsonl" 2>/dev/null | tr -d ' \r\n')
+    printf 'events.jsonl bytes: %s\n' "${E14_EVENTS:-?}"
+    if [ "${E14_EVENTS:-1}" = "0" ]; then
+        ok "the CLI was never launched after the stop was requested"
+    else
+        bad "the CLI ran anyway after the stop was requested (${E14_EVENTS} bytes of events)"
+    fi
+    E14_LOGS="${TMP_ROOT}/issue14-early-logs.out"
+    run_bounded 60 "$E14_LOGS" "$AGENTBOX" logs "$CLEAN_REPO" "$E14_RUNID"
+    cat "$E14_LOGS"
+    if grep -q 'not launching it' "$E14_LOGS"; then
+        ok "the run said it was not launching the CLI"
+    else
+        bad "the run did not say it had skipped the launch"
+    fi
+    if "$AGENTBOX" runs "$CLEAN_REPO" | grep -qE "${E14_RUNID}.*stopped"; then
+        ok "runs reports the never-launched run as stopped"
+    else
+        bad "runs does not report the never-launched run as stopped"
+    fi
+fi
+
 printf -- '\n--- (b) the CLI exits 0 but says is_error: that is a failed run ---\n'
 # shellcheck disable=SC2016  # $HOME must expand in the guest.
 guest bash -l -c 'cp /tmp/abx-claude-fail "$HOME/.local/bin/claude"; chmod +x "$HOME/.local/bin/claude"'
@@ -2082,7 +2215,8 @@ fi
 printf -- '\n--- the real CLI is put back ---\n'
 # shellcheck disable=SC2016  # $HOME must expand in the guest.
 guest bash -l -c 'mv -f "$HOME/.local/bin/claude.real" "$HOME/.local/bin/claude"' || true
-guest sh -c 'rm -f /tmp/abx-claude-stop /tmp/abx-claude-fail'
+STANDIN_INSTALLED=0
+guest sh -c 'rm -f /tmp/abx-claude-stop /tmp/abx-claude-fail /tmp/abx-claude-slowhelp'
 REAL_VER=$("$LIMACTL" shell --workdir /work "$INSTANCE" -- bash -lc 'claude --version' 2>&1)
 printf '%s\n' "$REAL_VER"
 if printf '%s' "$REAL_VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+' && ! printf '%s' "$REAL_VER" | grep -q standin; then
