@@ -41,7 +41,8 @@ usage() {
 usage: ${PROG} <command> [args]
 
   preflight <repo>                  scan a repo for secrets and configured terms
-  create <repo>                     preflight, then create and start its VM
+  create <repo> [options]           preflight, then create and start its VM
+  resize <repo|name> [options]      change cpus/memory/disk of an existing VM
   start <repo>                      preflight, then start an existing VM
   token <repo>                      read an OAuth token from the terminal into the VM
   verify-auth <repo>                prove the token authenticates, with a real model call
@@ -74,6 +75,22 @@ run options:
   --notify            desktop notification when it ends (or notify: true in
                       ${HOST_CONFIG_DIR}/config)
 
+create options — all off by default, all fixed for the life of the instance
+except the sizing, which 'resize' can change:
+
+  --docker            Docker Engine and compose inside the guest, with
+                      containers held to the same egress allowlist
+  --playwright        Node 22 and Playwright's system libraries
+  --rosetta           run linux/amd64 images on Apple silicon
+  --forward PORT[,PORT...]
+                      forward guest 127.0.0.1:PORT to host 127.0.0.1:PORT.
+                      This is a widening: host processes can then reach it
+  --cpus N            default 4
+  --memory SIZE       default 6GiB, or 8GiB with --docker
+  --disk SIZE         default 30GiB, or 60GiB with --docker
+
+resize options: --cpus N, --memory SIZE, --disk SIZE. The disk can only grow.
+
 Every subcommand stops reading options at a literal --, so a caller building a
 command line can always say where its operands begin:
 
@@ -86,8 +103,9 @@ to the CLI untouched.
 logs refuses to print a run whose leak check found the token, and says so.
 --force-unsafe prints it anyway.
 
-stop, destroy and firewall-check also accept a bare instance name, so a VM can
-still be shut down and deleted after its repository directory has been removed.
+stop, destroy, resize and firewall-check also accept a bare instance name, so a
+VM can still be shut down, resized and deleted after its repository directory
+has been removed.
 
 Host-side configuration, never copied into this repository.
 
@@ -388,41 +406,205 @@ cmd_preflight() {
     "${BOX_DIR}/host/preflight.sh" "$repo"
 }
 
+# A whole number of CPUs.
+valid_cpus() { case "$1" in ''|*[!0-9]*) return 1 ;; *) [ "$1" -ge 1 ] ;; esac; }
+
+# A Lima size string. A bare number is taken as GiB, which is what limactl's own
+# --memory/--disk flags mean by it.
+normalise_size() {
+    local v="${1:?}"
+    case "$v" in
+        *[0-9]) printf '%sGiB' "$v" ;;
+        *[0-9]GiB|*[0-9]MiB|*[0-9]TiB|*[0-9]G|*[0-9]M|*[0-9]T|*[0-9]B) printf '%s' "$v" ;;
+        *) return 1 ;;
+    esac
+}
+
+# One TCP port, in range.
+valid_port() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
 cmd_create() {
     local repo inst
-    split_args "" "$@"
-    check_operands 1 1 "create <repo>"
+    split_args "--forward --cpus --memory --disk" "$@"
+    check_operands 1 1 "create <repo> [options]"
     repo=$(abs_repo "${ABX_POSV[0]}")
     inst=$(instance_name "$repo")
     require_limactl
+
+    local docker=false playwright=false rosetta=false
+    local forward="" cpus="" memory="" disk=""
+    # The operands are already out of the way; what is left is options, and
+    # split_args has kept each valued option next to its value.
+    set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --docker)     docker=true; shift ;;
+            --playwright) playwright=true; shift ;;
+            --rosetta)    rosetta=true; shift ;;
+            --forward)    forward="${2:?--forward needs a port or comma-separated list}"; shift 2 ;;
+            --cpus)       cpus="${2:?--cpus needs a value}"; shift 2 ;;
+            --memory)     memory="${2:?--memory needs a value}"; shift 2 ;;
+            --disk)       disk="${2:?--disk needs a value}"; shift 2 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+
+    # Docker needs more of both than a bare agent does: images, layers and a
+    # build cache all land on the guest disk, and a compose stack plus a browser
+    # is a different memory profile from a shell and an editor.
+    local def_cpus=4 def_memory="6GiB" def_disk="30GiB"
+    if [ "$docker" = true ]; then
+        def_memory="8GiB"; def_disk="60GiB"
+    fi
+    cpus="${cpus:-$def_cpus}"
+    memory="${memory:-$def_memory}"
+    disk="${disk:-$def_disk}"
+
+    valid_cpus "$cpus" || die "--cpus must be a whole number of CPUs, got '${cpus}'"
+    # The original is kept for the message: the assignment happens either way,
+    # so reporting ${memory} after a failed substitution reports the empty
+    # string rather than what was typed.
+    local raw_memory="$memory" raw_disk="$disk"
+    memory=$(normalise_size "$raw_memory") || die "--memory must be a size such as 8GiB, got '${raw_memory}'"
+    disk=$(normalise_size "$raw_disk")     || die "--disk must be a size such as 60GiB, got '${raw_disk}'"
+
+    local -a forward_ports=()
+    if [ -n "$forward" ]; then
+        local p
+        # shellcheck disable=SC2086  # deliberate word splitting on commas.
+        IFS=',' read -r -a forward_ports <<< "$forward"
+        for p in "${forward_ports[@]}"; do
+            valid_port "$p" || die "--forward takes TCP port numbers, got '${p}'"
+        done
+    fi
 
     instance_exists "$inst" && die "instance '${inst}' already exists. Use '${PROG} start' or '${PROG} destroy'."
 
     run_preflight "$repo" || die "preflight failed; refusing to mount ${repo}"
     ensure_host_config_dir
 
+    local -a create_args=(
+        --name "$inst"
+        --param "repo=${repo}"
+        --param "box=${BOX_DIR}"
+        --param "config=${HOST_GUEST_CONFIG_DIR}"
+        --param "docker=${docker}"
+        --param "playwright=${playwright}"
+        --param "rosetta=${rosetta}"
+        --set ".cpus = ${cpus} | .memory = \"${memory}\" | .disk = \"${disk}\""
+    )
+
+    # Lima expands {{.Param.x}} only in a handful of string fields — never in a
+    # boolean, an integer, or a list entry — so neither Rosetta nor a port
+    # forward can be made conditional inside the template itself. limactl's own
+    # create-time flags can express both, which is why there is still exactly
+    # one template rather than a generated file per instance. See
+    # docs/decisions.md.
+    [ "$rosetta" = true ] && create_args+=(--rosetta)
+
+    if [ "${#forward_ports[@]}" -gt 0 ]; then
+        local yq_list="" p
+        for p in "${forward_ports[@]}"; do
+            [ -z "$yq_list" ] || yq_list+=", "
+            yq_list+="{\"guestPort\": ${p}}"
+        done
+        # Prepended, not appended: the template's two catch-all entries ignore
+        # every port, and Lima takes the first entry that matches.
+        create_args+=(--set ".portForwards = [${yq_list}] + .portForwards")
+    fi
+
     info "creating ${inst}"
-    "$LIMACTL" create --yes \
-        --name "$inst" \
-        --param "repo=${repo}" \
-        --param "box=${BOX_DIR}" \
-        --param "config=${HOST_GUEST_CONFIG_DIR}" \
-        "$LIMA_TEMPLATE"
+    info "sizing: ${cpus} cpus, ${memory} memory, ${disk} disk"
+    info "profile: docker=${docker} playwright=${playwright} rosetta=${rosetta}"
+    if [ "${#forward_ports[@]}" -gt 0 ]; then
+        info "WARNING: --forward ${forward_ports[*]} opens a hole in the other direction. Every one of those guest ports becomes reachable from any process on this Mac at 127.0.0.1, for as long as the VM runs. The default is that nothing the guest listens on is reachable from the host at all."
+    fi
+
+    "$LIMACTL" create --tty=false "${create_args[@]}" "$LIMA_TEMPLATE"
 
     # After create, not before: on a machine that has never run Lima, ~/.lima
     # does not exist yet and the exclusion would fail for no reason.
     exclude_from_backup
 
     info "starting ${inst} (first boot downloads the image and provisions; this takes a while)"
-    "$LIMACTL" start --yes "$inst"
+    "$LIMACTL" start --tty=false "$inst"
 
     cat <<EOF
 
 ${inst} is up.
 
+  sizing      ${cpus} cpus, ${memory} memory, ${disk} disk
+  docker      ${docker}
+  playwright  ${playwright}
+  rosetta     ${rosetta}
+  forwarded   ${forward_ports[*]:-none}
+
 Next: ${PROG} token ${repo}         # paste the OAuth token, once
 Then: ${PROG} verify-auth ${repo}   # a real model call, which is the only proof
 EOF
+}
+
+# Sizing is the one part of an instance's shape that is not fixed at create
+# time. Everything else — the mounts, the profile, the forwarded ports — is
+# decided once, on purpose.
+cmd_resize() {
+    local inst cpus="" memory="" disk="" was_running=0
+    split_args "--cpus --memory --disk" "$@"
+    check_operands 1 1 "resize <repo|name> [--cpus N] [--memory SIZE] [--disk SIZE]"
+    inst=$(instance_name "${ABX_POSV[0]}")
+    set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --cpus)   cpus="${2:?--cpus needs a value}"; shift 2 ;;
+            --memory) memory="${2:?--memory needs a value}"; shift 2 ;;
+            --disk)   disk="${2:?--disk needs a value}"; shift 2 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    require_limactl
+    require_instance "$inst"
+
+    local -a exprs=()
+    if [ -n "$cpus" ]; then
+        valid_cpus "$cpus" || die "--cpus must be a whole number of CPUs, got '${cpus}'"
+        exprs+=(".cpus = ${cpus}")
+    fi
+    local raw
+    if [ -n "$memory" ]; then
+        raw="$memory"
+        memory=$(normalise_size "$raw") || die "--memory must be a size such as 8GiB, got '${raw}'"
+        exprs+=(".memory = \"${memory}\"")
+    fi
+    if [ -n "$disk" ]; then
+        raw="$disk"
+        disk=$(normalise_size "$raw") || die "--disk must be a size such as 60GiB, got '${raw}'"
+        exprs+=(".disk = \"${disk}\"")
+    fi
+    [ "${#exprs[@]}" -gt 0 ] || die "nothing to change; pass at least one of --cpus, --memory, --disk"
+
+    local expr="${exprs[0]}" i
+    for ((i = 1; i < ${#exprs[@]}; i++)); do expr+=" | ${exprs[$i]}"; done
+
+    if [ "$("$LIMACTL" list --format '{{.Status}}' "$inst" 2>/dev/null)" = "Running" ]; then
+        was_running=1
+        info "stopping ${inst} to resize it"
+        "$LIMACTL" stop "$inst"
+    fi
+
+    info "applying: ${expr}"
+    # A disk can only grow. limactl says so itself and refuses; the message is
+    # better than anything this script could add.
+    "$LIMACTL" edit --tty=false "$inst" --set "$expr"
+
+    if [ "$was_running" -eq 1 ]; then
+        info "starting ${inst} again"
+        "$LIMACTL" start --tty=false "$inst"
+    else
+        info "${inst} was not running; start it when you need it"
+    fi
 }
 
 cmd_start() {
@@ -436,7 +618,7 @@ cmd_start() {
 
     run_preflight "$repo" || die "preflight failed; refusing to start ${inst}"
     ensure_host_config_dir
-    "$LIMACTL" start --yes "$inst"
+    "$LIMACTL" start --tty=false "$inst"
     sync_guest_config "$inst"
     # A run that was going when the VM stopped never ran its EXIT trap, so its
     # status still says `running`. This is the first moment anything can tell.
@@ -1169,6 +1351,7 @@ cmd_firewall_check() {
 case "${1:-}" in
     preflight)      shift; cmd_preflight "$@" ;;
     create)         shift; cmd_create "$@" ;;
+    resize)         shift; cmd_resize "$@" ;;
     start)          shift; cmd_start "$@" ;;
     token)          shift; cmd_token "$@" ;;
     verify-auth)    shift; cmd_verify_auth "$@" ;;

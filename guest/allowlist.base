@@ -29,6 +29,66 @@ registry.npmjs.org
 pypi.org
 files.pythonhosted.org
 
+# --- The distribution's own package archive --------------------------------
+# Ubuntu on arm64 is served from ports.ubuntu.com, not archive.ubuntu.com or
+# security.ubuntu.com; both the archive and the security pocket live there.
+# Source: /etc/apt/sources.list.d/ubuntu.sources in the Noble arm64 cloud image.
+# Needed permanently rather than only during provisioning, because
+# `playwright install-deps` shells out to apt and an agent installing a test
+# dependency is an ordinary thing to do.
+ports.ubuntu.com
+# The amd64 archive, for the same reason on an Intel host. Harmless on arm64.
+archive.ubuntu.com
+security.ubuntu.com
+
+# --- Docker Engine, from Docker's own apt repository -----------------------
+# Only reached on an instance created with --docker. Source:
+# https://docs.docker.com/engine/install/ubuntu/ (fetched 2026-09-05).
+download.docker.com
+
+# --- Container registries --------------------------------------------------
+# Docker Hub: the token endpoint, the registry, and the CDN the layer blobs
+# are redirected to. Docker Hub uses two blob CDNs and which one a pull is sent
+# to is not the client's choice, so both are listed. Source: a real
+# `docker pull python:3-alpine` in this guest on 2026-09-05 was redirected to
+# production.cloudfront.docker.com and failed until that name was added.
+auth.docker.io
+registry-1.docker.io
+production.cloudfront.docker.com
+production.cloudflare.docker.com
+# GitHub's registry. ghcr.io itself is on GitHub's meta ranges, but the blob
+# host is not, so it is named here. Community-sourced; verify if a pull fails.
+ghcr.io
+pkg-containers.githubusercontent.com
+# Quay, commented out: not needed by default, and every extra name is another
+# place an agent could post to. Uncomment the block to pull from quay.io.
+# quay.io
+# cdn.quay.io
+# cdn01.quay.io
+# cdn02.quay.io
+# cdn03.quay.io
+# cdn04.quay.io
+# cdn05.quay.io
+# cdn06.quay.io
+
+# --- Node and Playwright ---------------------------------------------------
+# The Node 22 tarball and its SHASUMS256.txt, fetched by provisioning on an
+# instance created with --playwright. Source: https://nodejs.org/dist/.
+nodejs.org
+# Playwright's browser builds. Each repository's own Playwright version
+# downloads its own browsers on first use; PLAYWRIGHT_DOWNLOAD_HOST overrides
+# this host. Source: https://playwright.dev/docs/browsers.
+#
+# This is the worst case for an address-pinning allowlist and worth naming: an
+# Azure Front Door endpoint that answers with ONE A record on a near-zero TTL.
+# It is the name that showed `dig` and the system resolver returning different
+# addresses for the same host in the same second — which is why the firewall
+# now resolves through both paths. A download can still land on an address that
+# was not in the set; retry, or re-run `agentbox firewall-check`. See "Why the
+# allowlist resolves through two paths, and more than once" in
+# docs/decisions.md.
+cdn.playwright.dev
+
 # Deliberately NOT allowed, and disabled by DISABLE_TELEMETRY=1 and
 # DISABLE_ERROR_REPORTING=1 in the guest environment instead:
 #   sentry.io, statsig.com, statsig.anthropic.com

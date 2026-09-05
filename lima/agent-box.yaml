@@ -53,7 +53,13 @@ containerd:
   system: false
   user: false
 
-# Nothing the guest listens on is reachable from the host or the LAN.
+# Nothing the guest listens on is reachable from the host or the LAN, unless
+# `agentbox create --forward PORT` said otherwise. That flag prepends
+# `- guestPort: PORT` entries ahead of the two catch-alls below, because Lima
+# takes the FIRST matching entry. It cannot be expressed here: Lima parses this
+# file as YAML before expanding {{.Param.x}}, and only expands in a few string
+# fields, so a template parameter cannot produce a list entry or an integer.
+# See docs/decisions.md.
 #
 # guestIPMustBeZero has to be set explicitly. Lima defaults it to
 # `guestIP == 0.0.0.0` (pkg/limayaml/defaults.go), so leaving it out of the
@@ -91,6 +97,18 @@ param:
   repo: "/tmp"
   box: "/tmp"
   config: "/tmp"
+  # The optional profile. Each is the string "true" or "false" and reaches
+  # guest/provision.sh as an argument; the defaults here are what a bare
+  # `agentbox create <repo>` gets, which is the same VM as before this file
+  # grew any of it.
+  #
+  # rosetta is passed through for the provisioner to log and for the guest to
+  # check. What actually enables it is `limactl create --rosetta`, which writes
+  # vmOpts.vz.rosetta — a boolean field, and therefore one no template
+  # parameter can reach.
+  docker: "false"
+  playwright: "false"
+  rosetta: "false"
 
 mounts:
 - location: "{{.Param.repo}}"
@@ -165,4 +183,7 @@ provision:
   script: |
     #!/bin/bash
     set -euo pipefail
-    exec /opt/agent-box/guest/provision.sh "{{.User}}" "{{.Home}}"
+    exec /opt/agent-box/guest/provision.sh "{{.User}}" "{{.Home}}" \
+      --docker "{{.Param.docker}}" \
+      --playwright "{{.Param.playwright}}" \
+      --rosetta "{{.Param.rosetta}}"
