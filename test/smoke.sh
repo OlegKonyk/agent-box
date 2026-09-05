@@ -231,7 +231,10 @@ MARKETPLACE_REPO="konyklabs/claude-plugins"
 # repository name: .claude-plugin/marketplace.json on that public repo's main
 # branch declares "konyklabs-plugins".
 MARKETPLACE_NAME="konyklabs-plugins"
-PLUGIN_UNDER_TEST="governor"
+# The plugin the marketplace actually publishes. It was `governor` until that
+# repository renamed it; a fixture naming a plugin that no longer exists tests
+# the error path and reports it as a broken plugin mechanism.
+PLUGIN_UNDER_TEST="supervisor"
 
 mkdir -p "${GUEST_CFG}/claude/rules" \
          "${GUEST_CFG}/plugin-dir/demo/.claude-plugin" \
@@ -886,10 +889,13 @@ fi
 step "8. agent-run refuses to start without a token"
 # ===========================================================================
 
+# --wait, because these four checks are about the exit status and the message
+# reaching the caller. Runs are detached by default now, so the plain form
+# returns 0 with the run still starting; the detached path is the next step.
 RUN_OUT="${TMP_ROOT}/run.out"
 printf 'Do nothing.\n' > "${TMP_ROOT}/noop-brief.md"
-"$AGENTBOX" run "$CLEAN_REPO" "${TMP_ROOT}/noop-brief.md" > "$RUN_OUT" 2>&1
-rc=$?
+run_bounded 240 "$RUN_OUT" "$AGENTBOX" run "$CLEAN_REPO" "${TMP_ROOT}/noop-brief.md" --wait
+rc=$BOUNDED_RC
 cat "$RUN_OUT"
 if [ "$rc" -ne 0 ]; then ok "agent-run exited non-zero without a token"; else bad "agent-run exited 0 without a token"; fi
 if grep -q 'no token at' "$RUN_OUT"; then
@@ -901,6 +907,57 @@ if [ -d "${CLEAN_REPO}/.agent-box" ]; then
     bad "agent-run created state despite refusing to run"
 else
     ok "agent-run changed nothing before refusing"
+fi
+
+# ===========================================================================
+step "8a. a DETACHED run without a token fails fast, and says so afterwards"
+# ===========================================================================
+#
+# The default shape: `run` returns as soon as the task has started, and the
+# record of what happened is read back with `runs` and `logs`. A run that dies
+# in its preconditions has no terminal to have printed on, so this is the only
+# way that failure is ever seen.
+
+DET_OUT="${TMP_ROOT}/detached.out"
+run_bounded 90 "$DET_OUT" "$AGENTBOX" run "$CLEAN_REPO" "${TMP_ROOT}/noop-brief.md"
+det_rc=$BOUNDED_RC
+cat "$DET_OUT"
+if [ "$det_rc" -eq 0 ]; then ok "a detached run returned 0 immediately"; else bad "a detached run exited ${det_rc}"; fi
+
+DET_RUNID=$(sed -n 's/^agentbox: run \([0-9-]*\) started.*/\1/p' "$DET_OUT" | head -1)
+printf 'detached runid: %s\n' "${DET_RUNID:-<none>}"
+if [ -n "$DET_RUNID" ]; then ok "the run id was printed"; else bad "no run id was printed"; fi
+
+# It fails in its preconditions, so it is over in seconds; poll rather than
+# assume.
+DET_STATE=""
+for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    DET_STATE=$(guest /opt/agent-box/guest/run-ctl.sh state "$DET_RUNID" 2>/dev/null | tr -d '\r\n')
+    case "$DET_STATE" in running|"") sleep 2 ;; *) break ;; esac
+done
+printf 'state: %s\n' "$DET_STATE"
+
+DET_RUNS="${TMP_ROOT}/detached-runs.out"
+"$AGENTBOX" runs "$CLEAN_REPO" > "$DET_RUNS" 2>&1
+cat "$DET_RUNS"
+if grep -q "$DET_RUNID" "$DET_RUNS" && grep -qE "${DET_RUNID}.*failed" "$DET_RUNS"; then
+    ok "runs lists the detached run as failed"
+else
+    bad "runs does not list the detached run as failed"
+fi
+case "$DET_STATE" in
+    exit:0)  bad "the tokenless run recorded exit:0" ;;
+    exit:*)  ok "the run recorded a non-zero exit (${DET_STATE})" ;;
+    *)       bad "the run never left state '${DET_STATE}'" ;;
+esac
+
+DET_LOGS="${TMP_ROOT}/detached-logs.out"
+run_bounded 60 "$DET_LOGS" "$AGENTBOX" logs "$CLEAN_REPO" "$DET_RUNID"
+cat "$DET_LOGS"
+if grep -q 'no token at' "$DET_LOGS"; then
+    ok "logs shows the reason the detached run failed"
+else
+    bad "logs does not show why the detached run failed"
 fi
 
 # ===========================================================================
@@ -929,7 +986,7 @@ printf -- '--- git diff in the guest now carries the fake token ---\n'
 guest sh -c 'cd /work && git diff --stat'
 
 LEAK_OUT="${TMP_ROOT}/leak.out"
-run_bounded 240 "$LEAK_OUT" "$AGENTBOX" run "$CLEAN_REPO" "${TMP_ROOT}/noop-brief.md"
+run_bounded 300 "$LEAK_OUT" "$AGENTBOX" run "$CLEAN_REPO" "${TMP_ROOT}/noop-brief.md" --wait
 leak_rc=$BOUNDED_RC
 cat "$LEAK_OUT"
 printf 'agentbox run exit status: %s\n' "$leak_rc"
@@ -939,10 +996,30 @@ if [ "$leak_rc" -eq 3 ]; then
 else
     bad "agent-run exited ${leak_rc}; expected 3 for a token leak"
 fi
-if grep -q 'SECURITY: the token appears in' "$LEAK_OUT"; then
-    ok "the leak was reported, naming the stream"
+# The report has two halves now. `logs` refuses a leak-flagged run's events, so
+# what --wait shows is the banner; the line naming the stream is in the output
+# the banner is withholding, and --force-unsafe is how you get it.
+if grep -q 'leak check found the OAuth token' "$LEAK_OUT"; then
+    ok "the leak was reported to the operator, with what to do about it"
 else
     bad "the leak was not reported"
+fi
+LEAK_RUNID=$(sed -n 's/^agentbox: run \([0-9-]*\) started.*/\1/p' "$LEAK_OUT" | head -1)
+if [ -n "$LEAK_RUNID" ]; then
+    LEAK_FORCED="${TMP_ROOT}/leak-forced.out"
+    run_bounded 60 "$LEAK_FORCED" "$AGENTBOX" logs "$CLEAN_REPO" "$LEAK_RUNID" --force-unsafe
+    if grep -q 'SECURITY: the token appears in' "$LEAK_FORCED"; then
+        ok "--force-unsafe shows the leak report, naming the stream"
+    else
+        bad "--force-unsafe did not show the leak report"
+    fi
+    if grep -qF "$FAKE_TOKEN" "$LEAK_FORCED"; then
+        bad "--force-unsafe echoed the token value"
+    else
+        ok "--force-unsafe still did not echo the token value"
+    fi
+else
+    bad "could not read the leaking run's id back"
 fi
 if grep -qF "$FAKE_TOKEN" "$LEAK_OUT"; then
     bad "the token value itself was echoed by the leak report"
@@ -963,6 +1040,817 @@ if grep -rqF "$FAKE_TOKEN" "$CLEAN_REPO" 2>/dev/null; then
     bad "the planted token is still in the work tree on the host"
 else
     ok "the planted token is gone from the work tree"
+fi
+
+# ===========================================================================
+step "8d. a detached run that reaches the CLI: the run directory, runs, logs"
+# ===========================================================================
+#
+# With a fake token in place the run gets all the way to a real `claude` call
+# and fails authentication. That is the interesting case for the sensors: there
+# is a run directory, an event stream, a status, and a formatted log — and none
+# of it may carry a fragment of the token.
+
+guest sh -c "umask 077; printf '%s' '${FAKE_TOKEN}' > \$HOME/.config/agent-box/token; chmod 600 \$HOME/.config/agent-box/token"
+
+AUTH_OUT="${TMP_ROOT}/authfail.out"
+run_bounded 90 "$AUTH_OUT" "$AGENTBOX" run "$CLEAN_REPO" "${TMP_ROOT}/noop-brief.md"
+cat "$AUTH_OUT"
+AUTH_RUNID=$(sed -n 's/^agentbox: run \([0-9-]*\) started.*/\1/p' "$AUTH_OUT" | head -1)
+printf 'runid: %s\n' "${AUTH_RUNID:-<none>}"
+if [ -n "$AUTH_RUNID" ]; then
+    ok "the fake-token run started and printed its id"
+else
+    # Not a fabricated id: `logs` for one that does not exist returns fast and
+    # non-zero, which would make every assertion below report a pass for a run
+    # that never happened.
+    bad "the fake-token run printed no id; skipping the checks that depend on it"
+    hr; printf 'RESULT: %s passed, %s failed\n' "$PASS" "$FAIL"; hr
+    exit 1
+fi
+
+# `logs -f` must come back on its own when the run ends. Started here, while
+# the run is still going, which is the only way that claim means anything.
+FOLLOW_OUT="${TMP_ROOT}/logs-follow.out"
+FOLLOW_T0=$(date +%s)
+run_bounded 300 "$FOLLOW_OUT" "$AGENTBOX" logs "$CLEAN_REPO" "$AUTH_RUNID" -f
+follow_rc=$BOUNDED_RC
+FOLLOW_ELAPSED=$(( $(date +%s) - FOLLOW_T0 ))
+cat "$FOLLOW_OUT"
+printf 'logs -f returned after %ss with status %s\n' "$FOLLOW_ELAPSED" "$follow_rc"
+# Exit 0, not merely "not killed". A `logs` that failed instantly — a run id
+# that does not exist, an instance that stopped answering — also returns
+# non-124, and would report a pass for something that never followed anything.
+if [ "$follow_rc" -eq 0 ]; then
+    ok "logs -f returned on its own, with exit 0, when the run ended"
+else
+    bad "logs -f exited ${follow_rc}; it did not follow the run to its end"
+fi
+if grep -qE '^[0-9]{2}:[0-9]{2}:[0-9]{2}  status  exit:' "$FOLLOW_OUT"; then
+    ok "logs -f ended with the run's status line"
+else
+    bad "logs -f did not print the run's status line"
+fi
+
+printf -- '\n--- the run directory as it stands in the guest ---\n'
+RUNDIR_OUT="${TMP_ROOT}/rundir.out"
+guest sh -c "ls -la \$HOME/.agent-box/runs/${AUTH_RUNID}" > "$RUNDIR_OUT" 2>&1
+cat "$RUNDIR_OUT"
+for f in meta.json events.jsonl status console.log hooks.jsonl summary.txt; do
+    if grep -q " ${f}\$" "$RUNDIR_OUT"; then
+        ok "the run directory has ${f}"
+    else
+        bad "the run directory is missing ${f}"
+    fi
+done
+printf -- '\n--- meta.json ---\n'
+guest sh -c "cat \$HOME/.agent-box/runs/${AUTH_RUNID}/meta.json" 2>&1
+
+printf -- '\n--- runs --json, in the form a caller assembling a command line uses ---\n'
+# `--` before the operands. A caller that did not type the path cannot know
+# whether it begins with a dash, and this is the only way it can say so.
+RUNSJ="${TMP_ROOT}/runs.json"
+"$AGENTBOX" runs --json -- "$CLEAN_REPO" > "$RUNSJ" 2>&1
+cat "$RUNSJ"
+if jq -e . "$RUNSJ" >/dev/null 2>&1; then
+    ok "runs --json -- <repo> works with the operand after a double dash"
+else
+    bad "runs --json -- <repo> did not produce JSON"
+fi
+if jq -e . "$RUNSJ" >/dev/null 2>&1; then
+    ok "runs --json parses"
+else
+    bad "runs --json does not parse"
+fi
+if jq -e --arg r "$AUTH_RUNID" 'map(select(.runid == $r and .state == "failed")) | length == 1' "$RUNSJ" >/dev/null 2>&1; then
+    ok "runs --json lists the run with state failed"
+else
+    bad "runs --json does not list the run as failed"
+fi
+if jq -e --arg r "$AUTH_RUNID" 'map(select(.runid == $r))[0] | has("exit_code") and has("model") and has("branch") and has("started_at") and has("duration_s") and has("turns") and has("cost_usd") and has("files_changed")' "$RUNSJ" >/dev/null 2>&1; then
+    ok "runs --json carries every documented key"
+else
+    bad "runs --json is missing documented keys"
+fi
+
+printf -- '\n--- logs, formatted ---\n'
+LOGS_OUT="${TMP_ROOT}/logs.out"
+run_bounded 90 "$LOGS_OUT" "$AGENTBOX" logs "$CLEAN_REPO" "$AUTH_RUNID"
+cat "$LOGS_OUT"
+if grep -qE '^[0-9]{2}:[0-9]{2}:[0-9]{2}  (status|text|tool|out|hook|result) ' "$LOGS_OUT"; then
+    ok "logs printed formatted event lines"
+else
+    bad "logs printed no formatted event lines"
+fi
+FAKE_HEAD=${FAKE_TOKEN:0:8}
+FAKE_TAIL=${FAKE_TOKEN: -8}
+if grep -qF "$FAKE_HEAD" "$LOGS_OUT" || grep -qF "$FAKE_TAIL" "$LOGS_OUT"; then
+    bad "logs printed a fragment of the token"
+else
+    ok "logs printed neither the token's head nor its tail"
+fi
+
+printf -- '\n--- logs --json ---\n'
+LOGSJ="${TMP_ROOT}/logs.json"
+run_bounded 90 "$LOGSJ" "$AGENTBOX" logs "$CLEAN_REPO" "$AUTH_RUNID" --json
+head -5 "$LOGSJ"
+LOGSJ_BAD=0
+LOGSJ_LINES=0
+while IFS= read -r jline; do
+    [ -n "$jline" ] || continue
+    LOGSJ_LINES=$((LOGSJ_LINES + 1))
+    printf '%s' "$jline" | jq -e 'has("ts") and has("run") and has("kind") and has("text") and has("tool") and has("detail")' >/dev/null 2>&1 \
+        || LOGSJ_BAD=$((LOGSJ_BAD + 1))
+done < "$LOGSJ"
+printf '%s lines, %s malformed\n' "$LOGSJ_LINES" "$LOGSJ_BAD"
+if [ "$LOGSJ_LINES" -gt 0 ] && [ "$LOGSJ_BAD" -eq 0 ]; then
+    ok "every logs --json line parses and carries the required keys"
+else
+    bad "logs --json produced ${LOGSJ_LINES} lines with ${LOGSJ_BAD} malformed"
+fi
+if grep -qF "$FAKE_HEAD" "$LOGSJ" || grep -qF "$FAKE_TAIL" "$LOGSJ"; then
+    bad "logs --json printed a fragment of the token"
+else
+    ok "logs --json printed neither the token's head nor its tail"
+fi
+
+# ===========================================================================
+step "8e. hook-event.sh turns one hook payload into one line"
+# ===========================================================================
+
+HOOK_OUT="${TMP_ROOT}/hook-event.out"
+guest bash -l > "$HOOK_OUT" 2>&1 <<'SH'
+set -u
+# Inside the state root: hook-event.sh refuses any destination outside it, and
+# a mktemp -d under /tmp is exactly the case it refuses.
+d="$HOME/.agent-box/sessions/hooktest"
+rm -rf "$d"; mkdir -p "$d"
+printf '%s' '{"session_id":"abc123","cwd":"/work","hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{"file_path":"/work/src/x.py","old_string":"a"}}' \
+    | AGENT_BOX_EVENTS_DIR="$d" /opt/agent-box/guest/hook-event.sh
+echo "RC=$?"
+echo "--- hooks.jsonl ---"
+cat "$d/hooks.jsonl"
+echo "--- fields ---"
+jq -r '"event=\(.event) tool=\(.tool) input_head=\(.input_head) session=\(.session_id) ok=\(.ok)"' "$d/hooks.jsonl"
+echo "--- with no events dir, it writes nothing and exits 0 ---"
+printf '%s' '{"hook_event_name":"Stop"}' | /opt/agent-box/guest/hook-event.sh
+echo "RC_NODIR=$?"
+rm -rf "$d"
+SH
+cat "$HOOK_OUT"
+if grep -q '^RC=0' "$HOOK_OUT"; then ok "hook-event.sh exited 0"; else bad "hook-event.sh did not exit 0"; fi
+if grep -q 'event=PreToolUse tool=Edit input_head=/work/src/x.py session=abc123 ok=null' "$HOOK_OUT"; then
+    ok "the hook line carries the expected fields"
+else
+    bad "the hook line does not carry the expected fields"
+fi
+if grep -q '^RC_NODIR=0' "$HOOK_OUT"; then
+    ok "hook-event.sh exits 0 with no events directory"
+else
+    bad "hook-event.sh did not exit 0 with no events directory"
+fi
+
+# ===========================================================================
+step "8f. stop-run: it signals, it observes, and it refuses what it should"
+# ===========================================================================
+#
+# The stand-in traps INT and writes a marker, so the assertion can distinguish
+# "the process was interrupted" from "cmd_stop wrote a status file". With an
+# unconditional write and a stand-in that ignores signals, this step used to
+# pass even if nothing was ever signalled.
+
+STANDIN=20260101-000000
+guest bash -l > "${TMP_ROOT}/standin.out" 2>&1 <<SH
+set -u
+d="\$HOME/.agent-box/runs/${STANDIN}"
+rm -rf "\$d"; mkdir -p "\$d"; chmod 700 "\$d"
+printf 'running\n' > "\$d/status"
+printf '{"runid":"${STANDIN}","model":"sonnet","branch":null,"brief":"stand-in","started_at":"2026-01-01T00:00:00Z","tmux":"run-${STANDIN}","max_turns":null,"max_budget_usd":null,"claude_version":null}\n' > "\$d/meta.json"
+rm -f /tmp/abx-standin-interrupted
+cat > /tmp/abx-standin.sh <<'INNER'
+#!/bin/bash
+# Loops, so that killing the inner sleep is not enough to end it. Only SIGINT
+# to this process writes the marker — which is what makes the assertion mean
+# "the pane process was interrupted" rather than "something died".
+trap 'touch /tmp/abx-standin-interrupted; exit 130' INT
+while :; do sleep 300 & wait \$!; done
+INNER
+chmod +x /tmp/abx-standin.sh
+tmux new-session -d -s "run-${STANDIN}" -- /tmp/abx-standin.sh
+sleep 1
+tmux has-session -t "=run-${STANDIN}" && echo STANDIN-UP
+SH
+cat "${TMP_ROOT}/standin.out"
+if grep -q 'STANDIN-UP' "${TMP_ROOT}/standin.out"; then
+    ok "the stand-in run session is up and trapping INT"
+else
+    bad "the stand-in run session did not start"
+fi
+
+STOP_OUT="${TMP_ROOT}/stop-run.out"
+STOP_T0=$(date +%s)
+run_bounded 90 "$STOP_OUT" "$AGENTBOX" stop-run "$CLEAN_REPO" "$STANDIN"
+stop_rc=$BOUNDED_RC
+STOP_ELAPSED=$(( $(date +%s) - STOP_T0 ))
+cat "$STOP_OUT"
+printf 'stop-run took %ss\n' "$STOP_ELAPSED"
+if [ "$stop_rc" -eq 0 ]; then ok "stop-run exited 0"; else bad "stop-run exited ${stop_rc}"; fi
+
+if guest test -e /tmp/abx-standin-interrupted; then
+    ok "the stand-in actually received SIGINT"
+else
+    bad "the stand-in was never signalled; the stop was a status write, not a stop"
+fi
+if [ "$STOP_ELAPSED" -lt 20 ]; then
+    ok "the stop completed in ${STOP_ELAPSED}s, before the 20s fallback"
+else
+    bad "the stop took ${STOP_ELAPSED}s; it fell through to killing the session"
+fi
+
+STOP_STATE=$(guest /opt/agent-box/guest/run-ctl.sh state "$STANDIN" 2>/dev/null | tr -d '\r\n')
+printf 'state after stop-run: %s\n' "$STOP_STATE"
+if [ "$STOP_STATE" = "exit:stopped" ]; then
+    ok "the run records exit:stopped"
+else
+    bad "the run records '${STOP_STATE}', not exit:stopped"
+fi
+if guest tmux has-session -t "=run-${STANDIN}" 2>/dev/null; then
+    bad "the tmux session survived stop-run"
+else
+    ok "the tmux session was closed"
+fi
+if "$AGENTBOX" runs "$CLEAN_REPO" | grep -qE "${STANDIN}.*stopped"; then
+    ok "runs shows the stopped run as stopped"
+else
+    bad "runs does not show the stopped run as stopped"
+fi
+
+printf -- '\n--- stopping a run that has already ended is refused, not overwritten ---\n'
+AGAIN_OUT="${TMP_ROOT}/stop-again.out"
+run_bounded 60 "$AGAIN_OUT" "$AGENTBOX" stop-run "$CLEAN_REPO" "$STANDIN"
+again_rc=$BOUNDED_RC
+cat "$AGAIN_OUT"
+if [ "$again_rc" -ne 0 ] && grep -q 'already ended' "$AGAIN_OUT"; then
+    ok "stop-run refused a run that had already ended"
+else
+    bad "stop-run did not refuse a run that had already ended"
+fi
+
+printf -- '\n--- a finished run keeps its own exit code ---\n'
+FINISHED=20260101-111111
+guest bash -l > /dev/null 2>&1 <<SH
+set -u
+d="\$HOME/.agent-box/runs/${FINISHED}"
+rm -rf "\$d"; mkdir -p "\$d"; chmod 700 "\$d"
+printf 'exit:0\n' > "\$d/status"
+printf '{"runid":"${FINISHED}","model":"sonnet","branch":null,"brief":"finished","started_at":"2026-01-01T11:11:11Z","tmux":null,"max_turns":null,"max_budget_usd":null,"claude_version":null}\n' > "\$d/meta.json"
+SH
+KEEP_OUT="${TMP_ROOT}/stop-finished.out"
+run_bounded 60 "$KEEP_OUT" "$AGENTBOX" stop-run "$CLEAN_REPO" "$FINISHED"
+cat "$KEEP_OUT"
+KEEP_STATE=$(guest /opt/agent-box/guest/run-ctl.sh state "$FINISHED" 2>/dev/null | tr -d '\r\n')
+printf 'state of the finished run afterwards: %s\n' "$KEEP_STATE"
+if [ "$KEEP_STATE" = "exit:0" ]; then
+    ok "a finished run's exit code survived stop-run"
+else
+    bad "stop-run overwrote a finished run's exit code with '${KEEP_STATE}'"
+fi
+
+printf -- '\n--- with nothing running, stop-run says so instead of picking one ---\n'
+NONE_OUT="${TMP_ROOT}/stop-none.out"
+run_bounded 60 "$NONE_OUT" "$AGENTBOX" stop-run "$CLEAN_REPO"
+none_rc=$BOUNDED_RC
+cat "$NONE_OUT"
+if [ "$none_rc" -ne 0 ] && grep -q 'no run is running' "$NONE_OUT"; then
+    ok "stop-run with no argument refused when nothing was running"
+else
+    bad "stop-run with no argument did not refuse when nothing was running"
+fi
+
+printf -- '\n--- with no argument it picks the newest RUNNING run, not the newest ---\n'
+OLD_RUNNING=20260101-222222
+guest bash -l > /dev/null 2>&1 <<SH
+set -u
+d="\$HOME/.agent-box/runs/${OLD_RUNNING}"
+rm -rf "\$d"; mkdir -p "\$d"; chmod 700 "\$d"
+printf 'running\n' > "\$d/status"
+printf '{"runid":"${OLD_RUNNING}","model":"sonnet","branch":null,"brief":"old-running","started_at":"2026-01-01T22:22:22Z","tmux":"run-${OLD_RUNNING}","max_turns":null,"max_budget_usd":null,"claude_version":null}\n' > "\$d/meta.json"
+rm -f /tmp/abx-old-interrupted
+cat > /tmp/abx-old.sh <<'INNER'
+#!/bin/bash
+trap 'touch /tmp/abx-old-interrupted; exit 130' INT
+while :; do sleep 300 & wait \$!; done
+INNER
+chmod +x /tmp/abx-old.sh
+tmux new-session -d -s "run-${OLD_RUNNING}" -- /tmp/abx-old.sh
+sleep 1
+SH
+# A finished run with a NEWER id than the running one, so that "newest" and
+# "newest running" are genuinely different answers and the assertion below can
+# tell which one stop-run used.
+NEWEST_FINISHED=20260101-333333
+guest bash -l > /dev/null 2>&1 <<SH
+set -u
+d="\$HOME/.agent-box/runs/${NEWEST_FINISHED}"
+rm -rf "\$d"; mkdir -p "\$d"; chmod 700 "\$d"
+printf 'exit:0\n' > "\$d/status"
+printf '{"runid":"${NEWEST_FINISHED}","model":"sonnet","branch":null,"brief":"newest-finished","started_at":"2026-01-01T33:33:33Z","tmux":null,"max_turns":null,"max_budget_usd":null,"claude_version":null}\n' > "\$d/meta.json"
+SH
+PICK_OUT="${TMP_ROOT}/stop-pick.out"
+run_bounded 90 "$PICK_OUT" "$AGENTBOX" stop-run "$CLEAN_REPO"
+cat "$PICK_OUT"
+if grep -q "stopping ${OLD_RUNNING}" "$PICK_OUT"; then
+    ok "stop-run chose the newest RUNNING run, not the newest run"
+else
+    bad "stop-run did not choose the newest running run"
+fi
+NEWEST_STATE=$(guest /opt/agent-box/guest/run-ctl.sh state "$NEWEST_FINISHED" 2>/dev/null | tr -d '\r\n')
+if [ "$NEWEST_STATE" = "exit:0" ]; then
+    ok "the newer finished run was left alone"
+else
+    bad "the newer finished run was rewritten to '${NEWEST_STATE}'"
+fi
+
+printf -- '\n--- a run left saying running with nothing behind it becomes lost ---\n'
+ORPHAN=20260101-444444
+guest bash -l > /dev/null 2>&1 <<SH
+set -u
+d="\$HOME/.agent-box/runs/${ORPHAN}"
+rm -rf "\$d"; mkdir -p "\$d"; chmod 700 "\$d"
+printf 'running\n' > "\$d/status"
+printf '999999\n' > "\$d/pid"
+printf '{"runid":"${ORPHAN}","model":"sonnet","branch":null,"brief":"orphan","started_at":"2026-01-01T44:44:44Z","tmux":"run-${ORPHAN}","max_turns":null,"max_budget_usd":null,"claude_version":null}\n' > "\$d/meta.json"
+SH
+ORPHAN_RUNS="${TMP_ROOT}/orphan-runs.out"
+"$AGENTBOX" runs "$CLEAN_REPO" > "$ORPHAN_RUNS" 2>&1
+cat "$ORPHAN_RUNS"
+ORPHAN_STATE=$(guest /opt/agent-box/guest/run-ctl.sh state "$ORPHAN" 2>/dev/null | tr -d '\r\n')
+printf 'orphan state after runs: %s\n' "$ORPHAN_STATE"
+if [ "$ORPHAN_STATE" = "exit:lost" ]; then
+    ok "runs reconciled the orphaned run to exit:lost"
+else
+    bad "the orphaned run is still '${ORPHAN_STATE}'; it would say running for ever"
+fi
+if grep -qE "${ORPHAN}.*lost" "$ORPHAN_RUNS"; then
+    ok "runs shows it in the lost state"
+else
+    bad "runs does not show the lost state"
+fi
+
+printf -- '\n--- procps is installed, which is what makes the signal find claude ---\n'
+if guest sh -c 'command -v pgrep >/dev/null 2>&1'; then
+    ok "pgrep is present in the guest"
+else
+    bad "pgrep is missing; stop-run cannot find the process tree"
+fi
+
+guest sh -c 'rm -f /tmp/abx-standin.sh /tmp/abx-old.sh /tmp/abx-standin-interrupted /tmp/abx-old-interrupted' || true
+guest sh -c "rm -rf \$HOME/.agent-box/runs/${STANDIN} \$HOME/.agent-box/runs/${FINISHED} \$HOME/.agent-box/runs/${OLD_RUNNING} \$HOME/.agent-box/runs/${NEWEST_FINISHED} \$HOME/.agent-box/runs/${ORPHAN}" || true
+
+# ===========================================================================
+step "8g. tmux sessions are listed, and a detached one can be attached to"
+# ===========================================================================
+
+guest tmux new-session -d -s shell -- sleep 600
+SESS_OUT="${TMP_ROOT}/sessions.out"
+"$AGENTBOX" sessions "$CLEAN_REPO" > "$SESS_OUT" 2>&1
+cat "$SESS_OUT"
+if grep -qE '^shell ' "$SESS_OUT"; then
+    ok "sessions lists the detached shell session"
+else
+    bad "sessions does not list the detached shell session"
+fi
+
+SESSJ="${TMP_ROOT}/sessions.json"
+"$AGENTBOX" sessions "$CLEAN_REPO" --json > "$SESSJ" 2>&1
+cat "$SESSJ"
+if jq -e 'map(select(.name == "shell")) | length == 1' "$SESSJ" >/dev/null 2>&1; then
+    ok "sessions --json lists it with a name"
+else
+    bad "sessions --json does not list it"
+fi
+if jq -e 'map(select(.name == "shell"))[0] | has("age_s")' "$SESSJ" >/dev/null 2>&1; then
+    ok "sessions --json carries an age"
+else
+    bad "sessions --json carries no age"
+fi
+
+# attach needs a terminal, so it gets one: `script` allocates a pty on macOS.
+# A detach-client from the other side is what has to make it return.
+printf -- '\n--- attach -r returns when the session detaches it ---\n'
+ATTACH_OUT="${TMP_ROOT}/attach.out"
+( sleep 8; "$LIMACTL" shell --workdir /work "$INSTANCE" -- tmux detach-client -s shell >/dev/null 2>&1 ) &
+DETACHER=$!
+ATTACH_T0=$(date +%s)
+run_bounded 60 "$ATTACH_OUT" script -q /dev/null "$AGENTBOX" attach "$CLEAN_REPO" shell -r
+attach_rc=$BOUNDED_RC
+ATTACH_ELAPSED=$(( $(date +%s) - ATTACH_T0 ))
+wait "$DETACHER" 2>/dev/null
+head -20 "$ATTACH_OUT"
+printf 'attach returned after %ss with status %s\n' "$ATTACH_ELAPSED" "$attach_rc"
+# The detacher waits 8 seconds before detaching, so a genuine pass cannot be
+# quicker than that. Without the elapsed check this step would pass if attach
+# failed instantly, or if the subcommand did not exist at all.
+if [ "$attach_rc" -eq 0 ] && [ "$ATTACH_ELAPSED" -ge 8 ]; then
+    ok "attach held the session for ${ATTACH_ELAPSED}s and returned 0 when it was detached"
+else
+    bad "attach exited ${attach_rc} after ${ATTACH_ELAPSED}s; expected 0 after at least 8s"
+fi
+guest tmux kill-session -t '=shell' 2>/dev/null || true
+
+# ===========================================================================
+step "8h. status: the JSON contract, and --watch leaving on Ctrl-C"
+# ===========================================================================
+#
+# Scoped to this instance. `agentbox status` with no argument reaches into
+# every agent-box VM on the machine, and a test must not run anything inside a
+# VM it did not create.
+
+STATUS_OUT="${TMP_ROOT}/status.out"
+"$AGENTBOX" status "$CLEAN_REPO" > "$STATUS_OUT" 2>&1
+cat "$STATUS_OUT"
+if grep -q "$INSTANCE" "$STATUS_OUT" && grep -q 'fw=drop' "$STATUS_OUT"; then
+    ok "status names the box and reports the firewall as drop"
+else
+    bad "status does not name the box with fw=drop"
+fi
+
+STATUSJ="${TMP_ROOT}/status.json"
+"$AGENTBOX" status "$CLEAN_REPO" --json > "$STATUSJ" 2>&1
+cat "$STATUSJ"
+if jq -e . "$STATUSJ" >/dev/null 2>&1; then
+    ok "status --json parses"
+else
+    bad "status --json does not parse"
+fi
+if jq -e '.generated_at and (.boxes | length == 1)' "$STATUSJ" >/dev/null 2>&1; then
+    ok "status --json has generated_at and exactly this box"
+else
+    bad "status --json is not shaped as documented"
+fi
+if jq -e '.boxes[0] | .firewall == "drop"' "$STATUSJ" >/dev/null 2>&1; then
+    ok "status --json reports firewall drop"
+else
+    bad "status --json does not report firewall drop"
+fi
+if jq -e '.boxes[0] | has("name") and has("instance") and has("repo") and has("state") and has("claude_version") and has("run") and has("runs_total") and has("sessions")' "$STATUSJ" >/dev/null 2>&1; then
+    ok "status --json carries every documented key"
+else
+    bad "status --json is missing documented keys"
+fi
+if jq -e '.boxes[0].run | has("id") and has("state") and has("elapsed_s") and has("turns") and has("cost_usd") and has("last_tool")' "$STATUSJ" >/dev/null 2>&1; then
+    ok "status --json includes the current run object"
+else
+    bad "status --json has no run object"
+fi
+# The newest run stays in `run` after it has finished, with its state, its exit
+# code and its total duration. Every run in this suite has ended by now, so a
+# `run` of null here would mean the object disappears the moment it matters.
+if jq -e '.boxes[0].run | .state == "failed" and .exit == 1 and (.elapsed_s | type) == "number"' "$STATUSJ" >/dev/null 2>&1; then
+    ok "the newest run stays in status --json after it finished, with its exit code"
+else
+    bad "status --json does not keep a finished run with its state and exit code"
+fi
+if jq -e '.boxes[0].sessions | type == "array"' "$STATUSJ" >/dev/null 2>&1; then
+    ok "status --json includes the session list"
+else
+    bad "status --json has no session list"
+fi
+if jq -e '.boxes[0].runs_total >= 1' "$STATUSJ" >/dev/null 2>&1; then
+    ok "status --json counts the runs"
+else
+    bad "status --json does not count the runs"
+fi
+
+printf -- '\n--- status --watch 30 leaves within three seconds of SIGINT ---\n'
+# THIRTY, not one. The spec's bound is three seconds whatever SECS is, and with
+# --watch 1 the assertion cannot fail: a shell that simply waited out the
+# interval would still be inside the bound. Thirty is far outside it, so this
+# only passes if the interrupt is acted on rather than deferred.
+WATCH_OUT="${TMP_ROOT}/watch.out"
+# `set -m`, not decoration: without job control a non-interactive shell starts
+# an asynchronous command with SIGINT ignored, and a signal the child cannot
+# receive would make this step prove nothing.
+set -m
+"$AGENTBOX" status "$CLEAN_REPO" --watch 30 > "$WATCH_OUT" 2>&1 &
+WATCH_PID=$!
+set +m
+sleep 6
+kill -INT "$WATCH_PID" 2>/dev/null
+WATCH_T0=$(date +%s)
+WATCH_LEFT=0
+for _attempt in 1 2 3 4 5 6; do
+    kill -0 "$WATCH_PID" 2>/dev/null || { WATCH_LEFT=1; break; }
+    sleep 0.5
+done
+wait "$WATCH_PID" 2>/dev/null
+WATCH_ELAPSED=$(( $(date +%s) - WATCH_T0 ))
+tail -5 "$WATCH_OUT"
+printf 'watch exited after %ss (flag %s)\n' "$WATCH_ELAPSED" "$WATCH_LEFT"
+if [ "$WATCH_LEFT" -eq 1 ] && [ "$WATCH_ELAPSED" -le 3 ]; then
+    ok "status --watch exited within 3s of SIGINT"
+else
+    bad "status --watch took ${WATCH_ELAPSED}s to exit after SIGINT"
+fi
+
+# ===========================================================================
+step "8i. hostile bytes from the guest are never executed or printed here"
+# ===========================================================================
+#
+# The agent runs as the guest user with a Bash tool, so every file the host CLI
+# reads out of the guest is a file the agent can write. Each check below plants
+# the bytes an agent could plant and asserts the host neither runs them nor
+# shows them.
+
+PWN_MARKER="${TMP_ROOT}/PWNED"
+rm -f "$PWN_MARKER"
+HOSTILE_RUNID=20260102-000000
+# Closes the AppleScript string literal and continues as AppleScript, where
+# `do shell script` runs on the HOST, outside the VM. Also carries the array
+# -subscript form that bash's arithmetic evaluator expands inside `[ -eq ]`.
+HOSTILE_STATE="exit:0\" & (do shell script \"touch ${PWN_MARKER}\") & \"x[\$(touch ${PWN_MARKER})]"
+
+guest bash -l > "${TMP_ROOT}/hostile-setup.out" 2>&1 <<SH
+set -u
+d="\$HOME/.agent-box/runs/${HOSTILE_RUNID}"
+mkdir -p "\$d"; chmod 700 "\$d"
+printf '%s' '${HOSTILE_STATE}' > "\$d/status"
+printf '{"runid":"${HOSTILE_RUNID}","model":"sonnet","branch":null,"brief":"hostile","started_at":"2026-01-02T00:00:00Z","tmux":null,"max_turns":null,"max_budget_usd":null,"claude_version":null}\n' > "\$d/meta.json"
+: > "\$d/events.jsonl"
+: > "\$d/console.log"
+wc -c < "\$d/status"
+SH
+cat "${TMP_ROOT}/hostile-setup.out"
+
+printf -- '\n--- B-01/B-07: the host reads that state through three commands ---\n'
+WATCH_RUN_OUT="${TMP_ROOT}/watch-run.out"
+run_bounded 60 "$WATCH_RUN_OUT" "$AGENTBOX" watch-run "$INSTANCE" "$HOSTILE_RUNID" "$CLEAN_REPO"
+cat "$WATCH_RUN_OUT"
+HOSTILE_LOGS="${TMP_ROOT}/hostile-logs.out"
+run_bounded 60 "$HOSTILE_LOGS" "$AGENTBOX" logs "$CLEAN_REPO" "$HOSTILE_RUNID"
+cat "$HOSTILE_LOGS"
+HOSTILE_STATUS="${TMP_ROOT}/hostile-status.json"
+"$AGENTBOX" status "$CLEAN_REPO" --json > "$HOSTILE_STATUS" 2>&1
+HOSTILE_RUNS="${TMP_ROOT}/hostile-runs.out"
+"$AGENTBOX" runs "$CLEAN_REPO" > "$HOSTILE_RUNS" 2>&1
+
+if [ -e "$PWN_MARKER" ]; then
+    bad "SECURITY: guest-written bytes executed a command on the host"
+    rm -f "$PWN_MARKER"
+else
+    ok "no guest-written byte executed anything on the host"
+fi
+if grep -q 'do shell script' "$WATCH_RUN_OUT" "$HOSTILE_LOGS" "$HOSTILE_STATUS" "$HOSTILE_RUNS" 2>/dev/null; then
+    bad "the hostile state was echoed back to the host terminal"
+else
+    ok "the hostile state was never echoed to the host terminal"
+fi
+if grep -q 'not a run state' "$WATCH_RUN_OUT"; then
+    ok "the host reported the unrecognised state instead of using it"
+else
+    bad "the host did not report the unrecognised state"
+fi
+if grep -q 'unknown' "$HOSTILE_RUNS"; then
+    ok "runs shows the hostile run in an unknown state"
+else
+    bad "runs did not fall back to unknown for the hostile state"
+fi
+
+printf -- '\n--- B-08: a run id that is not a run id is refused on the host ---\n'
+# shellcheck disable=SC2016  # these must stay literal; that is the point.
+for bad_id in '../../.ssh' 'x[$(touch /tmp/nope)]' '2026-1-2'; do
+    TRAV_OUT="${TMP_ROOT}/traversal.out"
+    "$AGENTBOX" logs "$CLEAN_REPO" "$bad_id" > "$TRAV_OUT" 2>&1
+    trav_rc=$?
+    printf 'logs %-22s -> rc=%s %s\n' "$bad_id" "$trav_rc" "$(head -1 "$TRAV_OUT")"
+    if [ "$trav_rc" -ne 0 ] && grep -q 'not a run id' "$TRAV_OUT"; then
+        ok "logs refused the run id ${bad_id}"
+    else
+        bad "logs did not refuse the run id ${bad_id}"
+    fi
+    "$AGENTBOX" stop-run "$CLEAN_REPO" "$bad_id" > "$TRAV_OUT" 2>&1
+    trav_rc=$?
+    if [ "$trav_rc" -ne 0 ] && grep -q 'not a run id' "$TRAV_OUT"; then
+        ok "stop-run refused the run id ${bad_id}"
+    else
+        bad "stop-run did not refuse the run id ${bad_id}"
+    fi
+done
+# shellcheck disable=SC2016  # $HOME must expand in the guest.
+if guest sh -c 'test -e "$HOME/.ssh/status"'; then
+    bad "a status file was written outside the runs directory"
+else
+    ok "nothing was written outside the runs directory"
+fi
+
+printf -- '\n--- B-02: a tmux session named after the token is not printed ---\n'
+guest tmux new-session -d -s "$FAKE_TOKEN" -- sleep 300 2>/dev/null || true
+SESS_TOK="${TMP_ROOT}/sessions-token.out"
+"$AGENTBOX" sessions "$CLEAN_REPO" > "$SESS_TOK" 2>&1
+cat "$SESS_TOK"
+SESS_TOKJ="${TMP_ROOT}/sessions-token.json"
+"$AGENTBOX" sessions "$CLEAN_REPO" --json > "$SESS_TOKJ" 2>&1
+cat "$SESS_TOKJ"
+if grep -qF "$FAKE_TOKEN" "$SESS_TOK" "$SESS_TOKJ"; then
+    bad "SECURITY: sessions printed the whole token"
+else
+    ok "sessions did not print the token"
+fi
+if grep -qF "$FAKE_HEAD" "$SESS_TOK" "$SESS_TOKJ" || grep -qF "$FAKE_TAIL" "$SESS_TOK" "$SESS_TOKJ"; then
+    bad "sessions printed a fragment of the token"
+else
+    ok "sessions printed neither the token's head nor its tail"
+fi
+if grep -q 'redacted' "$SESS_TOK"; then
+    ok "sessions redacted the credential-shaped session name"
+else
+    bad "sessions did not redact the credential-shaped session name"
+fi
+guest tmux kill-session -t "=${FAKE_TOKEN}" 2>/dev/null || true
+
+printf -- '\n--- B-05: a session name full of JSON cannot forge or erase a row ---\n'
+guest tmux new-session -d -s 'shell' -- sleep 300 2>/dev/null || true
+JSON_NAME='x","age_s":0},{"name":"ghost'
+guest tmux new-session -d -s "$JSON_NAME" -- sleep 300 2>/dev/null || true
+FORGE="${TMP_ROOT}/sessions-forge.json"
+"$AGENTBOX" sessions "$CLEAN_REPO" --json > "$FORGE" 2>&1
+cat "$FORGE"
+if jq -e . "$FORGE" >/dev/null 2>&1; then
+    ok "sessions --json still parses with a hostile session name"
+else
+    bad "a hostile session name broke sessions --json"
+fi
+if jq -e 'map(select(.name == "ghost")) | length == 0' "$FORGE" >/dev/null 2>&1; then
+    ok "no session row was forged"
+else
+    bad "a session row was forged by the name"
+fi
+FORGE_STATUS="${TMP_ROOT}/status-forge.json"
+"$AGENTBOX" status "$CLEAN_REPO" --json > "$FORGE_STATUS" 2>&1
+if jq -e '.boxes[0].sessions | type == "array" and length >= 2' "$FORGE_STATUS" >/dev/null 2>&1; then
+    ok "status --json still lists the real sessions"
+else
+    bad "status --json lost the session list to a hostile name"
+fi
+guest tmux kill-session -t "=${JSON_NAME}" 2>/dev/null || true
+guest tmux kill-session -t '=shell' 2>/dev/null || true
+
+printf -- '\n--- B-03: a whole credential in a tool result is dropped, not trimmed ---\n'
+LEAKY_RUNID=20260103-000000
+OTHER_CRED="sk-ant-oat01-AAAAAAAAAABBBBBBBBBBCCCCCCCCCCDDDDDDDDDD"
+guest bash -l > /dev/null 2>&1 <<SH
+set -u
+d="\$HOME/.agent-box/runs/${LEAKY_RUNID}"
+mkdir -p "\$d"; chmod 700 "\$d"
+printf 'exit:3\n' > "\$d/status"
+printf '{"runid":"${LEAKY_RUNID}","model":"sonnet","branch":null,"brief":"leaky","started_at":"2026-01-03T00:00:00Z","tmux":null,"max_turns":null,"max_budget_usd":null,"claude_version":null}\n' > "\$d/meta.json"
+printf '%s\n' '{"type":"user","timestamp":"2026-01-03T00:00:01.000Z","message":{"content":[{"type":"tool_result","content":[{"type":"text","text":"CLAUDE_CODE_OAUTH_TOKEN=${OTHER_CRED}"}]}]}}' > "\$d/events.jsonl"
+: > "\$d/console.log"
+SH
+LEAKY_OUT="${TMP_ROOT}/leaky-logs.out"
+run_bounded 60 "$LEAKY_OUT" "$AGENTBOX" logs "$CLEAN_REPO" "$LEAKY_RUNID"
+cat "$LEAKY_OUT"
+if grep -qF "$OTHER_CRED" "$LEAKY_OUT"; then
+    bad "SECURITY: logs printed a whole credential from a leak-flagged run"
+else
+    ok "logs printed no credential for the leak-flagged run"
+fi
+if grep -q 'leak check found the OAuth token' "$LEAKY_OUT"; then
+    ok "logs printed the leak banner instead of the events"
+else
+    bad "logs did not print the leak banner"
+fi
+LEAKY_FORCED="${TMP_ROOT}/leaky-forced.out"
+run_bounded 60 "$LEAKY_FORCED" "$AGENTBOX" logs "$CLEAN_REPO" "$LEAKY_RUNID" --force-unsafe
+cat "$LEAKY_FORCED"
+if grep -qF "$OTHER_CRED" "$LEAKY_FORCED"; then
+    bad "SECURITY: --force-unsafe printed the credential verbatim"
+else
+    ok "even --force-unsafe drops the whole credential, not just its ends"
+fi
+if grep -q 'redacted' "$LEAKY_FORCED"; then
+    ok "the credential was replaced by a redaction marker"
+else
+    bad "no redaction marker where the credential was"
+fi
+
+printf -- '\n--- B-09: the hook command refuses a destination outside the state root ---\n'
+HOOKC_OUT="${TMP_ROOT}/hook-contain.out"
+guest bash -l > "$HOOKC_OUT" 2>&1 <<'SH'
+set -u
+rm -rf /tmp/abx-outside && mkdir -p /tmp/abx-outside
+printf '%s' '{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{"file_path":"/work/x"}}' \
+    | AGENT_BOX_EVENTS_DIR=/tmp/abx-outside /opt/agent-box/guest/hook-event.sh
+echo "RC_OUTSIDE=$?"
+echo "FILES_OUTSIDE=$(find /tmp/abx-outside -type f | wc -l | tr -d ' ')"
+d="$HOME/.agent-box/sessions/linktest"
+rm -rf "$d" && mkdir -p "$d"
+ln -s /tmp/abx-outside/stolen.jsonl "$d/hooks.jsonl"
+printf '%s' '{"session_id":"s","hook_event_name":"Stop"}' \
+    | AGENT_BOX_EVENTS_DIR="$d" /opt/agent-box/guest/hook-event.sh
+echo "RC_SYMLINK=$?"
+echo "SYMLINK_TARGET=$( [ -e /tmp/abx-outside/stolen.jsonl ] && echo WRITTEN || echo untouched )"
+rm -rf /tmp/abx-outside "$d"
+SH
+cat "$HOOKC_OUT"
+if grep -q 'RC_OUTSIDE=0' "$HOOKC_OUT" && grep -q 'FILES_OUTSIDE=0' "$HOOKC_OUT"; then
+    ok "the hook wrote nothing outside the state root, and still exited 0"
+else
+    bad "the hook wrote outside the state root or failed"
+fi
+if grep -q 'SYMLINK_TARGET=untouched' "$HOOKC_OUT"; then
+    ok "the hook refused a hooks.jsonl that is a symlink"
+else
+    bad "the hook followed a symlink out of the state root"
+fi
+
+printf -- '\n--- B-10: the state root itself is 700 ---\n'
+# shellcheck disable=SC2016  # $HOME must expand in the guest.
+STATE_MODE=$(guest sh -c 'stat -c "%a" "$HOME/.agent-box"' 2>/dev/null)
+printf 'mode of ~/.agent-box: %s\n' "$STATE_MODE"
+if [ "$STATE_MODE" = "700" ]; then
+    ok "the state root is 700"
+else
+    bad "the state root is ${STATE_MODE}, expected 700"
+fi
+# And the case provisioning does not cover: a state root created by a script,
+# under a permissive umask. abx_private_dir has to make the parent private too,
+# or the layout the spec states is not what the code guarantees on its own.
+MODE_OUT="${TMP_ROOT}/state-mode.out"
+guest bash -l > "$MODE_OUT" 2>&1 <<'SH'
+die() { printf 'lib refused: %s\n' "$*" >&2; exit 1; }
+rm -rf /tmp/abx-modetest
+export ABX_STATE_DIR=/tmp/abx-modetest
+export ABX_RUNS_DIR=/tmp/abx-modetest/runs
+# shellcheck source=/dev/null
+. /opt/agent-box/guest/lib.sh
+umask 022
+abx_private_dir "$ABX_RUNS_DIR"
+abx_private_dir "${ABX_RUNS_DIR}/20260101-000000"
+stat -c '%a %n' /tmp/abx-modetest /tmp/abx-modetest/runs /tmp/abx-modetest/runs/20260101-000000
+rm -rf /tmp/abx-modetest
+SH
+cat "$MODE_OUT"
+if [ "$(grep -c '^700 ' "$MODE_OUT")" -eq 3 ]; then
+    ok "a state root created by a script is 700 all the way down, under umask 022"
+else
+    bad "a script-created state root is not 700 all the way down"
+fi
+
+printf -- '\n--- B-12: --settings merges the hooks rather than replacing them ---\n'
+MERGE_OUT="${TMP_ROOT}/settings-merge.out"
+guest bash -l > "$MERGE_OUT" 2>&1 <<'SH'
+set -u
+w=/tmp/abx-merge; rm -rf "$w"; mkdir -p "$w/cfg" "$w/out" "$w/proj"
+printf '#!/bin/sh\ncat >/dev/null\ntouch %s/out/user.marker\nexit 0\n' "$w" > "$w/hook-user.sh"
+printf '#!/bin/sh\ncat >/dev/null\ntouch %s/out/extra.marker\nexit 0\n' "$w" > "$w/hook-extra.sh"
+chmod +x "$w/hook-user.sh" "$w/hook-extra.sh"
+printf '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"%s/hook-user.sh"}]}]}}\n' "$w" > "$w/cfg/settings.json"
+printf '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"%s/hook-extra.sh"}]}]}}\n' "$w" > "$w/extra.json"
+cd "$w/proj"
+# `< /dev/null`, and it is load-bearing: this whole script arrives on bash's
+# stdin, so a claude that inherits it eats the rest of the script and the two
+# echoes below never run.
+CLAUDE_CONFIG_DIR="$w/cfg" CLAUDE_CODE_OAUTH_TOKEN='sk-ant-oat01-MERGEHEADzzzzzzzzzzzzzzzzzzzzMERGETAIL' \
+  timeout 120 claude -p --model haiku --settings "$w/extra.json" 'hi' >/dev/null 2>&1 </dev/null
+echo "USER_HOOK=$( [ -f "$w/out/user.marker" ] && echo RAN || echo absent )"
+echo "EXTRA_HOOK=$( [ -f "$w/out/extra.marker" ] && echo RAN || echo absent )"
+rm -rf "$w"
+SH
+cat "$MERGE_OUT"
+if grep -q 'USER_HOOK=RAN' "$MERGE_OUT" && grep -q 'EXTRA_HOOK=RAN' "$MERGE_OUT"; then
+    ok "--settings MERGES hook arrays with the user settings.json"
+else
+    bad "--settings did not merge; the sensor's hooks can be displaced (see docs/decisions.md)"
+fi
+
+printf -- '\n--- B-12: a repository settings.json with hooks is refused ---\n'
+REPOSET="${TMP_ROOT}/repo-settings.out"
+guest sh -c 'mkdir -p /work/.claude && printf "%s\n" "{\"hooks\":{\"PreToolUse\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"touch /tmp/repo-hook-ran\"}]}]}}" > /work/.claude/settings.json'
+printf 'Do nothing.\n' | "$LIMACTL" shell --workdir /work "$INSTANCE" -- \
+    /opt/agent-box/guest/agent-run.sh --slug reposettings --brief - > "$REPOSET" 2>&1
+reposet_rc=$?
+cat "$REPOSET"
+if [ "$reposet_rc" -ne 0 ] && grep -q 'hooks' "$REPOSET" && grep -q '/work/.claude/settings.json' "$REPOSET"; then
+    ok "agent-run refused a repository settings.json carrying hooks, and named it"
+else
+    bad "agent-run did not refuse a repository settings.json carrying hooks"
+fi
+guest sh -c 'rm -rf /work/.claude /tmp/repo-hook-ran'
+
+# Clean up everything this step planted in the guest.
+guest sh -c "rm -rf \$HOME/.agent-box/runs/${HOSTILE_RUNID} \$HOME/.agent-box/runs/${LEAKY_RUNID}" || true
+
+printf -- '\n--- clean up the planted token and the run state ---\n'
+# shellcheck disable=SC2016  # $HOME must expand in the guest, not on the host.
+guest sh -c 'rm -f $HOME/.config/agent-box/token'
+guest sh -c 'cd /work && git checkout -- . 2>/dev/null; git checkout --quiet main 2>/dev/null; true'
+# shellcheck disable=SC2016  # $HOME must expand in the guest, not on the host.
+guest sh -c 'rm -rf /work/.agent-box $HOME/.agent-box/runs $HOME/.agent-box/briefs' || true
+if grep -rqF "$FAKE_TOKEN" "$CLEAN_REPO" 2>/dev/null; then
+    bad "the planted token is still in the work tree after the sensor checks"
+else
+    ok "the work tree is clean of the planted token after the sensor checks"
 fi
 
 # ===========================================================================

@@ -11,3 +11,9 @@ blocklist.txt
 ca.pem
 
 .DS_Store
+
+# `python3 -m py_compile guest/run-format.py` is a required verification step
+# and it writes here. A compiled artifact must never be stageable by a
+# `git add guest/`.
+__pycache__/
+*.pyc

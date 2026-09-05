@@ -32,13 +32,198 @@ cp templates/brief.md briefs/my-task.md   # fill it in
 ./bin/agentbox run ~/dev/my-e2e-tests briefs/my-task.md --model sonnet
 ```
 
-The run gets its own `agent/<slug>-<timestamp>` branch, keeps its JSON
-transcript inside the VM, writes only a short scrubbed summary to the host, and
-checks that summary and both diffs for fragments of your token before it
-reports success. Use this for anything you intend to review as a diff.
+The run gets its own `agent/<slug>-<timestamp>` branch, keeps its event stream
+inside the VM, writes only a short scrubbed summary to the host, and checks
+that summary and both diffs for fragments of your token before it reports
+success. Use this for anything you intend to review as a diff.
+
+It returns as soon as the run has started. The next section is how you watch
+it.
 
 `agentbox shell` is still there for looking around, and does not authenticate
 anything: nothing exports the token into a plain shell.
+
+## Watching and steering
+
+A run is detached by default, in a tmux session inside the VM. Closing the
+laptop, dropping the connection or quitting the terminal does not stop it.
+
+### The run loop
+
+```
+./bin/agentbox run   ~/dev/my-e2e-tests briefs/my-task.md   # prints a run id
+./bin/agentbox runs  ~/dev/my-e2e-tests                     # every run, newest first
+./bin/agentbox logs  ~/dev/my-e2e-tests -f                  # follow the newest one
+./bin/agentbox stop-run ~/dev/my-e2e-tests                  # interrupt it
+```
+
+`run` takes `--model M`, `--max-budget-usd X`, `--max-turns N`, `--wait` and
+`--notify`. `--wait` blocks, streams the run and exits with its status, which
+is what a script wrapping this wants. The two caps are passed to the CLI only
+when the installed CLI has them: 2.1.261 has `--max-budget-usd` and does not
+have `--max-turns`, and a run that is not capped says so rather than dying on
+an unknown option.
+
+`logs` takes a run id, `-f` to follow until the run ends, and `--json`. The
+default is the newest run. What you see is one line per event, merged from
+three sensors in time order:
+
+```
+12:00:01  status  agent-run: branch agent/my-task-20260905-120001 created from main
+12:00:03  text    Reading the suite to see what it covers
+12:00:04  tool    Edit  tests/test_orders.py
+12:00:05  out     Applied 1 edit to tests/test_orders.py
+12:00:07  hook    Notification  waiting for your input
+12:00:41  result  success  turns=3  cost=$0.0412  duration=38s  is_error=false
+```
+
+If a run's leak check found the token in output that reaches the host, that run
+exited 3 and `logs` will not print its events. You get a banner saying so and
+telling you to rotate the token; `--force-unsafe` overrides it. The same applies
+to the summary `run --wait` prints.
+
+`stop-run` with no run id addresses **the newest run that is still running**,
+and says which one it picked. If nothing is running it says so and stops; if
+you name a run that has already ended it refuses rather than overwriting the
+record of how it ended.
+
+It interrupts the model rather than killing the pane, waits up to twenty
+seconds, and then closes the session. `exit:stopped` is written only once the
+session and its process have both been observed to be gone; if the run recorded
+its own exit while we waited, that code is kept, because it is the truth about
+what happened.
+
+**Nothing is reverted, ever.** An interrupted run does not check out anything,
+does not delete its branch, and does not touch the tree. That matters most when
+the brief said to commit: a clean tree with three commits on it is exactly what
+"nothing to restore" used to look like, and the branch would have been deleted
+with `-D`. It is not, now. `run --wait` on a run you stopped prints the summary
+and exits 130.
+
+### The states a run can be in
+
+| State | Means |
+|---|---|
+| `running` | the process is alive and the run is going |
+| `done` | it ended on its own with exit 0 |
+| `failed` | it ended on its own with a non-zero exit |
+| `stopped` | `stop-run` interrupted it and watched it end |
+| `lost` | it said running, and neither its tmux session nor its recorded pid was there |
+| `unknown` | there is no status file to read |
+
+`lost` is what a run becomes when the VM was stopped underneath it, or its
+process died without running its exit handler. `runs`, `status` and
+`agentbox start` each reconcile that before answering, so a run does not sit at
+`running` for ever and `logs -f` does not block on one.
+
+### Sessions you can leave
+
+```
+./bin/agentbox session ~/dev/my-e2e-tests briefs/my-task.md   # interactive, in tmux
+./bin/agentbox attach  ~/dev/my-e2e-tests                     # back to it
+./bin/agentbox attach  ~/dev/my-e2e-tests 20260905-120001     # watch a run, read-only
+./bin/agentbox sessions ~/dev/my-e2e-tests                    # what is open in there
+```
+
+`session` is `agentbox claude` in a tmux session named `claude`, optionally
+with a brief as the first prompt. Detach with the tmux prefix and `d`
+(`Ctrl-b d` unless you have changed it) and the session keeps running. Attaching
+to a **run** is read-only, because typing into a run's pane types at the agent.
+`agentbox shell` is in tmux too, under the name `shell`.
+
+Interactive output is not scrubbed. `agentbox session` says so once when it
+starts, for the reason `docs/decisions.md` gives: there is no boundary to
+filter at when the model's output is being drawn on your screen.
+
+### Status
+
+```
+./bin/agentbox status                      # every box, one line each
+./bin/agentbox status ~/dev/my-e2e-tests   # just that one
+./bin/agentbox status --watch 5            # redraw every five seconds
+./bin/agentbox status --json               # the contract a UI reads
+```
+
+```
+BOX                            STATE     RUN / SESSIONS / FIREWALL
+(one line per box; wrapped here to fit)
+agent-box-my-e2e-tests         running   fw=drop  claude=2.1.261  runs=4  tmux=2
+                                         run 20260905-120001 running 38s turns=3
+                                         cost=$0.0412  last: Edit tests/test_orders.py
+```
+
+`firewall` is read from the live `iptables` OUTPUT policy, not from whether a
+systemd unit is enabled: `drop`, `open`, or `unknown` when it could not be
+read at all. A stopped box costs nothing to display, and a running one costs
+exactly one `limactl shell` per refresh.
+
+### Notifications
+
+`--notify` on a run, or `notify: true` in `~/.config/agent-box/config`, starts
+a small background process **on the host** that polls the run every ten seconds
+and shows a desktop notification when it ends. One watcher per run, tracked by
+a pid file under `~/.config/agent-box/watchers/`. The guest has no way to reach
+your desktop and is not given one.
+
+### The JSON is the contract
+
+`runs --json`, `logs --json` and `status --json` are stable, snake_case, with
+ISO 8601 UTC times and durations in seconds. Every subcommand stops reading
+options at a literal `--`, which is how a caller that assembles a command line
+says where its operands begin:
+
+```
+./bin/agentbox runs --json         -- ~/dev/my-e2e-tests
+./bin/agentbox logs -f --json      -- ~/dev/my-e2e-tests 20260905-120001
+./bin/agentbox stop-run            -- ~/dev/my-e2e-tests 20260905-120001
+```
+
+`status --json`'s `run` is the **newest** run whatever state it is in, so a run
+that has finished stays visible with its state, its exit code and its total
+duration in `elapsed_s`. It is `null` only when the box has never run anything,
+or is not running. `state` is one of `running`, `done`, `failed`, `stopped`,
+`lost` or `unknown`, and `exit_code` is null for all but `done` and `failed`. `sessions` is `null`, never `[]`, when the list could not be
+read: an empty array means the box genuinely has no sessions.
+
+`--watch` needs a named box. A one-shot `agentbox status` across every VM is
+cheap; a loop across every VM is a python process and a tmux client inside each
+of them every few seconds, aimed at boxes you did not name. A user interface built on this is
+a renderer of those three commands: it never talks to `limactl` itself, and it
+never reads anything inside the guest. That is what keeps the scrub in one
+place. `status --json` looks like this:
+
+```json
+{"generated_at": "2026-09-05T16:00:00Z",
+ "boxes": [{"name": "my-e2e-tests", "instance": "agent-box-my-e2e-tests",
+            "repo": "/Users/you/dev/my-e2e-tests", "state": "running",
+            "claude_version": "2.1.261 (Claude Code)", "firewall": "drop",
+            "run": {"id": "20260905-120001", "state": "running", "exit": null,
+                    "model": "sonnet", "branch": "agent/my-task-20260905-120001",
+                    "started_at": "2026-09-05T12:00:01Z", "elapsed_s": 38,
+                    "turns": 3, "cost_usd": 0.0412,
+                    "last_tool": "Edit  tests/test_orders.py",
+                    "last_text": "Reading the suite to see what it covers"},
+            "runs_total": 4,
+            "sessions": [{"name": "claude", "age_s": 900, "last_event": null}]}]}
+```
+
+### What a run leaves behind, and where
+
+Inside the VM, at mode 700, never on the host's disk:
+
+```
+~/.agent-box/runs/<runid>/
+  meta.json      model, branch, brief, start time, tmux session, the caps
+  events.jsonl   the raw stream-json from the CLI
+  hooks.jsonl    one line per hook event
+  console.log    what agent-run.sh printed, one timestamp per line
+  status         running, then exit:<code> or exit:stopped
+  summary.txt    the scrubbed summary, the same text that reaches the host
+~/.agent-box/sessions/<name>/hooks.jsonl   the same for an interactive session
+```
+
+The only thing that crosses to the host's disk is `<repo>/.agent-box/last-run.txt`,
+and it is checked for token fragments before the run reports success.
 
 ## Host configuration layout
 
@@ -143,7 +328,7 @@ Two mechanisms, for two different situations.
 ```
 # one directive per line, '#' starts a comment
 marketplace konyklabs/claude-plugins
-install governor@konyklabs-plugins
+install supervisor@konyklabs-plugins
 install py-testing@konyklabs-plugins
 ```
 

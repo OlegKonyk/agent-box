@@ -18,6 +18,19 @@ HOST_GUEST_CONFIG_DIR="${HOST_CONFIG_DIR}/guest"
 LIMA_TEMPLATE="${BOX_DIR}/lima/agent-box.yaml"
 LIMACTL="${LIMACTL:-limactl}"
 
+# Optional host-side settings, one `key: value` per line. Only `notify` is read.
+HOST_CONFIG_FILE="${HOST_CONFIG_DIR}/config"
+# One pid file per watched run, so `--notify` twice does not watch twice.
+WATCHER_DIR="${HOST_CONFIG_DIR}/watchers"
+
+# This script's own absolute path. `--notify` re-invokes it detached, and $0 is
+# whatever the caller typed, which may be relative to a directory the
+# background process will not be sitting in.
+SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
+
+# Everything guest-side lives under one prefix, named once.
+GUEST_BIN="/opt/agent-box/guest"
+
 PROG=$(basename "$0")
 
 die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
@@ -32,16 +45,46 @@ usage: ${PROG} <command> [args]
   start <repo>                      preflight, then start an existing VM
   token <repo>                      read an OAuth token from the terminal into the VM
   verify-auth <repo>                prove the token authenticates, with a real model call
-  claude <repo> [claude args...]    interactive Claude Code in the VM, in /work
-  shell <repo>                      interactive shell in the VM, in /work
-  run <repo> <brief.md> [--model M] run one headless task; default model: sonnet
+  claude [--] <repo> [claude args]  interactive Claude Code in the VM, in /work
+  session <repo> [brief.md]         interactive Claude Code in a tmux session
+  shell <repo>                      interactive shell in the VM, in a tmux session
+  attach <repo> [session|runid] [-r]
+                                    attach to a tmux session; runs are read-only
+  sessions <repo> [--json]          list the VM's tmux sessions
+  run <repo> <brief.md> [options]   start one headless task; returns at once
+  runs <repo> [--json]              list this VM's runs, newest first
+  logs <repo> [runid] [-f] [--json] [--force-unsafe]
+                                    read a run back, scrubbed, in the guest
+  stop-run <repo> [runid]           interrupt a running task
   plugins <repo> [--update]         apply plugins.txt inside the VM
   update <repo>                     update Claude Code inside the VM
   stop <repo|name>                  stop the VM
   destroy <repo|name>               stop and delete the VM
-  status                            list all Lima instances
+  status [repo] [--json] [--watch [SECS]]
+                                    one line per box: run, sessions, firewall
+                                    (--watch needs a named box)
   firewall-check <repo|name>        re-run the egress verification inside the VM
   help                              this message
+
+run options:
+  --model M           default sonnet
+  --max-turns N       cap the number of turns, when the installed CLI has it
+  --max-budget-usd X  cap the spend
+  --wait              block until it finishes and print the summary
+  --notify            desktop notification when it ends (or notify: true in
+                      ${HOST_CONFIG_DIR}/config)
+
+Every subcommand stops reading options at a literal --, so a caller building a
+command line can always say where its operands begin:
+
+  ${PROG} runs --json -- <repo>
+  ${PROG} logs -f --json -- <repo> [runid]
+
+For claude the -- may only come before the repository; everything after it goes
+to the CLI untouched.
+
+logs refuses to print a run whose leak check found the token, and says so.
+--force-unsafe prints it anyway.
 
 stop, destroy and firewall-check also accept a bare instance name, so a VM can
 still be shut down and deleted after its repository directory has been removed.
@@ -77,6 +120,165 @@ abs_repo() {
     local p="${1:?}"
     [ -d "$p" ] || die "not a directory: ${p}"
     (cd "$p" && pwd -P)
+}
+
+# Absolute path to an existing file, resolved against the CALLER's working
+# directory. `agentbox run . briefs/x.md` used to be read relative to wherever
+# the shell happened to be by the time the path was used, which is issue #5:
+# the brief is the caller's file, named the way the caller named it.
+abs_file() {
+    local p="${1:?}" dir base
+    [ -f "$p" ] || die "not a file: ${p}"
+    dir=$(cd "$(dirname "$p")" && pwd -P) || die "cannot resolve: ${p}"
+    base=$(basename "$p")
+    printf '%s/%s' "$dir" "$base"
+}
+
+# A run id and a tmux session name in one: %Y%m%d-%H%M%S, UTC, to the second.
+# Seconds because two runs inside one minute must not collide.
+new_runid() { date -u +%Y%m%d-%H%M%S; }
+
+# JSON string escaping for the handful of host-known values that go into
+# `status --json`. Paths, instance names and states — nothing with a newline in
+# it, but a backslash in a path is not exotic on any filesystem.
+json_str() {
+    local v="${1-}"
+    v=${v//\\/\\\\}
+    v=${v//\"/\\\"}
+    printf '"%s"' "$v"
+}
+
+# Split a command line into options and operands, stopping option processing at
+# a literal `--`.
+#
+# The `--` matters more than it looks. A caller that builds a command line
+# programmatically — the user interface that reads `--json`, a script, anything
+# that did not type the arguments by hand — cannot know whether the repository
+# path it is about to pass begins with a dash, and has no way to say "this is
+# an operand" without it. Everything after `--` is an operand, whatever it
+# starts with.
+#
+# $1 is the space-separated list of options that take a value, so that the
+# value travels with its option instead of being mistaken for an operand.
+# Results land in ABX_OPTV and ABX_POSV.
+split_args() {
+    local valued=" ${1} " arg literal=0
+    shift
+    ABX_OPTV=()
+    ABX_POSV=()
+    while [ $# -gt 0 ]; do
+        arg="$1"
+        if [ "$literal" -eq 1 ]; then
+            ABX_POSV+=("$arg"); shift; continue
+        fi
+        case "$arg" in
+            --)
+                literal=1; shift ;;
+            -*)
+                ABX_OPTV+=("$arg")
+                case "$valued" in
+                    *" ${arg} "*)
+                        shift
+                        [ $# -gt 0 ] || die "${arg} needs a value"
+                        ABX_OPTV+=("$1") ;;
+                esac
+                shift ;;
+            *)
+                ABX_POSV+=("$arg"); shift ;;
+        esac
+    done
+}
+
+# The Nth operand, or empty. Guarded, because bash 3.2 on this host treats an
+# out-of-range index of an empty array under `set -u` as an error.
+operand() {
+    local n="${1:?}"
+    [ "${#ABX_POSV[@]}" -gt "$n" ] || return 0
+    printf '%s' "${ABX_POSV[$n]}"
+}
+
+# At least $1 operands and at most $2, or a usage message. Both halves matter:
+# a missing operand must not reach `abs_repo` as an empty string and come back
+# as bash's own "parameter null or not set", and a stray one must be refused
+# rather than ignored, because a mistyped flag lands in the operand list.
+check_operands() {
+    local min="${1:?}" max="${2:?}" what="${3:?}"
+    [ "${#ABX_POSV[@]}" -ge "$min" ] || die "usage: ${PROG} ${what}"
+    [ "${#ABX_POSV[@]}" -le "$max" ] \
+        || die "unexpected argument: ${ABX_POSV[$max]} (usage: ${PROG} ${what})"
+}
+
+# ---------------------------------------------------------------------------
+# Everything the guest says, validated before the host uses it
+# ---------------------------------------------------------------------------
+#
+# The agent runs as the guest user with --dangerously-skip-permissions and a
+# Bash tool, so every file this CLI reads out of the guest is a file the agent
+# can write. Bytes from in there are input, not data: they are matched against
+# a shape before they reach a shell, an arithmetic context, or a program text.
+
+# `running`, `exit:stopped`, or `exit:` and digits. Nothing else.
+valid_run_state() {
+    case "${1:-}" in
+        running|exit:stopped) return 0 ;;
+        exit:*)
+            case "${1#exit:}" in
+                ''|*[!0-9]*) return 1 ;;
+                *) return 0 ;;
+            esac ;;
+        *) return 1 ;;
+    esac
+}
+
+# %Y%m%d-%H%M%S. Checked on the host as well as in the guest, because the host
+# builds a tmux session name and a pid-file path out of it.
+valid_runid() {
+    case "${1:-}" in
+        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# A tmux session name, a model name: letters, digits and the three punctuation
+# characters either of them legitimately uses.
+valid_plain_name() {
+    case "${1:-}" in
+        ""|*[!A-Za-z0-9._-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# Read a run's state out of the guest and return something the host may act on.
+# An unrecognised answer becomes `unknown` and is reported — never echoed, since
+# echoing it is most of what makes it dangerous.
+read_run_state() {
+    local inst="${1:?}" runid="${2:?}" state
+    state=$(guest_shell "$inst" "${GUEST_BIN}/run-ctl.sh" state "$runid" 2>/dev/null | tr -d '\r\n')
+    if valid_run_state "$state"; then
+        printf '%s' "$state"
+        return 0
+    fi
+    [ -z "$state" ] || printf '%s: WARNING: %s reported a run state that is not a run state; treating it as unknown\n' \
+        "$PROG" "$inst" >&2
+    printf 'unknown'
+}
+
+# `notify: true` in the host config file, or nothing.
+config_notify_default() {
+    [ -f "$HOST_CONFIG_FILE" ] || return 1
+    grep -qiE '^[[:space:]]*notify[[:space:]]*:[[:space:]]*(true|yes|1)[[:space:]]*$' "$HOST_CONFIG_FILE"
+}
+
+instance_state() {
+    local inst="${1:?}" state
+    state=$("$LIMACTL" list --format '{{.Status}}' "$inst" 2>/dev/null | head -1)
+    printf '%s' "${state:-Unknown}"
+}
+
+require_running() {
+    local inst="${1:?}" state
+    state=$(instance_state "$inst")
+    [ "$state" = "Running" ] || die "instance '${inst}' is ${state}. Run '${PROG} start <repo>' first."
 }
 
 slugify() {
@@ -179,13 +381,18 @@ sync_guest_config() {
 # ---------------------------------------------------------------------------
 
 cmd_preflight() {
-    local repo; repo=$(abs_repo "${1:?usage: ${PROG} preflight <repo>}")
+    local repo
+    split_args "" "$@"
+    check_operands 1 1 "preflight <repo>"
+    repo=$(abs_repo "${ABX_POSV[0]}")
     "${BOX_DIR}/host/preflight.sh" "$repo"
 }
 
 cmd_create() {
     local repo inst
-    repo=$(abs_repo "${1:?usage: ${PROG} create <repo>}")
+    split_args "" "$@"
+    check_operands 1 1 "create <repo>"
+    repo=$(abs_repo "${ABX_POSV[0]}")
     inst=$(instance_name "$repo")
     require_limactl
 
@@ -220,7 +427,9 @@ EOF
 
 cmd_start() {
     local repo inst
-    repo=$(abs_repo "${1:?usage: ${PROG} start <repo>}")
+    split_args "" "$@"
+    check_operands 1 1 "start <repo>"
+    repo=$(abs_repo "${ABX_POSV[0]}")
     inst=$(instance_name "$repo")
     require_limactl
     require_instance "$inst"
@@ -229,11 +438,16 @@ cmd_start() {
     ensure_host_config_dir
     "$LIMACTL" start --yes "$inst"
     sync_guest_config "$inst"
+    # A run that was going when the VM stopped never ran its EXIT trap, so its
+    # status still says `running`. This is the first moment anything can tell.
+    guest_shell "$inst" "${GUEST_BIN}/run-ctl.sh" reconcile 2>/dev/null || true
 }
 
 cmd_token() {
     local repo inst
-    repo=$(abs_repo "${1:?usage: ${PROG} token <repo>}")
+    split_args "" "$@"
+    check_operands 1 1 "token <repo>"
+    repo=$(abs_repo "${ABX_POSV[0]}")
     inst=$(instance_name "$repo")
     require_limactl
     require_instance "$inst"
@@ -302,16 +516,18 @@ offer_plugins_after_token() {
 }
 
 cmd_verify_auth() {
-    local repo inst model
-    repo=$(abs_repo "${1:?usage: ${PROG} verify-auth <repo> [--model haiku]}")
-    shift
-    model="haiku"
+    local repo inst model="haiku"
+    split_args "--model" "$@"
+    check_operands 1 1 "verify-auth <repo> [--model haiku]"
+    set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
     while [ $# -gt 0 ]; do
         case "$1" in
-            --model) model="${2:?--model needs a value}"; shift 2 ;;
+            --model) model="$2"; shift 2 ;;
             *) die "unknown option: $1" ;;
         esac
     done
+    valid_plain_name "$model" || die "not a model name: ${model}"
+    repo=$(abs_repo "${ABX_POSV[0]}")
     inst=$(instance_name "$repo")
     require_limactl
     require_instance "$inst"
@@ -325,14 +541,20 @@ cmd_verify_auth() {
     guest_shell "$inst" /opt/agent-box/guest/verify-auth.sh "$model"
 }
 
+# In tmux, like everything else that holds a terminal. A shell opened to watch
+# a build is a shell someone wants to be able to detach from and come back to,
+# and `agentbox sessions` can then say it is there.
 cmd_shell() {
     local repo inst
-    repo=$(abs_repo "${1:?usage: ${PROG} shell <repo>}")
+    split_args "" "$@"
+    check_operands 1 1 "shell <repo>"
+    repo=$(abs_repo "${ABX_POSV[0]}")
     inst=$(instance_name "$repo")
     require_limactl
     require_instance "$inst"
     sync_guest_config "$inst"
-    exec "$LIMACTL" shell --workdir /work "$inst"
+    exec "$LIMACTL" shell --workdir /work "$inst" -- \
+        tmux new-session -A -s shell -- bash -l
 }
 
 # The interactive half of the box. `run` is the headless half: it branches,
@@ -340,9 +562,14 @@ cmd_shell() {
 # token fragments. This one hands the terminal to the CLI, so none of that
 # applies — what appears on screen is whatever the session prints. That is the
 # trade being made deliberately; docs/decisions.md states it.
+# The other bespoke parser, and for the opposite reason: everything after the
+# repository is the CLI's, verbatim, dashes and all. So `--` is honoured only
+# where it can mean "the operand starts here" — immediately before the
+# repository — and never touches the pass-through.
 cmd_claude() {
     local repo inst
-    repo=$(abs_repo "${1:?usage: ${PROG} claude <repo> [claude args...]}")
+    [ "${1:-}" = "--" ] && shift
+    repo=$(abs_repo "${1:?usage: ${PROG} claude [--] <repo> [claude args...]}")
     shift
     inst=$(instance_name "$repo")
     require_limactl
@@ -354,14 +581,16 @@ cmd_claude() {
 
 cmd_plugins() {
     local repo inst update=""
-    repo=$(abs_repo "${1:?usage: ${PROG} plugins <repo> [--update]}")
-    shift
+    split_args "" "$@"
+    check_operands 1 1 "plugins <repo> [--update]"
+    set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
     while [ $# -gt 0 ]; do
         case "$1" in
             --update) update="--update"; shift ;;
             *) die "unknown option: $1" ;;
         esac
     done
+    repo=$(abs_repo "${ABX_POSV[0]}")
     inst=$(instance_name "$repo")
     require_limactl
     require_instance "$inst"
@@ -381,7 +610,9 @@ cmd_plugins() {
 
 cmd_update() {
     local repo inst before after
-    repo=$(abs_repo "${1:?usage: ${PROG} update <repo>}")
+    split_args "" "$@"
+    check_operands 1 1 "update <repo>"
+    repo=$(abs_repo "${ABX_POSV[0]}")
     inst=$(instance_name "$repo")
     require_limactl
     require_instance "$inst"
@@ -392,48 +623,324 @@ cmd_update() {
     info "before: ${before}"
     "$LIMACTL" shell --workdir /work "$inst" -- bash -lc 'claude update'
     after=$("$LIMACTL" shell --workdir /work "$inst" -- bash -lc 'claude --version' 2>&1 || true)
+    # `agentbox status` reads the version from a cache file rather than
+    # spawning the CLI on every refresh. This is the one command that can make
+    # that cache wrong.
+    # shellcheck disable=SC2016  # $HOME must expand in the guest.
+    guest_shell "$inst" sh -c 'rm -f "$HOME/.agent-box/claude-version"' 2>/dev/null || true
     info "after:  ${after}"
     if [ "$before" = "$after" ]; then
         info "no version change"
     fi
 }
 
+# The headless half. Detached by default: an unattended task should not be tied
+# to the terminal that started it, and a dropped SSH connection or a closed lid
+# is not a reason for a run to die. --wait is the old behaviour, kept because
+# the smoke test and any script wrapping this one need an exit status.
 cmd_run() {
-    local repo brief model inst slug
-    repo=$(abs_repo "${1:?usage: ${PROG} run <repo> <brief.md> [--model sonnet]}")
-    brief="${2:?usage: ${PROG} run <repo> <brief.md> [--model sonnet]}"
-    shift 2
-    model="sonnet"
+    local repo brief inst slug runid model="sonnet"
+    local max_turns="" max_budget="" wait_for_it=0 notify=0
+    split_args "--model --max-turns --max-budget-usd" "$@"
+    check_operands 2 2 "run <repo> <brief.md> [options]"
+    set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
     while [ $# -gt 0 ]; do
         case "$1" in
-            --model) model="${2:?--model needs a value}"; shift 2 ;;
+            --model)          model="$2"; shift 2 ;;
+            --max-turns)      max_turns="$2"; shift 2 ;;
+            --max-budget-usd) max_budget="$2"; shift 2 ;;
+            --wait)           wait_for_it=1; shift ;;
+            --notify)         notify=1; shift ;;
             *) die "unknown option: $1" ;;
         esac
     done
+    valid_plain_name "$model" || die "not a model name: ${model}"
+    [ -z "$max_turns" ]  || case "$max_turns"  in ''|*[!0-9]*) die "--max-turns takes a whole number" ;; esac
+    [ -z "$max_budget" ] || case "$max_budget" in ''|*[!0-9.]*) die "--max-budget-usd takes a number" ;; esac
+    repo=$(abs_repo "${ABX_POSV[0]}")
+    brief="${ABX_POSV[1]}"
 
-    [ -f "$brief" ] || die "brief not found: ${brief}"
+    # Resolved against the caller's working directory, before anything else
+    # changes what that means.
+    brief=$(abs_file "$brief")
     inst=$(instance_name "$repo")
     require_limactl
     require_instance "$inst"
+    require_running "$inst"
+
+    if [ "$notify" -eq 0 ] && config_notify_default; then
+        notify=1
+    fi
 
     slug=$(basename "$brief"); slug="${slug%.*}"
+    runid=$(new_runid)
 
     sync_guest_config "$inst"
-    info "running ${slug} in ${inst} on model ${model}"
-    # The brief goes in on stdin, so it needs no path the guest can see.
-    "$LIMACTL" shell --workdir /work "$inst" -- \
-        /opt/agent-box/guest/agent-run.sh --slug "$slug" --model "$model" --brief - < "$brief"
+
+    # The brief goes in on stdin and lands in the guest home at mode 600. It is
+    # named after the run rather than being a temporary file, so that a run
+    # that failed can still be asked what it was told to do.
+    # shellcheck disable=SC2016  # $HOME and $1 must expand in the guest.
+    if ! "$LIMACTL" shell --workdir /work "$inst" -- \
+        sh -c 'umask 077; mkdir -p "$HOME/.agent-box/briefs"; cat > "$HOME/.agent-box/briefs/$1"' \
+        sh "${runid}.md" < "$brief"
+    then
+        die "could not copy the brief into ${inst}"
+    fi
+
+    local start_args=(start --runid "$runid" --slug "$slug" --model "$model"
+                      --brief "${runid}.md")
+    [ -n "$max_turns" ]  && start_args+=(--max-turns "$max_turns")
+    [ -n "$max_budget" ] && start_args+=(--max-budget-usd "$max_budget")
+
+    guest_shell "$inst" "${GUEST_BIN}/run-ctl.sh" "${start_args[@]}" >/dev/null \
+        || die "could not start the run in ${inst}"
+
+    info "run ${runid} started in ${inst} on model ${model}"
+
+    if [ "$notify" -eq 1 ]; then
+        start_run_watcher "$inst" "$runid" "$repo"
+    fi
+
+    if [ "$wait_for_it" -eq 0 ]; then
+        cat <<EOF
+
+Follow it with:
+  ${PROG} logs ${repo} -f
+  ${PROG} runs ${repo}
+  ${PROG} stop-run ${repo} ${runid}
+EOF
+        return 0
+    fi
+
+    wait_for_run "$inst" "$repo" "$runid"
+}
+
+# --wait: stream the run and exit with its status. Everything printed here is
+# printed by the guest, which is where the scrub is.
+wait_for_run() {
+    local inst="$1" repo="$2" runid="$3" state code
+
+    guest_shell "$inst" python3 -u "${GUEST_BIN}/run-format.py" "$runid" --follow || true
+
+    state=$(read_run_state "$inst" "$runid")
+    case "$state" in
+        exit:stopped)
+            # The run wrote a summary on its way out, including the note saying
+            # it was interrupted and that nothing was reverted. A caller that
+            # blocked on --wait wants to see it, and wants a status that is not
+            # success: 130 is what an interrupted process returns.
+            info "run ${runid} was stopped"
+            printf -- '--- summary ---\n'
+            guest_shell "$inst" python3 "${GUEST_BIN}/run-format.py" --summary "$runid" || true
+            return 130 ;;
+        exit:lost)
+            info "run ${runid} is lost: it stopped without recording an exit"
+            return 1 ;;
+        exit:*)
+            code="${state#exit:}"
+            # The summary is read and scrubbed inside the guest, not catted off
+            # the host mount: it is written by the guest, and on exit 3 it is
+            # one of the very streams the leak check named. run-format.py
+            # refuses it in that case and says why.
+            printf -- '--- summary ---\n'
+            guest_shell "$inst" python3 "${GUEST_BIN}/run-format.py" --summary "$runid" || true
+            # A case pattern, not `-eq`. Bash's test builtin runs both operands
+            # of -eq through its arithmetic evaluator, and an array subscript
+            # inside that string is word-expanded — so `x[$(cmd)]` from a guest
+            # -written status file would run cmd here. The state is validated
+            # before it gets this far; this is the second defence.
+            case "$code" in
+                0) return 0 ;;
+                [1-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5]) return "$code" ;;
+                *) return 1 ;;
+            esac ;;
+        *) info "run ${runid} is ${state}"; return 0 ;;
+    esac
+}
+
+cmd_runs() {
+    local repo inst args=()
+    split_args "" "$@"
+    check_operands 1 1 "runs <repo> [--json]"
+    set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) args+=(--json); shift ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    repo=$(abs_repo "${ABX_POSV[0]}")
+    inst=$(instance_name "$repo")
+    require_limactl
+    require_instance "$inst"
+    require_running "$inst"
+    # Through run-ctl, which reconciles orphaned runs before listing them: a
+    # run whose process died without its trap would otherwise be listed as
+    # running for ever.
+    guest_shell "$inst" "${GUEST_BIN}/run-ctl.sh" runs ${args[@]+"${args[@]}"}
+}
+
+cmd_logs() {
+    local repo inst runid="" args=()
+    split_args "" "$@"
+    check_operands 1 2 "logs <repo> [runid] [-f] [--json] [--force-unsafe]"
+    set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f|--follow)    args+=(--follow); shift ;;
+            --json)         args+=(--json); shift ;;
+            --force-unsafe) args+=(--force-unsafe); shift ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    repo=$(abs_repo "${ABX_POSV[0]}")
+    runid=$(operand 1)
+    [ -z "$runid" ] || valid_runid "$runid" || die "not a run id: ${runid} (expected YYYYMMDD-HHMMSS)"
+    inst=$(instance_name "$repo")
+    require_limactl
+    require_instance "$inst"
+    require_running "$inst"
+    if [ -n "$runid" ]; then
+        guest_shell "$inst" python3 -u "${GUEST_BIN}/run-format.py" "$runid" ${args[@]+"${args[@]}"}
+    else
+        guest_shell "$inst" python3 -u "${GUEST_BIN}/run-format.py" ${args[@]+"${args[@]}"}
+    fi
+}
+
+cmd_stop_run() {
+    local repo inst runid=""
+    split_args "" "$@"
+    check_operands 1 2 "stop-run <repo> [runid]"
+    [ "${#ABX_OPTV[@]}" -eq 0 ] || die "unknown option: ${ABX_OPTV[0]}"
+    repo=$(abs_repo "${ABX_POSV[0]}")
+    runid=$(operand 1)
+    [ -z "$runid" ] || valid_runid "$runid" || die "not a run id: ${runid} (expected YYYYMMDD-HHMMSS)"
+    inst=$(instance_name "$repo")
+    require_limactl
+    require_instance "$inst"
+    require_running "$inst"
+    if [ -n "$runid" ]; then
+        guest_shell "$inst" "${GUEST_BIN}/run-ctl.sh" stop "$runid"
+    else
+        guest_shell "$inst" "${GUEST_BIN}/run-ctl.sh" stop
+    fi
+}
+
+cmd_sessions() {
+    local repo inst args=()
+    split_args "" "$@"
+    check_operands 1 1 "sessions <repo> [--json]"
+    set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) args+=(--json); shift ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    repo=$(abs_repo "${ABX_POSV[0]}")
+    inst=$(instance_name "$repo")
+    require_limactl
+    require_instance "$inst"
+    require_running "$inst"
+    guest_shell "$inst" "${GUEST_BIN}/run-ctl.sh" sessions ${args[@]+"${args[@]}"}
+}
+
+# The interactive half, in tmux: leave it with the tmux detach key and come
+# back with `agentbox attach`. Everything `agentbox claude` refuses to do about
+# scrubbing still applies, which is why it is said out loud here rather than
+# only in the documentation.
+cmd_session() {
+    local repo inst brief="" model="" name="claude" stamp
+    split_args "--model" "$@"
+    check_operands 1 2 "session <repo> [brief.md] [--model M]"
+    set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --model) model="$2"; shift 2 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    [ -z "$model" ] || valid_plain_name "$model" || die "not a model name: ${model}"
+    repo=$(abs_repo "${ABX_POSV[0]}")
+    [ "${#ABX_POSV[@]}" -lt 2 ] || brief=$(abs_file "${ABX_POSV[1]}")
+    inst=$(instance_name "$repo")
+    require_limactl
+    require_instance "$inst"
+    require_running "$inst"
+    sync_guest_config "$inst"
+
+    local session_args=(--tmux "$name")
+    if [ -n "$brief" ]; then
+        stamp="session-$(new_runid).md"
+        # shellcheck disable=SC2016  # $HOME and $1 must expand in the guest.
+        "$LIMACTL" shell --workdir /work "$inst" -- \
+            sh -c 'umask 077; mkdir -p "$HOME/.agent-box/briefs"; cat > "$HOME/.agent-box/briefs/$1"' \
+            sh "$stamp" < "$brief" || die "could not copy the brief into ${inst}"
+        session_args+=(--brief "$stamp")
+    fi
+    [ -n "$model" ] && session_args+=(--model "$model")
+
+    cat <<EOF
+${PROG}: interactive output is NOT scrubbed — what the model prints goes
+${PROG}: straight to this terminal. Detach with the tmux prefix then d
+${PROG}: (Ctrl-b d by default); come back with '${PROG} attach ${repo}'.
+EOF
+
+    exec "$LIMACTL" shell --workdir /work "$inst" -- \
+        "${GUEST_BIN}/claude-session.sh" "${session_args[@]}"
+}
+
+# Read-only for a run: a run's pane is agent-run.sh's own output, and typing
+# into it would go to the agent's stdin. Steering a run is `stop-run`.
+cmd_attach() {
+    local repo inst target flags=()
+    split_args "" "$@"
+    check_operands 1 2 "attach <repo> [session|runid] [-r]"
+    set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -r|--read-only) flags=(-r); shift ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    repo=$(abs_repo "${ABX_POSV[0]}")
+    target=$(operand 1)
+    [ -n "$target" ] || target="claude"
+    valid_plain_name "$target" \
+        || die "not a session name: ${target} (letters, digits, dot, dash and underscore)"
+    inst=$(instance_name "$repo")
+    require_limactl
+    require_instance "$inst"
+    require_running "$inst"
+
+    # A bare run id is the session name without its prefix. A run is always
+    # read-only whether or not -r was asked for.
+    case "$target" in
+        run-*) flags=(-r) ;;
+        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9])
+            target="run-${target}"; flags=(-r) ;;
+    esac
+
+    exec "$LIMACTL" shell --workdir /work "$inst" -- \
+        tmux attach ${flags[@]+"${flags[@]}"} -t "=${target}"
 }
 
 cmd_stop() {
-    local inst; inst=$(instance_name "${1:?usage: ${PROG} stop <repo|name>}")
+    local inst
+    split_args "" "$@"
+    check_operands 1 1 "stop <repo|name>"
+    inst=$(instance_name "${ABX_POSV[0]}")
     require_limactl
     require_instance "$inst"
     "$LIMACTL" stop "$inst"
 }
 
 cmd_destroy() {
-    local inst; inst=$(instance_name "${1:?usage: ${PROG} destroy <repo|name>}")
+    local inst
+    split_args "" "$@"
+    check_operands 1 1 "destroy <repo|name>"
+    inst=$(instance_name "${ABX_POSV[0]}")
     require_limactl
     require_instance "$inst"
     "$LIMACTL" stop --force "$inst" >/dev/null 2>&1 || true
@@ -448,13 +955,208 @@ it now: claude.ai -> Settings -> Claude Code -> revoke the token.
 EOF
 }
 
+# ---------------------------------------------------------------------------
+# Status
+# ---------------------------------------------------------------------------
+#
+# ONE `limactl shell` per RUNNING box per refresh, and nothing at all for a
+# stopped one. `--watch` redraws on a timer, and a display that costs three
+# round trips per box per second is a display nobody leaves running. Everything
+# inside the box's own line is assembled by guest/box-status.sh, which is where
+# the scrub happens: the host formats what it is given and parses none of it.
+
+# The agent-box instances, one per line: name|status|repo. Mount 0 is /work by
+# construction — lima/agent-box.yaml declares it first — so the repository a
+# box is pointed at is read back from Lima rather than guessed from the name.
+list_boxes() {
+    local only="${1:-}" names
+    names=$("$LIMACTL" list --quiet 2>/dev/null | grep '^agent-box-' || true)
+    if [ -n "$only" ]; then
+        names=$(printf '%s\n' "$names" | grep -xF "$only" || true)
+    fi
+    [ -n "$names" ] || return 0
+    # shellcheck disable=SC2086  # one instance name per word is the point.
+    "$LIMACTL" list $names \
+        --format '{{.Name}}|{{.Status}}|{{(index .Config.Mounts 0).Location}}' 2>/dev/null
+}
+
+# The one bespoke parser: `--watch` takes an OPTIONAL count, so its value
+# cannot be declared to split_args without swallowing the box name in
+# `status --watch <repo>`.
 cmd_status() {
+    local as_json=0 watch_secs="" only="" literal=0
+    while [ $# -gt 0 ]; do
+        if [ "$literal" -eq 1 ]; then
+            [ -z "$only" ] || die "only one box"
+            only=$(instance_name "$1"); shift; continue
+        fi
+        case "$1" in
+            --) literal=1; shift ;;
+            --json) as_json=1; shift ;;
+            --watch)
+                shift
+                if [ $# -gt 0 ] && printf '%s' "$1" | grep -qE '^[0-9]+$'; then
+                    watch_secs="$1"; shift
+                else
+                    watch_secs=3
+                fi ;;
+            -*) die "unknown option: $1" ;;
+            # An optional repository or instance name narrows the display to
+            # one box. Every box is the default, but a machine with several is
+            # also a machine where you often mean one of them — and a status
+            # command that reaches into every VM you own is the wrong default
+            # when one of them is doing something you would rather not disturb.
+            *)  [ -z "$only" ] || die "only one box"; only=$(instance_name "$1"); shift ;;
+        esac
+    done
     require_limactl
-    "$LIMACTL" list
+
+    if [ -z "$watch_secs" ]; then
+        render_status "$as_json" "$only"
+        return 0
+    fi
+
+    # A one-shot across every box is cheap and occasionally what you want. A
+    # LOOP across every box is a python process and a tmux client inside each
+    # of your VMs every few seconds, aimed at boxes you did not name — one of
+    # which may be running something you would rather not slow down.
+    [ -n "$only" ] || die "--watch needs a box: ${PROG} status <repo|name> --watch [SECS]"
+
+    # The sleep runs in the BACKGROUND and is waited on, so the interrupt is
+    # acted on the moment it arrives. A foreground `sleep 30` defers the trap
+    # until it returns, and bash only appears to be prompt about it because a
+    # terminal's Ctrl-C reaches the whole foreground group and kills the sleep
+    # too. Anything that signals the process alone — a supervisor, a test,
+    # `kill -INT <pid>` — would otherwise wait out the full interval.
+    WATCH_SLEEP_PID=""
+    # shellcheck disable=SC2064  # the pid must be read when the trap fires.
+    trap 'printf "\n"; [ -z "${WATCH_SLEEP_PID}" ] || kill "${WATCH_SLEEP_PID}" 2>/dev/null; exit 130' INT
+    while :; do
+        printf '\033[H\033[2J'
+        printf 'agentbox status — every %ss — Ctrl-C to stop\n\n' "$watch_secs"
+        render_status "$as_json" "$only"
+        sleep "$watch_secs" &
+        WATCH_SLEEP_PID=$!
+        wait "$WATCH_SLEEP_PID" 2>/dev/null || true
+        WATCH_SLEEP_PID=""
+    done
+}
+
+render_status() {
+    local as_json="$1" only="${2:-}" name state repo guest first=1
+
+    if [ "$as_json" -eq 1 ]; then
+        printf '{"generated_at":%s,"boxes":[' "$(json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+    else
+        printf '%-30s %-9s %s\n' 'BOX' 'STATE' 'RUN / SESSIONS / FIREWALL'
+    fi
+
+    while IFS='|' read -r name state repo; do
+        [ -n "$name" ] || continue
+        guest=""
+        if [ "$state" = "Running" ]; then
+            if [ "$as_json" -eq 1 ]; then
+                guest=$(guest_shell "$name" "${GUEST_BIN}/box-status.sh" 2>/dev/null) || guest=""
+            else
+                guest=$(guest_shell "$name" "${GUEST_BIN}/box-status.sh" --text 2>/dev/null) || guest=""
+            fi
+        fi
+
+        if [ "$as_json" -eq 1 ]; then
+            [ "$first" -eq 1 ] || printf ','
+            first=0
+            case "$guest" in
+                \{*) ;;
+                # Not running, or the guest could not answer. Say so with the
+                # same keys rather than omitting them: a consumer that has to
+                # branch on missing keys is a consumer that will get it wrong.
+                *) guest='{"claude_version":null,"firewall":"unknown","run":null,"runs_total":0,"sessions":[]}' ;;
+            esac
+            printf '{"name":%s,"instance":%s,"repo":%s,"state":%s,%s' \
+                "$(json_str "${name#agent-box-}")" \
+                "$(json_str "$name")" \
+                "$(json_str "$repo")" \
+                "$(json_str "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')")" \
+                "${guest#\{}"
+        else
+            [ -n "$guest" ] || guest='(not running)'
+            printf '%-30s %-9s %s\n' \
+                "$name" "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')" "$guest"
+        fi
+    done <<EOF
+$(list_boxes "$only")
+EOF
+
+    if [ "$as_json" -eq 1 ]; then
+        printf ']}\n'
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# The notification watcher
+# ---------------------------------------------------------------------------
+#
+# A host-side background process, because the guest has no way to reach the
+# desktop and should not have one. It polls the run's status file every ten
+# seconds over `limactl shell` and says one thing, once, when the run ends.
+
+start_run_watcher() {
+    local inst="$1" runid="$2" repo="$3" pidfile old
+    mkdir -p "$WATCHER_DIR"
+    pidfile="${WATCHER_DIR}/${inst}-${runid}.pid"
+
+    if [ -f "$pidfile" ]; then
+        old=$(cat "$pidfile" 2>/dev/null || true)
+        if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+            info "a watcher for ${runid} is already running"
+            return 0
+        fi
+    fi
+
+    nohup "$SELF" watch-run "$inst" "$runid" "$repo" >/dev/null 2>&1 &
+    printf '%s\n' "$!" > "$pidfile"
+    disown 2>/dev/null || true
+    info "will notify when ${runid} ends"
+}
+
+# Not in the usage text: `run --notify` starts it, nothing else should.
+cmd_watch_run() {
+    local inst="${1:?}" runid="${2:?}" repo="${3:?}" state waited=0
+    valid_runid "$runid" || die "not a run id: ${runid}"
+    local pidfile="${WATCHER_DIR}/${inst}-${runid}.pid"
+    # A day is far longer than any run this box is meant for, and a watcher
+    # that never gives up is a process still polling a deleted VM next week.
+    while [ "$waited" -lt 86400 ]; do
+        state=$(read_run_state "$inst" "$runid")
+        case "$state" in
+            running) ;;
+            *) break ;;
+        esac
+        sleep 10
+        waited=$((waited + 10))
+    done
+    rm -f "$pidfile"
+    command -v osascript >/dev/null 2>&1 || return 0
+
+    # `on run argv`, and the text as an ARGUMENT after --. Interpolating it into
+    # the program text would let a byte the guest wrote close the AppleScript
+    # string literal and continue as AppleScript, where `do shell script` runs
+    # a command on this host, as this user, outside the VM. Every guarantee the
+    # VM makes is downstream of that never happening. The state is validated
+    # above as well, so this is the second of two defences and not the first.
+    osascript \
+        -e 'on run argv' \
+        -e 'display notification (item 1 of argv) with title "agent-box"' \
+        -e 'end run' \
+        -- "$(basename "$repo") ${runid}: ${state}" \
+        >/dev/null 2>&1 || true
 }
 
 cmd_firewall_check() {
-    local inst; inst=$(instance_name "${1:?usage: ${PROG} firewall-check <repo|name>}")
+    local inst
+    split_args "" "$@"
+    check_operands 1 1 "firewall-check <repo|name>"
+    inst=$(instance_name "${ABX_POSV[0]}")
     require_limactl
     require_instance "$inst"
     # Under sudo: the verification reads the live ruleset with `iptables -S`,
@@ -471,8 +1173,15 @@ case "${1:-}" in
     token)          shift; cmd_token "$@" ;;
     verify-auth)    shift; cmd_verify_auth "$@" ;;
     claude)         shift; cmd_claude "$@" ;;
+    session)        shift; cmd_session "$@" ;;
     shell)          shift; cmd_shell "$@" ;;
+    attach)         shift; cmd_attach "$@" ;;
+    sessions)       shift; cmd_sessions "$@" ;;
     run)            shift; cmd_run "$@" ;;
+    runs)           shift; cmd_runs "$@" ;;
+    logs)           shift; cmd_logs "$@" ;;
+    stop-run)       shift; cmd_stop_run "$@" ;;
+    watch-run)      shift; cmd_watch_run "$@" ;;
     plugins)        shift; cmd_plugins "$@" ;;
     update)         shift; cmd_update "$@" ;;
     stop)           shift; cmd_stop "$@" ;;
