@@ -65,6 +65,12 @@ trap cleanup EXIT
 # working directory inside the guest, which warns on stderr every time.
 guest() { "$LIMACTL" shell --workdir /work "$INSTANCE" -- "$@"; }
 
+# A run's own summary, read and scrubbed inside the guest.
+guest_summary() {
+    "$LIMACTL" shell --workdir /work "$INSTANCE" -- \
+        python3 /opt/agent-box/guest/run-format.py --summary "$1"
+}
+
 # Run a command with a wall-clock bound and capture its exit status. macOS has
 # no `timeout(1)`, and one step below makes a real model call that must not be
 # able to wedge the suite.
@@ -1840,6 +1846,253 @@ guest sh -c 'rm -rf /work/.claude /tmp/repo-hook-ran'
 
 # Clean up everything this step planted in the guest.
 guest sh -c "rm -rf \$HOME/.agent-box/runs/${HOSTILE_RUNID} \$HOME/.agent-box/runs/${LEAKY_RUNID}" || true
+
+# ===========================================================================
+step "8j. an interrupted run is recorded as stopped, not as done (issue #14)"
+# ===========================================================================
+#
+# Claude Code exits 0 when it is interrupted and says so only in its result
+# event, so a run that was stopped used to be recorded as `done` with exit 0.
+# A stand-in CLI reproduces that shape exactly, without a model call and
+# without the real credential path: it never reads a token and never prints
+# one.
+#
+# The stand-in has to sit where the real one does. guest/lib.sh puts
+# "$HOME/.local/bin" at the FRONT of PATH, so prepending a directory of our own
+# would lose to the real binary; the real one is moved aside for the duration
+# of this step and put back at the end, which is asserted.
+
+guest bash -l > "${TMP_ROOT}/standin-install.out" 2>&1 <<'SH'
+set -u
+# (a) interrupted: prints an init line, then on SIGINT the shape issue #14 is
+# about — error_during_execution, is_error true, exit status 0.
+cat > /tmp/abx-claude-stop <<'INNER'
+#!/bin/bash
+case "${1:-}" in
+    --version) printf '2.1.261-standin (Claude Code)\n'; exit 0 ;;
+    --help)    printf -- '--include-hook-events --max-budget-usd --settings --verbose\n'; exit 0 ;;
+esac
+on_int() {
+    printf '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":3,"duration_ms":900,"total_cost_usd":0}\n'
+    exit 0
+}
+trap on_int INT
+printf '{"type":"system","subtype":"init","model":"stand-in","claude_code_version":"stand-in"}\n'
+sleep 120 &
+wait $!
+printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":1000,"total_cost_usd":0}\n'
+exit 0
+INNER
+# (b) failed without any signal: the CLI's own verdict says error, and it still
+# exits 0.
+cat > /tmp/abx-claude-fail <<'INNER'
+#!/bin/bash
+case "${1:-}" in
+    --version) printf '2.1.261-standin (Claude Code)\n'; exit 0 ;;
+    --help)    printf -- '--include-hook-events --max-budget-usd --settings --verbose\n'; exit 0 ;;
+esac
+printf '{"type":"system","subtype":"init","model":"stand-in","claude_code_version":"stand-in"}\n'
+printf '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":2,"duration_ms":500,"total_cost_usd":0}\n'
+exit 0
+INNER
+chmod +x /tmp/abx-claude-stop /tmp/abx-claude-fail
+mv "$HOME/.local/bin/claude" "$HOME/.local/bin/claude.real"
+cp /tmp/abx-claude-stop "$HOME/.local/bin/claude"
+chmod +x "$HOME/.local/bin/claude"
+claude --version
+SH
+cat "${TMP_ROOT}/standin-install.out"
+if grep -q 'standin' "${TMP_ROOT}/standin-install.out"; then
+    ok "the stand-in CLI is in place"
+else
+    bad "the stand-in CLI could not be installed; the rest of this step is meaningless"
+fi
+
+# A token, because agent-run refuses without one. It is never read by the
+# stand-in and never printed by it.
+guest sh -c "umask 077; printf '%s' '${FAKE_TOKEN}' > \$HOME/.config/agent-box/token; chmod 600 \$HOME/.config/agent-box/token"
+
+printf -- '\n--- (a) a detached run, stopped while it is going ---\n'
+STOPPED_OUT="${TMP_ROOT}/issue14-run.out"
+run_bounded 90 "$STOPPED_OUT" "$AGENTBOX" run "$CLEAN_REPO" "${TMP_ROOT}/noop-brief.md"
+cat "$STOPPED_OUT"
+S14_RUNID=$(sed -n 's/^agentbox: run \([0-9-]*\) started.*/\1/p' "$STOPPED_OUT" | head -1)
+printf 'runid: %s\n' "${S14_RUNID:-<none>}"
+if [ -z "$S14_RUNID" ]; then
+    bad "the run did not start; skipping the rest of 8j"
+    S14_RUNID=""
+fi
+
+if [ -n "$S14_RUNID" ]; then
+    # Wait until the stand-in is genuinely running, so the stop lands on it
+    # rather than on the preconditions.
+    S14_READY=0
+    for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        if guest sh -c "grep -q '\"subtype\":\"init\"' \$HOME/.agent-box/runs/${S14_RUNID}/events.jsonl 2>/dev/null"; then
+            S14_READY=1; break
+        fi
+        sleep 2
+    done
+    if [ "$S14_READY" -eq 1 ]; then ok "the stand-in run reached the CLI"; else bad "the stand-in run never reached the CLI"; fi
+
+    S14_STOP="${TMP_ROOT}/issue14-stop.out"
+    S14_T0=$(date +%s)
+    run_bounded 90 "$S14_STOP" "$AGENTBOX" stop-run "$CLEAN_REPO" "$S14_RUNID"
+    S14_ELAPSED=$(( $(date +%s) - S14_T0 ))
+    cat "$S14_STOP"
+    printf 'stop-run took %ss\n' "$S14_ELAPSED"
+    if grep -q "${S14_RUNID} stopped after" "$S14_STOP"; then
+        ok "run-ctl reported the run as stopped"
+    else
+        bad "run-ctl did not report the run as stopped"
+    fi
+    # The two stop paths are worded differently. This one must be the path
+    # where the RUN recorded its own exit, not the one where the session was
+    # closed and the status written from outside.
+    if grep -q 'did not record its own exit' "$S14_STOP"; then
+        bad "the run did not record its own stop; the status was written from outside"
+    else
+        ok "the run recorded its own stop; run-ctl only reported it"
+    fi
+    if [ "$S14_ELAPSED" -lt 20 ]; then
+        ok "the stop completed in ${S14_ELAPSED}s, without falling through to the 20s fallback"
+    else
+        bad "the stop took ${S14_ELAPSED}s; it fell through to closing the session"
+    fi
+    if grep -q 'ended by itself' "$S14_STOP"; then
+        bad "run-ctl still claims the run ended by itself"
+    else
+        ok "run-ctl no longer claims the run ended by itself"
+    fi
+
+    S14_STATE=$(guest /opt/agent-box/guest/run-ctl.sh state "$S14_RUNID" 2>/dev/null | tr -d '\r\n')
+    printf 'status file: %s\n' "$S14_STATE"
+    if [ "$S14_STATE" = "exit:stopped" ]; then
+        ok "the run recorded exit:stopped"
+    else
+        bad "the run recorded '${S14_STATE}', not exit:stopped"
+    fi
+
+    S14_JSON="${TMP_ROOT}/issue14-runs.json"
+    "$AGENTBOX" runs "$CLEAN_REPO" --json > "$S14_JSON" 2>&1
+    cat "$S14_JSON"
+    if jq -e --arg r "$S14_RUNID" 'map(select(.runid == $r and .state == "stopped" and .exit_code == null)) | length == 1' "$S14_JSON" >/dev/null 2>&1; then
+        ok "runs --json reports it stopped with a null exit code"
+    else
+        bad "runs --json does not report it stopped with a null exit code"
+    fi
+
+    S14_BRANCH=$(guest sh -c "jq -r '.branch // empty' \$HOME/.agent-box/runs/${S14_RUNID}/meta.json" 2>/dev/null | tr -d '\r\n')
+    printf 'branch: %s\n' "${S14_BRANCH:-<none>}"
+    if [ -n "$S14_BRANCH" ] && guest sh -c "git -C /work rev-parse --verify --quiet '${S14_BRANCH}' >/dev/null"; then
+        ok "the run's branch still exists; nothing was reverted"
+    else
+        bad "the run's branch is gone after a stop"
+    fi
+
+    # The summary the run wrote, read back through the guest so it is scrubbed.
+    # It must be THIS run's summary and it must say stopped: a run that was
+    # killed before it could write one would otherwise leave the previous
+    # run's summary in place and look fine.
+    S14_SUMMARY="${TMP_ROOT}/issue14-summary.out"
+    run_bounded 60 "$S14_SUMMARY" guest_summary "$S14_RUNID"
+    cat "$S14_SUMMARY"
+    if grep -q "runid     : ${S14_RUNID}" "$S14_SUMMARY" && grep -q 'state     : stopped' "$S14_SUMMARY"; then
+        ok "the run wrote its own summary, naming the state as stopped"
+    else
+        bad "the run did not write a summary saying stopped"
+    fi
+    if grep -q 'Nothing was reverted' "$S14_SUMMARY"; then
+        ok "the summary says nothing was reverted"
+    else
+        bad "the summary does not say nothing was reverted"
+    fi
+fi
+
+printf -- '\n--- (a2) run --wait on a run that gets stopped returns 130 ---\n'
+WAIT_OUT="${TMP_ROOT}/issue14-wait.out"
+set -m
+"$AGENTBOX" run "$CLEAN_REPO" "${TMP_ROOT}/noop-brief.md" --wait > "$WAIT_OUT" 2>&1 &
+WAIT_PID=$!
+set +m
+W14_READY=0
+for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if guest /opt/agent-box/guest/run-ctl.sh state 2>/dev/null | grep -qx 'running'; then
+        W14_READY=1; break
+    fi
+    sleep 2
+done
+sleep 3
+run_bounded 90 "${TMP_ROOT}/issue14-wait-stop.out" "$AGENTBOX" stop-run "$CLEAN_REPO"
+cat "${TMP_ROOT}/issue14-wait-stop.out"
+wait "$WAIT_PID"; wait_rc=$?
+cat "$WAIT_OUT"
+printf 'run --wait exit status: %s (ready flag %s)\n' "$wait_rc" "$W14_READY"
+if [ "$wait_rc" -eq 130 ]; then
+    ok "run --wait returned 130 for a run that was stopped"
+else
+    bad "run --wait returned ${wait_rc}; expected 130 for a stopped run"
+fi
+if grep -q 'summary' "$WAIT_OUT"; then
+    ok "run --wait printed the summary for the stopped run"
+else
+    bad "run --wait printed no summary for the stopped run"
+fi
+
+printf -- '\n--- (b) the CLI exits 0 but says is_error: that is a failed run ---\n'
+# shellcheck disable=SC2016  # $HOME must expand in the guest.
+guest bash -l -c 'cp /tmp/abx-claude-fail "$HOME/.local/bin/claude"; chmod +x "$HOME/.local/bin/claude"'
+FAIL_OUT="${TMP_ROOT}/issue14-fail.out"
+run_bounded 120 "$FAIL_OUT" "$AGENTBOX" run "$CLEAN_REPO" "${TMP_ROOT}/noop-brief.md" --wait
+fail_rc=$BOUNDED_RC
+cat "$FAIL_OUT"
+printf 'run --wait exit status: %s\n' "$fail_rc"
+F14_RUNID=$(sed -n 's/^agentbox: run \([0-9-]*\) started.*/\1/p' "$FAIL_OUT" | head -1)
+F14_STATE=$(guest /opt/agent-box/guest/run-ctl.sh state "$F14_RUNID" 2>/dev/null | tr -d '\r\n')
+printf 'status file: %s\n' "$F14_STATE"
+if [ "$F14_STATE" = "exit:1" ]; then
+    ok "a CLI that exits 0 while reporting is_error is recorded as exit:1"
+else
+    bad "the run recorded '${F14_STATE}', not exit:1"
+fi
+if "$AGENTBOX" runs "$CLEAN_REPO" | grep -qE "${F14_RUNID}.*failed"; then
+    ok "runs shows it as failed"
+else
+    bad "runs does not show it as failed"
+fi
+if [ "$fail_rc" -ne 0 ]; then
+    ok "run --wait returned non-zero for the failed run"
+else
+    bad "run --wait returned 0 for a run the CLI said had failed"
+fi
+if grep -q 'is_error=true; recording this run as failed' "$FAIL_OUT"; then
+    ok "agent-run said why it overrode the exit status"
+else
+    bad "agent-run did not explain the override"
+fi
+
+printf -- '\n--- no token fragment left this step ---\n'
+if grep -qF "$FAKE_HEAD" "$STOPPED_OUT" "$S14_STOP" "$WAIT_OUT" "$FAIL_OUT" 2>/dev/null \
+   || grep -qF "$FAKE_TAIL" "$STOPPED_OUT" "$S14_STOP" "$WAIT_OUT" "$FAIL_OUT" 2>/dev/null; then
+    bad "a token fragment reached the host in step 8j"
+else
+    ok "no token fragment reached the host in step 8j"
+fi
+
+printf -- '\n--- the real CLI is put back ---\n'
+# shellcheck disable=SC2016  # $HOME must expand in the guest.
+guest bash -l -c 'mv -f "$HOME/.local/bin/claude.real" "$HOME/.local/bin/claude"' || true
+guest sh -c 'rm -f /tmp/abx-claude-stop /tmp/abx-claude-fail'
+REAL_VER=$("$LIMACTL" shell --workdir /work "$INSTANCE" -- bash -lc 'claude --version' 2>&1)
+printf '%s\n' "$REAL_VER"
+if printf '%s' "$REAL_VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+' && ! printf '%s' "$REAL_VER" | grep -q standin; then
+    ok "the real Claude Code is back on PATH"
+else
+    bad "the real Claude Code was not restored"
+fi
+# shellcheck disable=SC2016  # $HOME must expand in the guest.
+guest sh -c 'rm -f $HOME/.config/agent-box/token'
+guest sh -c 'cd /work && git checkout -- . 2>/dev/null; true'
 
 printf -- '\n--- clean up the planted token and the run state ---\n'
 # shellcheck disable=SC2016  # $HOME must expand in the guest, not on the host.

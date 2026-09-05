@@ -111,6 +111,13 @@ and exits 130.
 | `lost` | it said running, and neither its tmux session nor its recorded pid was there |
 | `unknown` | there is no status file to read |
 
+A stop is recorded by the run itself, not deduced by the thing that stopped it:
+`stop-run` leaves a `stop-requested` marker in the run directory before it
+sends a signal, and the run writes `exit:stopped` on its way out if it did not
+finish cleanly. It has to work that way because Claude Code exits 0 when it is
+interrupted and says so only in its result event, so a stopper watching from
+outside sees what looks like a successful run.
+
 `lost` is what a run becomes when the VM was stopped underneath it, or its
 process died without running its exit handler. `runs`, `status` and
 `agentbox start` each reconcile that before answering, so a run does not sit at

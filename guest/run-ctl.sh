@@ -135,32 +135,44 @@ cmd_stop() {
         return 0
     fi
 
-    # Every process under the session's pane, deepest first. claude is the
-    # deepest one, so it is interrupted before the script that launched it and
-    # gets the chance to finish its result event; agent-run.sh's EXIT trap then
-    # records the status whatever happens next.
+    # Before any signal, and after the check above: the run reads this file in
+    # its exit trap and records `exit:stopped` itself. The stopper cannot tell
+    # an interrupted run from one that happened to finish in the same second,
+    # and Claude Code exits 0 on an interrupt (issue #14), so inferring it from
+    # out here recorded stopped runs as `done`. The run knows; this is how it
+    # is told to look.
+    printf '%s\n' "$(abx_now_iso)" > "${dir}/stop-requested"
+    chmod 600 "${dir}/stop-requested" 2>/dev/null || true
+
+    # The CLI, and only the CLI.
     #
-    # By position in the tree rather than by name: the CLI is a single native
-    # binary in some installs and a node process in others, and a stop that
-    # only works for one of those is a stop that silently does not work.
-    local pids="" pid signalled=0
+    # Signalling every process under the pane hits two things that are not the
+    # CLI: agent-run.sh itself, and the console tee holding the read end of its
+    # stdout. Killing the tee left agent-run.sh writing into a pipe nobody was
+    # reading, so it died of SIGPIPE without running its exit trap — no
+    # summary, and no status written by the one process that knew what had
+    # happened. That is why the run records its own pid for the CLI, and why
+    # this walks down from there rather than down from the pane.
+    local claude_pid pids="" pid signalled=0
+    claude_pid=$(cat "${dir}/claude-pid" 2>/dev/null | head -1) || claude_pid=""
+    case "$claude_pid" in ''|*[!0-9]*) claude_pid="" ;; esac
+
     pane_pid=$(tmux list-panes -t "=${session}" -F '#{pane_pid}' 2>/dev/null | head -1)
-    if [ -n "$pane_pid" ]; then
-        pids=$(descendants_deepest_first "$pane_pid")
-    fi
-    for pid in $pids; do
-        [ "$pid" = "$pane_pid" ] && continue
-        kill -INT "$pid" 2>/dev/null && signalled=$((signalled + 1))
-    done
-    if [ "$signalled" -eq 0 ]; then
-        # pgrep missing, or the pane holds nothing but the script. Say so: the
-        # difference between "the model was interrupted" and "the wrapper was
-        # killed" is the difference between a clean stop and a truncated
-        # events.jsonl, and it must not be silent.
-        printf 'run-ctl: WARNING: found no process under the pane to interrupt; is procps installed?\n' >&2
-    fi
-    if [ -n "$pane_pid" ]; then
-        kill -INT "$pane_pid" 2>/dev/null || true
+
+    if [ -n "$claude_pid" ] && kill -0 "$claude_pid" 2>/dev/null; then
+        pids=$(descendants_deepest_first "$claude_pid")
+        for pid in $pids; do
+            kill -INT "$pid" 2>/dev/null && signalled=$((signalled + 1))
+        done
+        if [ "$signalled" -eq 0 ]; then
+            printf 'run-ctl: WARNING: could not signal the CLI (pid %s); is procps installed?\n' \
+                "$claude_pid" >&2
+        fi
+    else
+        # No CLI running: the run is still in its preconditions, or already on
+        # its way out. Interrupt the script itself, which has a trap for it.
+        printf 'run-ctl: no CLI process for %s yet; interrupting the run script\n' "$runid"
+        [ -z "$pane_pid" ] || kill -INT "$pane_pid" 2>/dev/null || true
     fi
 
     waited=0
@@ -176,8 +188,20 @@ cmd_stop() {
     state=$(abx_status_read "$dir")
     if [ "$state" != "running" ]; then
         tmux kill-session -t "=${session}" 2>/dev/null || true
-        printf 'run-ctl: %s ended by itself after %ss with %s; nothing was reverted\n' \
-            "$runid" "$waited" "$state"
+        case "$state" in
+            exit:stopped)
+                printf 'run-ctl: %s stopped after %ss. Nothing was reverted: the work tree is as the run left it.\n' \
+                    "$runid" "$waited" ;;
+            exit:0)
+                # "By itself" is reserved for a run that really did finish on
+                # its own terms while we were waiting, which is the one case
+                # where this command changed nothing.
+                printf 'run-ctl: %s ended by itself after %ss with %s; nothing was reverted\n' \
+                    "$runid" "$waited" "$state" ;;
+            *)
+                printf 'run-ctl: %s ended after %ss with %s; nothing was reverted\n' \
+                    "$runid" "$waited" "$state" ;;
+        esac
         return 0
     fi
 
@@ -199,8 +223,12 @@ cmd_stop() {
         return 1
     fi
 
+    # Worded differently from the branch above on purpose. There, the run
+    # recorded its own stop and this command only reported it. Here it did not,
+    # so the session was closed and the status written from outside — a
+    # materially weaker claim, and one an operator should be able to tell apart.
     abx_status_write "$dir" "exit:stopped"
-    printf 'run-ctl: %s stopped after %ss. Nothing was reverted: the work tree is as the run left it.\n' \
+    printf 'run-ctl: %s stopped after %ss by closing its session; it did not record its own exit. Nothing was reverted.\n' \
         "$runid" "$waited"
 }
 

@@ -751,3 +751,46 @@ Two defences now, deliberately not one:
 
 Either alone would close today's hole. Both, because the first is a policy that
 a later change could widen and the second is a property of how the call is made.
+
+## Why a run records its own stop, instead of the stopper recording it
+
+`agentbox stop-run` used to work the way it reads: send SIGINT, wait for the
+status file to move, and if it moved, report what it now says. That was wrong
+in a way nothing caught until a real run on a real box, and it is issue #14.
+
+Claude Code 2.1.261 in `-p` mode **exits 0 when it is interrupted**. It says
+what happened only in its result event:
+
+```
+20:38:53  result  error_during_execution  turns=3  cost=$0.0205  duration=21s  is_error=true
+20:38:53  status  exit:0  done
+```
+
+So `agent-run.sh` recorded `exit:0`, the stop loop saw a status appear and
+announced that the run had "ended by itself", and `runs`, `status --json` and
+the summary all agreed it was `done`. Every one of them was reporting a stopped
+run as a successful one.
+
+Two things were wrong, and they need different fixes.
+
+**The outcome is the CLI's verdict, not its exit status.** `agent-run.sh` now
+reads `is_error` and `subtype` out of the result event and, when the process
+exited 0 but the result says otherwise, records the run as failed and prints
+one line saying why. A missing result event counts the same way: with
+`--output-format stream-json` the CLI always emits one, so its absence means
+the stream was cut off.
+
+**The stop is recorded by the run, because only the run knows both halves.**
+The stopper knows it asked; the run knows how it ended. Neither alone can tell
+an interrupted run from one that happened to finish in the same second, and the
+stopper is the one that cannot see the difference. So `run-ctl.sh stop` writes
+`stop-requested` into the run directory before it sends any signal, and
+`agent-run.sh`'s exit trap writes `exit:stopped` if that file is there and the
+run did not end cleanly. The stopper then reads the answer rather than guessing
+it, and "ended by itself" is reserved for the one case where it is true.
+
+The alternative was to have the stopper write `exit:stopped` whenever it had
+signalled and the run subsequently ended. That is the version the review round
+already rejected for a different reason: it overwrites the record of a run that
+finished on its own terms a moment before the signal landed. Both failures come
+from the same mistake, which is inferring a run's fate from outside it.
