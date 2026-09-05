@@ -1,0 +1,37 @@
+# agent-box — base egress allowlist.
+#
+# One DNS name per line. Blank lines and lines starting with '#' are ignored.
+# Each name is resolved to A records on every firewall run and the addresses
+# are added to the `allowed-domains` ipset. Nothing else may leave the VM.
+#
+# This file is generic on purpose: it must stay committable to a public
+# repository. Anything site-specific (an app under test, a staging host, an
+# internal package mirror) belongs in allowlist.local, which lives on the host
+# in ~/.config/agent-box/ and is never committed. See docs/decisions.md.
+#
+# GitHub is NOT listed here. Its address ranges are pulled from
+# api.github.com/meta at runtime, which covers github.com, the API, raw
+# content and the git endpoints in one go.
+
+# --- Claude Code: model traffic -------------------------------------------
+api.anthropic.com
+claude.ai
+platform.claude.com
+
+# --- Claude Code: the native installer and self-update ---------------------
+# claude.ai serves install.sh; downloads.claude.ai serves `latest`,
+# manifest.json and the platform binary. Verified by reading install.sh
+# (fetched 2026-09-04): DOWNLOAD_BASE_URL="https://downloads.claude.ai/claude-code-releases".
+downloads.claude.ai
+
+# --- Package registries the agent may need to install test dependencies ----
+registry.npmjs.org
+pypi.org
+files.pythonhosted.org
+
+# Deliberately NOT allowed, and disabled by DISABLE_TELEMETRY=1 and
+# DISABLE_ERROR_REPORTING=1 in the guest environment instead:
+#   sentry.io, statsig.com, statsig.anthropic.com
+# Deliberately NOT allowed, because nothing in this VM is an editor:
+#   marketplace.visualstudio.com, vscode.blob.core.windows.net,
+#   update.code.visualstudio.com

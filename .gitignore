@@ -1,0 +1,13 @@
+# Host-side configuration lives in ~/.config/agent-box and is MOUNTED into the
+# VM read-only, never copied in here — see docs/decisions.md. These entries stay
+# as a backstop: none of these names is generic, so none is ever committable,
+# and .local/ remains available for local scratch.
+.local/
+
+# Belt and braces: these names must never be committed even at the repo root.
+*.token
+allowlist.local
+blocklist.txt
+ca.pem
+
+.DS_Store
