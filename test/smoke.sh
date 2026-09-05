@@ -40,6 +40,13 @@ DIRTY_REPO="${TMP_ROOT}/dirty-${SMOKE_ID}"
 TERM_REPO="${TMP_ROOT}/term-${SMOKE_ID}"
 INSTANCE="agent-box-${SMOKE_ID}"
 
+# The second instance: the same box with the Docker and browser-testing
+# profile. A separate VM rather than a flag on the first, because the profile
+# is fixed at create time and the point is to prove both shapes work.
+DOCKER_REPO="${TMP_ROOT}/dk-${SMOKE_ID}"
+DOCKER_INSTANCE="agent-box-dk-${SMOKE_ID}"
+FORWARD_PORT=3999
+
 PASS=0
 FAIL=0
 
@@ -49,12 +56,14 @@ ok()   { PASS=$((PASS + 1)); printf 'PASS  %s\n' "$*"; }
 bad()  { FAIL=$((FAIL + 1)); printf 'FAIL  %s\n' "$*"; }
 
 cleanup() {
-    local rc=$?
+    local rc=$? inst
     step "cleanup"
-    if "$LIMACTL" list --quiet 2>/dev/null | grep -qxF "$INSTANCE"; then
-        printf 'destroying %s\n' "$INSTANCE"
-        "$AGENTBOX" destroy "$INSTANCE" || "$LIMACTL" delete --force "$INSTANCE" || true
-    fi
+    for inst in "$INSTANCE" "$DOCKER_INSTANCE"; do
+        if "$LIMACTL" list --quiet 2>/dev/null | grep -qxF "$inst"; then
+            printf 'destroying %s\n' "$inst"
+            "$AGENTBOX" destroy "$inst" || "$LIMACTL" delete --force "$inst" || true
+        fi
+    done
     rm -rf "$TMP_ROOT"
     printf 'Lima image cache under ~/Library/Caches/lima/download is left in place on purpose.\n'
     exit "$rc"
@@ -63,7 +72,8 @@ trap cleanup EXIT
 
 # An explicit --workdir stops limactl from trying to cd into the host's
 # working directory inside the guest, which warns on stderr every time.
-guest() { "$LIMACTL" shell --workdir /work "$INSTANCE" -- "$@"; }
+guest()  { "$LIMACTL" shell --workdir /work "$INSTANCE" -- "$@"; }
+dguest() { "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- "$@"; }
 
 # Run a command with a wall-clock bound and capture its exit status. macOS has
 # no `timeout(1)`, and one step below makes a real model call that must not be
@@ -231,7 +241,12 @@ MARKETPLACE_REPO="konyklabs/claude-plugins"
 # repository name: .claude-plugin/marketplace.json on that public repo's main
 # branch declares "konyklabs-plugins".
 MARKETPLACE_NAME="konyklabs-plugins"
-PLUGIN_UNDER_TEST="governor"
+# The plugin this test installs from that marketplace. It is a real public
+# marketplace, so this name tracks whatever it actually publishes: it was
+# `governor` until 2026-09-05, when konyklabs/claude-plugins renamed it to
+# `supervisor` on main and every install here began failing with
+# `Plugin "governor" not found in marketplace "konyklabs-plugins"`.
+PLUGIN_UNDER_TEST="supervisor"
 
 mkdir -p "${GUEST_CFG}/claude/rules" \
          "${GUEST_CFG}/plugin-dir/demo/.claude-plugin" \
@@ -731,8 +746,8 @@ SH
 # Either an explicit CLI install works with no account in the VM, or it does
 # not and the documented fallback is what the operator sees.
 #
-# The installed check asserts the full identity, `governor@konyklabs-plugins`,
-# against the installed listing alone. A bare `governor` would also match the
+# The installed check asserts the full identity, `<plugin>@konyklabs-plugins`,
+# against the installed listing alone. A bare plugin name would also match the
 # marketplace listing, and a plugin of that name from some other marketplace.
 if grep -q "$MARKETPLACE_NAME" "$MK_OUT" && grep -q "${PLUGIN_UNDER_TEST}@${MARKETPLACE_NAME}" "$INST_OUT"; then
     ok "PLUGIN PATH: install needs NO account — ${MARKETPLACE_NAME} is registered and ${PLUGIN_UNDER_TEST} is installed"
@@ -1035,8 +1050,13 @@ if grep -q 'there is no standing ruleset' "$FR_OUT"; then
 else
     bad "the hard-close branch was not taken"
 fi
-if grep -qE '^-A INPUT .*--dport 22 -j ACCEPT' "$FR_OUT"; then
-    ok "the hard-close ruleset keeps inbound port 22"
+# In AGENTBOX-IN, which INPUT rule 1 jumps to. The accept rules moved out of
+# the builtin chains when the firewall started owning chains rather than the
+# whole table, so both halves are asserted: the rule, and the jump that reaches
+# it. A rule in an unreachable chain would let the operator out just as surely.
+if grep -qE '^-A AGENTBOX-IN .*--dport 22 -j ACCEPT' "$FR_OUT" \
+    && grep -qx -- '-A INPUT -j AGENTBOX-IN' "$FR_OUT"; then
+    ok "the hard-close ruleset keeps inbound port 22, in a chain INPUT reaches"
 else
     bad "the hard-close ruleset does not keep inbound port 22"
 fi
@@ -1140,6 +1160,415 @@ if "$LIMACTL" list --quiet 2>/dev/null | grep -qxF "$INSTANCE"; then
     bad "${INSTANCE} is still listed after destroy"
 else
     ok "${INSTANCE} is gone from limactl list"
+fi
+
+# ===========================================================================
+step "11. a second instance with the Docker and browser-testing profile"
+# ===========================================================================
+#
+# Everything from here down is about the opt-in profile: Docker Engine inside
+# the guest, containers held to the same egress allowlist, a forwarded port,
+# Node 22 with Playwright's system libraries, and Rosetta for amd64 images.
+#
+# A separate VM, not a flag on the first one. The profile is fixed at create
+# time — that is the whole design — so the only way to test both shapes is to
+# build both.
+
+mkdir -p "$DOCKER_REPO"
+git init -q "$DOCKER_REPO"
+cat > "${DOCKER_REPO}/hello.txt" <<'EOF'
+A second throwaway repository, for the Docker and Playwright profile.
+EOF
+
+printf 'This installs Docker Engine, Node 22 and Playwright system libraries.\n'
+printf 'It is slower than the first create; it is not stuck.\n'
+DK_CREATE_OUT="${TMP_ROOT}/dk-create.out"
+DK_TS=$(date +%s)
+run_bounded 2400 "$DK_CREATE_OUT" "$AGENTBOX" create "$DOCKER_REPO" \
+    --docker --playwright --rosetta --forward "$FORWARD_PORT"
+dk_rc=$BOUNDED_RC
+cat "$DK_CREATE_OUT"
+printf 'docker-profile create took %s seconds\n' "$(( $(date +%s) - DK_TS ))"
+if [ "$dk_rc" -eq 0 ]; then ok "agentbox create --docker --playwright --rosetta succeeded"; else bad "that create exited ${dk_rc}"; fi
+
+if grep -q 'WARNING: --forward' "$DK_CREATE_OUT"; then
+    ok "--forward printed the widening warning"
+else
+    bad "--forward printed no warning"
+fi
+if grep -qE "^  forwarded +${FORWARD_PORT}\$" "$DK_CREATE_OUT"; then
+    ok "the summary records the forwarded port"
+else
+    bad "the summary does not record the forwarded port"
+fi
+if grep -qE '^agentbox: sizing: 4 cpus, 8GiB memory, 60GiB disk$' "$DK_CREATE_OUT"; then
+    ok "--docker raised the default sizing to 4/8GiB/60GiB"
+else
+    bad "--docker did not print the raised default sizing"
+fi
+
+if "$LIMACTL" list --quiet | grep -qxF "$DOCKER_INSTANCE"; then
+    ok "instance ${DOCKER_INSTANCE} exists"
+else
+    bad "instance ${DOCKER_INSTANCE} does not exist; the remaining Docker checks cannot run"
+    hr; printf 'RESULT: %s passed, %s failed\n' "$PASS" "$FAIL"; hr
+    exit 1
+fi
+
+printf -- '\n--- the sizing Lima actually gave it ---\n'
+"$LIMACTL" list "$DOCKER_INSTANCE"
+
+# ===========================================================================
+step "12. Docker inside the guest, under the same allowlist"
+# ===========================================================================
+
+printf -- '--- docker info, as the NON-ROOT guest user ---\n'
+# Not under sudo. A box where only root can talk to the daemon is a box the
+# agent cannot use, and the agent is never root.
+DI_OUT="${TMP_ROOT}/docker-info.out"
+run_bounded 120 "$DI_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- \
+    docker info --format '{{.ServerVersion}} {{.SecurityOptions}}'
+cat "$DI_OUT"
+if [ "$BOUNDED_RC" -eq 0 ] && grep -qE '^[0-9]+\.[0-9]+' "$DI_OUT"; then
+    ok "docker info works as the non-root guest user"
+else
+    bad "docker info failed as the non-root guest user"
+fi
+# The rootless engine reports name=rootless among its security options and
+# populates none of the DOCKER* chains, so this is the check that the profile
+# installed the engine the allowlist can actually hook into.
+if grep -q 'name=rootless' "$DI_OUT"; then
+    bad "the daemon is rootless; DOCKER-USER would not exist"
+else
+    ok "the daemon is rootful, which is what populates DOCKER-USER"
+fi
+
+printf -- '\n--- docker pull alpine:3 through the allowlist ---\n'
+PULL_OUT="${TMP_ROOT}/docker-pull.out"
+run_bounded 300 "$PULL_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- \
+    docker pull alpine:3
+pull_rc=$BOUNDED_RC
+tail -5 "$PULL_OUT"
+if [ "$pull_rc" -eq 0 ]; then
+    ok "docker pull alpine:3 succeeded, so the registry names are on the allowlist"
+else
+    bad "docker pull alpine:3 exited ${pull_rc}"
+fi
+
+printf -- '\n--- DOCKER-USER rule 1 ---\n'
+DU_OUT="${TMP_ROOT}/docker-user.out"
+dguest sudo iptables -S DOCKER-USER > "$DU_OUT" 2>&1
+cat "$DU_OUT"
+if [ "$(sed -n '2p' "$DU_OUT")" = "-A DOCKER-USER -j AGENTBOX-FWD" ]; then
+    ok "DOCKER-USER rule 1 jumps to AGENTBOX-FWD"
+else
+    bad "DOCKER-USER rule 1 is not the AGENTBOX-FWD jump"
+fi
+
+printf -- '\n--- Docker chains are intact and ours sit beside them ---\n'
+dguest sudo iptables -S 2>/dev/null | grep -E '^-N|^-P|^-A (FORWARD|DOCKER-USER)'
+
+printf -- '\n--- container egress obeys the allowlist ---\n'
+CEG_OUT="${TMP_ROOT}/container-egress.out"
+dguest bash -c '
+docker run --rm alpine:3 wget -T 5 -q -O /dev/null https://example.com 2>&1
+echo "EXAMPLE_RC=$?"
+docker run --rm alpine:3 wget -T 5 -q -O /dev/null https://api.anthropic.com/ 2>&1
+echo "ANTHROPIC_RC=$?"
+' > "$CEG_OUT" 2>&1
+cat "$CEG_OUT"
+if grep -q '^EXAMPLE_RC=0' "$CEG_OUT"; then
+    bad "a container reached https://example.com"
+else
+    ok "a container could not reach https://example.com"
+fi
+# busybox wget exits 1 on an HTTP error too, so "connected" means either a zero
+# exit or an answer from the server. A refused connection says so explicitly.
+if grep -q '^ANTHROPIC_RC=0' "$CEG_OUT" || grep -q 'server returned error' "$CEG_OUT"; then
+    ok "a container reached https://api.anthropic.com/"
+else
+    bad "a container could not reach https://api.anthropic.com/"
+fi
+
+printf -- '\n--- two containers on a user-defined network reach each other ---\n'
+C2C_OUT="${TMP_ROOT}/c2c.out"
+run_bounded 300 "$C2C_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c '
+set -e
+docker network create abxnet >/dev/null 2>&1 || true
+docker rm -f abxsrv >/dev/null 2>&1 || true
+docker run -d --name abxsrv --network abxnet alpine:3 \
+    sh -c "while true; do printf \"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO\" | nc -l -p 8000; done" >/dev/null
+sleep 3
+docker run --rm --network abxnet alpine:3 wget -T 5 -q -O - http://abxsrv:8000/
+echo ""
+echo "C2C_RC=$?"
+docker rm -f abxsrv >/dev/null 2>&1 || true
+'
+cat "$C2C_OUT"
+if grep -q 'HELLO' "$C2C_OUT" && grep -q '^C2C_RC=0' "$C2C_OUT"; then
+    ok "two containers on a user-defined network reached each other"
+else
+    bad "container-to-container traffic on a user-defined network did not work"
+fi
+
+printf -- '\n--- a compose stack, published on the forwarded port ---\n'
+STACK_OUT="${TMP_ROOT}/stack.out"
+run_bounded 600 "$STACK_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c "
+set -e
+rm -rf /tmp/abx-stack && mkdir -p /tmp/abx-stack
+cat > /tmp/abx-stack/compose.yaml <<'YML'
+services:
+  web:
+    image: python:3-alpine
+    command: python -m http.server 8000
+    ports:
+      - \"127.0.0.1:${FORWARD_PORT}:8000\"
+YML
+cd /tmp/abx-stack
+docker compose up -d
+for i in \$(seq 1 30); do
+    code=\$(curl -sS -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:${FORWARD_PORT}/ 2>/dev/null || true)
+    [ \"\$code\" = 200 ] && break
+    sleep 2
+done
+echo \"GUEST_HTTP=\$code\"
+"
+cat "$STACK_OUT"
+if grep -q '^GUEST_HTTP=200' "$STACK_OUT"; then
+    ok "the compose stack answers at 127.0.0.1:${FORWARD_PORT} inside the guest"
+else
+    bad "the compose stack does not answer inside the guest"
+fi
+
+printf -- '\n--- and on the host, through the forwarded port ---\n'
+HOST_HTTP=""
+for _try in 1 2 3 4 5 6 7 8 9 10; do
+    HOST_HTTP=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${FORWARD_PORT}/" 2>/dev/null || true)
+    [ "$HOST_HTTP" = "200" ] && break
+    sleep 2
+done
+printf 'host curl http://127.0.0.1:%s/ -> %s\n' "$FORWARD_PORT" "${HOST_HTTP:-<no answer>}"
+if [ "$HOST_HTTP" = "200" ]; then
+    ok "the forwarded port answers on the host at 127.0.0.1:${FORWARD_PORT}"
+else
+    bad "the forwarded port does not answer on the host"
+fi
+
+printf -- '\n--- a daemon restart leaves no unfiltered window ---\n'
+# ExecStartPost, not the 15-minute timer. `systemctl restart docker` returning
+# means the hook has already run, so the jump must be back immediately — not
+# eventually.
+RESTART_OUT="${TMP_ROOT}/docker-restart.out"
+run_bounded 300 "$RESTART_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c '
+sudo iptables -D DOCKER-USER -j AGENTBOX-FWD 2>/dev/null || true
+echo "--- jump deliberately removed ---"
+sudo iptables -S DOCKER-USER
+sudo systemctl restart docker
+echo "RESTART_RC=$?"
+echo "--- immediately after the restart returned ---"
+sudo iptables -S DOCKER-USER
+docker run --rm alpine:3 echo CONTAINER_STILL_RUNS
+'
+cat "$RESTART_OUT"
+if grep -q '^RESTART_RC=0' "$RESTART_OUT"; then
+    ok "systemctl restart docker exited 0"
+else
+    bad "systemctl restart docker did not exit 0"
+fi
+if [ "$(grep -c -- '-A DOCKER-USER -j AGENTBOX-FWD' "$RESTART_OUT")" -ge 1 ]; then
+    ok "the AGENTBOX-FWD jump was back in DOCKER-USER as soon as the restart returned"
+else
+    bad "the AGENTBOX-FWD jump was not restored by the restart"
+fi
+if grep -q 'CONTAINER_STILL_RUNS' "$RESTART_OUT"; then
+    ok "a container still runs after the daemon restart"
+else
+    bad "no container could run after the daemon restart"
+fi
+
+printf -- '\n--- a forced firewall rebuild leaves Docker chains intact ---\n'
+# `restart`, not `start`: agent-box-firewall is a RemainAfterExit oneshot, so
+# `start` on an already-active unit does nothing at all and would make this
+# check vacuous. This is the case the old whole-table `iptables-restore` broke:
+# it replaced the filter table every fifteen minutes and took Docker's chains
+# with it.
+REBUILD_OUT="${TMP_ROOT}/dk-rebuild.out"
+run_bounded 300 "$REBUILD_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c '
+sudo systemctl restart agent-box-firewall.service
+echo "FW_RC=$?"
+echo "--- DOCKER-FORWARD ---"
+sudo iptables -S DOCKER-FORWARD
+echo "--- DOCKER-USER ---"
+sudo iptables -S DOCKER-USER
+docker run --rm alpine:3 echo CONTAINER_AFTER_REBUILD
+'
+cat "$REBUILD_OUT"
+if grep -q '^FW_RC=0' "$REBUILD_OUT"; then
+    ok "the firewall rebuilt on an instance running Docker"
+else
+    bad "the firewall rebuild failed on an instance running Docker"
+fi
+if [ "$(sed -n '/--- DOCKER-FORWARD ---/,/--- DOCKER-USER ---/p' "$REBUILD_OUT" | grep -c '^-A DOCKER-FORWARD')" -gt 0 ]; then
+    ok "DOCKER-FORWARD still holds Docker's own rules after the rebuild"
+else
+    bad "DOCKER-FORWARD was emptied by the rebuild"
+fi
+if grep -q -- '-A DOCKER-USER -j AGENTBOX-FWD' "$REBUILD_OUT"; then
+    ok "the AGENTBOX-FWD jump survived the rebuild"
+else
+    bad "the AGENTBOX-FWD jump did not survive the rebuild"
+fi
+if grep -q 'CONTAINER_AFTER_REBUILD' "$REBUILD_OUT"; then
+    ok "a container still runs after a firewall rebuild"
+else
+    bad "no container could run after a firewall rebuild"
+fi
+
+printf -- '\n--- firewall-check on the Docker instance ---\n'
+DFW_OUT="${TMP_ROOT}/dk-firewall.out"
+run_bounded 300 "$DFW_OUT" "$AGENTBOX" firewall-check "$DOCKER_REPO"
+dfw_rc=$BOUNDED_RC
+cat "$DFW_OUT"
+if [ "$dfw_rc" -eq 0 ]; then ok "firewall-check exited 0 on the Docker instance"; else bad "firewall-check exited ${dfw_rc} on the Docker instance"; fi
+for check in policy-drop policy-drop-v6 forward-drop out-chain-first allowlist-rule \
+             literal-ip-denied foreign-dns-denied egress-denied anthropic-allowed github-allowed \
+             docker-user-jump docker-egress docker-allowed; do
+    if grep -q "^PASS  ${check}" "$DFW_OUT"; then
+        ok "firewall check ${check} (docker instance)"
+    else
+        bad "firewall check ${check} (docker instance)"
+    fi
+done
+
+# ===========================================================================
+step "12b. Node, Playwright and Rosetta"
+# ===========================================================================
+
+printf -- '--- node and npx ---\n'
+NODE_OUT="${TMP_ROOT}/node.out"
+"$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -lc 'node --version; npm --version' > "$NODE_OUT" 2>&1
+cat "$NODE_OUT"
+if grep -qE '^v22\.' "$NODE_OUT"; then
+    ok "node --version is 22.x"
+else
+    bad "node --version is not 22.x"
+fi
+
+PW_OUT="${TMP_ROOT}/playwright.out"
+run_bounded 300 "$PW_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- \
+    bash -lc 'npx --yes playwright --version'
+cat "$PW_OUT"
+if grep -qiE 'Version [0-9]+\.[0-9]+' "$PW_OUT"; then
+    ok "npx playwright --version printed a version"
+else
+    bad "npx playwright --version printed no version"
+fi
+
+printf -- '\n--- a Playwright system library is installed ---\n'
+NSS_OUT="${TMP_ROOT}/libnss3.out"
+dguest bash -c 'dpkg -s libnss3 2>&1 | grep -E "^(Package|Status):"' > "$NSS_OUT" 2>&1
+cat "$NSS_OUT"
+if grep -q 'Status: install ok installed' "$NSS_OUT"; then
+    ok "libnss3 is installed, so install-deps really ran"
+else
+    bad "libnss3 is not installed"
+fi
+
+printf -- '\n--- python3-venv and pip, for pytest-playwright ---\n'
+PY3_OUT="${TMP_ROOT}/py3.out"
+dguest bash -c 'python3 -m venv --help >/dev/null 2>&1 && echo VENV_OK; python3 -m pip --version 2>&1 | head -1' > "$PY3_OUT" 2>&1
+cat "$PY3_OUT"
+if grep -q 'VENV_OK' "$PY3_OUT"; then
+    ok "python3 -m venv is available"
+else
+    bad "python3 -m venv is not available"
+fi
+if grep -q '^pip ' "$PY3_OUT"; then
+    ok "python3 -m pip is available"
+else
+    bad "python3 -m pip is not available"
+fi
+
+printf -- '\n--- Rosetta runs a linux/amd64 image ---\n'
+ROS_OUT="${TMP_ROOT}/rosetta.out"
+run_bounded 300 "$ROS_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c '
+ls -l /proc/sys/fs/binfmt_misc/ 2>&1 | head -5
+docker run --rm --platform linux/amd64 alpine:3 uname -m
+'
+cat "$ROS_OUT"
+if grep -qx 'x86_64' "$ROS_OUT"; then
+    ok "a linux/amd64 container reports x86_64, so Rosetta is doing the work"
+else
+    bad "a linux/amd64 container did not report x86_64"
+fi
+
+printf -- '\n--- the names added to the base allowlist are reachable under it ---\n'
+# Provisioning downloads with the firewall stopped, so a name it needed could
+# be missing from allowlist.base and nothing would notice until an agent tried
+# to use it later. These are checked from inside the running guest, under the
+# standing deny. Any HTTP status counts: an answer proves the connection was
+# permitted, and 401 or 403 from a registry is an answer.
+AL_OUT="${TMP_ROOT}/allowlist-reach.out"
+# Each name is tried up to six times. That is not papering over flakiness: the
+# allowlist pins addresses and several of these names sit behind CDNs that hand
+# out one address from a rotating pool, so a single attempt tests the pool
+# lottery rather than the allowlist. Six attempts against a set holding most of
+# a pool is the shape a real download has, and a name that is genuinely absent
+# still fails all six.
+# shellcheck disable=SC2016  # $u and $code must expand in the guest, not here.
+run_bounded 600 "$AL_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c '
+for u in http://ports.ubuntu.com/ \
+         https://download.docker.com/linux/ubuntu/gpg \
+         https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt \
+         https://cdn.playwright.dev/ \
+         https://ghcr.io/v2/ \
+         https://auth.docker.io/ \
+         https://registry-1.docker.io/v2/; do
+    code=000
+    for _try in 1 2 3 4 5 6; do
+        code=$(curl -sS -m 12 -o /dev/null -w "%{http_code}" "$u" 2>/dev/null || true)
+        [ -n "$code" ] && [ "$code" != 000 ] && break
+        sleep 2
+    done
+    printf "REACH %s %s\n" "${code:-000}" "$u"
+done
+'
+grep '^REACH' "$AL_OUT" || cat "$AL_OUT"
+for host in ports.ubuntu.com download.docker.com nodejs.org cdn.playwright.dev ghcr.io auth.docker.io registry-1.docker.io; do
+    if grep -E "^REACH [1-5][0-9][0-9] " "$AL_OUT" | grep -q -- "${host}"; then
+        ok "allowlisted and reachable: ${host}"
+    else
+        bad "allowlisted but NOT reachable: ${host}"
+    fi
+done
+
+printf -- '\n--- and a name that is not on it still is not ---\n'
+NAL_OUT="${TMP_ROOT}/allowlist-negative.out"
+dguest bash -c 'curl -sS -m 8 -o /dev/null -w "%{http_code}" https://cdn.quay.io/ 2>&1; echo ""' > "$NAL_OUT" 2>&1
+cat "$NAL_OUT"
+if grep -qE '^(000)?$|Could not|refused|prohibited|unreachable|Failed' "$NAL_OUT"; then
+    ok "cdn.quay.io, left commented out in allowlist.base, is refused"
+else
+    bad "cdn.quay.io answered although it is not on the allowlist"
+fi
+
+printf -- '\n--- tear the stack down ---\n'
+dguest bash -c 'cd /tmp/abx-stack && docker compose down 2>&1 | tail -2; docker network rm abxnet >/dev/null 2>&1; true'
+
+# ===========================================================================
+step "13. destroy the Docker instance"
+# ===========================================================================
+
+"$AGENTBOX" destroy "$DOCKER_INSTANCE"
+rc=$?
+if [ "$rc" -eq 0 ]; then ok "agentbox destroy exited 0 for the Docker instance"; else bad "agentbox destroy exited ${rc} for the Docker instance"; fi
+
+printf -- '\n--- limactl list ---\n'
+"$LIMACTL" list 2>&1
+if "$LIMACTL" list --quiet 2>/dev/null | grep -qxF "$DOCKER_INSTANCE"; then
+    bad "${DOCKER_INSTANCE} is still listed after destroy"
+else
+    ok "${DOCKER_INSTANCE} is gone from limactl list"
 fi
 
 # ===========================================================================

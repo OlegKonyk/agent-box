@@ -58,7 +58,8 @@ One instance per repository, named `agent-box-<repo basename>`.
 | Command | What it does |
 |---|---|
 | `agentbox preflight <repo>` | Scan a repo for secrets and configured terms. Exit 1 on findings. |
-| `agentbox create <repo>` | Preflight, then create and start that repo's VM. |
+| `agentbox create <repo> [options]` | Preflight, then create and start that repo's VM. Options below. |
+| `agentbox resize <repo\|name> [--cpus N] [--memory SIZE] [--disk SIZE]` | Resize an existing VM. Stops it if running, then starts it again. The disk can only grow. |
 | `agentbox start <repo>` | Preflight, then start an existing VM. |
 | `agentbox token <repo>` | Read an OAuth token from the terminal into the VM. Never echoed, never stored on the host. |
 | `agentbox verify-auth <repo>` | Prove the token authenticates, with one real model call. |
@@ -72,8 +73,35 @@ One instance per repository, named `agent-box-<repo basename>`.
 | `agentbox status` | List all Lima instances. |
 | `agentbox firewall-check <repo\|name>` | Re-run the egress verification inside the VM. |
 
-The last three also take a bare instance name, so a VM can still be shut down
-and deleted after its repository directory is gone.
+`resize`, `stop`, `destroy` and `firewall-check` also take a bare instance
+name, so a VM can still be shut down, resized and deleted after its repository
+directory is gone.
+
+### create options
+
+All optional, all off by default, and all fixed for the life of the instance
+except the sizing. The same reasoning as the mounts: what a VM can do is
+decided when it is made, not adjusted while it runs.
+
+| Option | What it adds |
+|---|---|
+| `--docker` | Docker Engine, buildx and compose inside the guest. Containers are held to the same egress allowlist as the guest itself. |
+| `--playwright` | Node 22 from nodejs.org, plus the system libraries `playwright install-deps` installs. Browsers are not baked in: each repository's own Playwright downloads the builds it was pinned against, on first use. |
+| `--rosetta` | Run `linux/amd64` images on Apple silicon. Needs Rosetta 2 on the Mac; `softwareupdate --install-rosetta` if Lima stalls at "Installing rosetta". |
+| `--forward PORT[,PORT...]` | Forward guest `127.0.0.1:PORT` to host `127.0.0.1:PORT`. A widening — see Limits below. |
+| `--cpus N` | Default 4. |
+| `--memory SIZE` | Default `6GiB`, or `8GiB` with `--docker`. |
+| `--disk SIZE` | Default `30GiB`, or `60GiB` with `--docker`. |
+
+`--docker` raises the memory and disk defaults because images, layers and a
+build cache all land on the guest disk and a compose stack plus a browser is a
+different memory profile from a shell and an editor. An explicit `--memory` or
+`--disk` overrides that. The effective sizing is printed at create time and
+again in the summary.
+
+```
+./bin/agentbox create ~/dev/my-app --docker --playwright --forward 3000,8080
+```
 
 ## Layout
 
@@ -129,6 +157,16 @@ What of `claude/` crosses into the guest, and what is refused, is in
   against carelessness, not a sandbox against a hostile tool — the VM boundary
   is what protects the host. Tracked as
   [issue #1](https://github.com/OlegKonyk/agent-box/issues/1).
+- **`--forward` opens a hole in the other direction.** By default nothing the
+  guest listens on is reachable from the host. Each forwarded port becomes
+  reachable by any process on the Mac at `127.0.0.1`, for as long as the VM
+  runs. It is opt-in per port, fixed at create time, warned about once, and
+  recorded in the instance summary — but it is still the one place this design
+  gives something back.
+- **`--docker` puts the guest user in the `docker` group**, which is
+  root-equivalent on that guest. It changes nothing about the threat model,
+  because that user already has passwordless sudo, but it is worth knowing it
+  is there.
 - **The interactive session is not scrubbed.** `agentbox run` checks its
   output for token fragments before reporting success; `agentbox claude` hands
   you the terminal and cannot.

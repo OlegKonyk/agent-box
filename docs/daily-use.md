@@ -192,6 +192,154 @@ decision rather than a convenience — but it is worth knowing that it happened,
 because it means a repository's own plugin declarations do take effect in
 there.
 
+## Running an application stack
+
+Only on an instance created with `--docker`. On any other, `docker` is simply
+not installed — the profile is fixed when the VM is made.
+
+```
+./bin/agentbox create ~/dev/my-app --docker --forward 3000
+./bin/agentbox shell  ~/dev/my-app
+```
+
+Inside, it is ordinary Docker. The daemon is rootful, the guest user owns the
+socket, and `docker compose` is the v2 plugin:
+
+```
+cd /work
+docker compose up -d
+docker compose ps
+docker compose logs -f web
+docker compose down
+```
+
+**Ports.** Publish on `127.0.0.1` inside the guest and the stack is reachable
+at `127.0.0.1:PORT` in there, which is all a test running in the guest needs.
+To open the page in a browser on the Mac, the port must also have been named at
+create time:
+
+```
+ports:
+  - "127.0.0.1:3000:3000"     # in compose.yaml, inside the guest
+```
+
+```
+./bin/agentbox create ~/dev/my-app --docker --forward 3000
+```
+
+`--forward` is fixed at create time on purpose, and it is the one widening in
+the whole design: that guest port becomes reachable by any process on your Mac
+for as long as the VM runs. Forward the ports you actually want to look at, not
+a range.
+
+**What containers can and cannot reach.** The same allowlist as the guest, and
+that is enforced rather than assumed: `AGENTBOX-FWD` is jumped to from
+`DOCKER-USER` rule 1, before any of Docker's own rules. So:
+
+| From a container | Result |
+|---|---|
+| another container on the same user-defined network | works, by service name |
+| a published port, from the guest or the host | works |
+| an allowlisted host — the model API, GitHub, npm, PyPI | works |
+| Docker Hub, ghcr.io, `download.docker.com` | works; that is how images are pulled |
+| anything else | rejected immediately, the same as from the guest |
+
+`agentbox firewall-check <repo>` proves it each time it runs: it makes sure
+`alpine:3` is present, pulling it through the allowlist if it is not, and then
+checks that a container cannot reach `example.com` and can reach
+`api.anthropic.com`. On an instance without Docker those three checks print
+`SKIP` with the reason, rather than quietly passing.
+
+**Rosetta, for amd64 images.** `--rosetta` at create time, and then
+`docker run --platform linux/amd64 …` works on Apple silicon. It needs Rosetta
+2 installed on the Mac; if Lima sits at "Installing rosetta" for more than a
+minute, run `softwareupdate --install-rosetta` on the host and try again.
+Translated containers are slower than native ones — reach for it when an image
+has no arm64 build, not by default.
+
+**Disk hygiene.** `--docker` raises the default disk to 60GiB, and images,
+layers and the build cache all live on it. A long-running instance fills up:
+
+```
+docker system df                 # what is using it
+docker system prune -f           # stopped containers, unused networks, dangling images
+docker system prune -af --volumes  # everything not currently in use. Blunt.
+```
+
+If that is not enough, grow the disk rather than rebuilding the VM:
+
+```
+./bin/agentbox resize ~/dev/my-app --disk 100GiB
+```
+
+It stops the VM if it is running and starts it again afterwards. The disk can
+only grow; `--cpus` and `--memory` go either way.
+
+## Browser and API tests
+
+Only on an instance created with `--playwright`, which installs Node 22 and the
+system libraries the browsers link against — the `libnss3`, `libatk`, font and
+graphics packages that `npx playwright install-deps` pulls in.
+
+**Browsers are not baked into the image.** Each repository's own Playwright
+version downloads the builds it was pinned against, on first use, from
+`cdn.playwright.dev`, which is on the allowlist. So the first test run in a
+fresh VM spends a minute or two downloading Chromium and then never does it
+again. That is deliberate: baking in one set would be the wrong set for most
+repositories and would double every instance's disk footprint.
+
+**If that download is refused, retry it before you debug it.** The allowlist
+holds addresses, not names, and `cdn.playwright.dev` is an Azure Front Door
+endpoint that answers with a single address on a near-zero TTL. The firewall
+resolves it through the system resolver as well as `dig` on every rebuild,
+which is normally enough — but a download can still land on an address that was
+not in the set at that moment and be rejected outright.
+`agentbox firewall-check <repo>` forces a rebuild and refreshes the set, which
+is the quickest fix; `PLAYWRIGHT_DOWNLOAD_HOST` pointed at a mirror you control
+is the durable one. The full explanation is in `docs/decisions.md`.
+
+Node:
+
+```
+cd /work
+npm ci
+npx playwright install chromium     # or `install` for all three engines
+npx playwright test
+```
+
+Python:
+
+```
+python3 -m venv ~/.venvs/my-app     # NOT inside /work — see the friction list
+. ~/.venvs/my-app/bin/activate
+pip install pytest-playwright
+playwright install chromium
+pytest
+```
+
+**Headless only.** There is no display in the guest and none is wanted:
+`--headed`, `--ui` and `npx playwright show-report` have nothing to draw on.
+What you get instead is the artefacts, and they should be written under `/work`
+so they cross to the host and can be opened there:
+
+```
+npx playwright test --trace on --output /work/test-results
+```
+
+Then, on the Mac: `npx playwright show-trace ~/dev/my-app/test-results/.../trace.zip`.
+Screenshots, videos and traces all work this way; the report is HTML and opens
+in a host browser.
+
+**The app under test needs no allowlist entry.** It is running inside the same
+guest — a container on a Docker network, or a process on `127.0.0.1` — and
+neither path leaves the machine, so neither is filtered. What *does* need an
+entry is anything the app itself calls out to: a staging API, an OAuth
+provider, a payment sandbox, an S3 bucket, a CDN the page loads a font from. A
+test that fails with a connection refused inside the guest while
+`agentbox firewall-check` still passes is almost always one of those. Add the
+name to `~/.config/agent-box/guest/allowlist.local`, one per line, and re-run
+`agentbox firewall-check` — the rebuild picks it up.
+
 ## Keeping the CLI current
 
 Background self-update is off in the guest (`DISABLE_AUTOUPDATER=1`), so a run
@@ -230,11 +378,13 @@ None of these is broken. They are the shape of the thing.
   there. Keep environment directories out of the shared tree, or give each
   side a distinct name (`.venv-host` on the host, say), and expect to
   recreate the host's environment after a run that touched it.
-- **The app under test needs an allowlist entry.** So does anything a browser
-  test talks to: a Playwright download host, a staging API, an internal package
-  mirror. They go in `guest/allowlist.local`, one name per line. The symptom of
-  a missing one is a connection refused inside the guest while
-  `agentbox firewall-check` still passes.
+- **What a test talks to needs an allowlist entry; the app itself does not.**
+  An app running inside the guest — a container, or a process on `127.0.0.1` —
+  is reachable with no rule at all, because that traffic never leaves the
+  machine. A staging API, an OAuth provider, an internal package mirror or a
+  font CDN the page loads does need one. They go in `guest/allowlist.local`,
+  one name per line. The symptom of a missing one is a connection refused
+  inside the guest while `agentbox firewall-check` still passes.
 - **A first boot that cannot reach GitHub installs no plugins.** A host simply
   off the allowlist fails fast, because the ruleset ends in REJECT. The slow
   cases are the other ones: GitHub accepting a connection and then not
