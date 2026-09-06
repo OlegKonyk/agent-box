@@ -64,11 +64,22 @@ FIREWALL="unknown"
 FIREWALL_DETAIL=""
 if MODE_LINE=$("${ABX_LIB_DIR}/egress-mode.sh" 2>/dev/null); then
     _live=$(printf '%s' "$MODE_LINE" | sed -n 's/.*live=\([a-z]*\).*/\1/p')
+    _agree=$(printf '%s' "$MODE_LINE" | sed -n 's/.*agree=\([a-z]*\).*/\1/p')
     FIREWALL_DETAIL=$(printf '%s' "$MODE_LINE" | sed -n 's/.*detail=//p')
-    if [ -n "$FIREWALL_DETAIL" ]; then
-        FIREWALL="unknown"
-    else
+    # A DISAGREEMENT is unknown. A detail on its own is not: a box with no mode
+    # file has an unambiguous ruleset and something worth mentioning, and
+    # reporting `unknown` about it would be less true rather than more careful.
+    if [ "${_agree:-no}" = "yes" ]; then
         FIREWALL="${_live:-unknown}"
+        # And the JSON carries no detail in this case, even when the reader had
+        # something to say. The contract is that `firewall_detail` appears only
+        # when the mode is unknown or the two sources conflict; a note about a
+        # missing mode file is information for a person, and it is printed by
+        # `agentbox egress` where a person is reading. Putting it in the
+        # contract would make a healthy box look like it had a problem.
+        FIREWALL_DETAIL=""
+    else
+        FIREWALL="unknown"
     fi
 fi
 

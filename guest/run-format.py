@@ -968,27 +968,24 @@ def cmd_box_json(args):
     if sessions is not None:
         sessions = _clean_sessions(sessions)
     runid = newest_runid()
-    print(
-        json.dumps(
-            scrub_obj(
-                {
-                    "claude_version": args.claude_version or None,
-                    "firewall": args.firewall or "unknown",
-                    # Empty when the mode file and the live ruleset agree.
-                    # Non-empty means `firewall` is "unknown" and this says
-                    # which two things disagreed, so a reader is never left
-                    # with an unexplained unknown.
-                    "firewall_detail": args.firewall_detail or None,
-                    "run": Run(runid).status_object() if runid else None,
-                    "runs_total": len(all_runids()),
-                    # null, not [], when it could not be read: see
-                    # _sessions_or_none.
-                    "sessions": sessions,
-                }
-            ),
-            separators=(",", ":"),
-        )
-    )
+    obj = {
+        "claude_version": args.claude_version or None,
+        "firewall": args.firewall or "unknown",
+        "run": Run(runid).status_object() if runid else None,
+        "runs_total": len(all_runids()),
+        # null, not [], when it could not be read: see _sessions_or_none.
+        "sessions": sessions,
+    }
+    # PRESENT ONLY when there is something to say: the mode is unknown, or the
+    # mode file and the live ruleset disagree. Not `null` on a healthy box.
+    #
+    # The distinction is the contract's, and it is worth keeping: every other
+    # nullable key here means "this fact was asked for and is unavailable", so
+    # a null `firewall_detail` on a box that is working reads as a fourth
+    # unknown rather than as nothing to report. Absent means agreed.
+    if args.firewall_detail:
+        obj["firewall_detail"] = args.firewall_detail
+    print(json.dumps(scrub_obj(obj), separators=(",", ":")))
     return 0
 
 

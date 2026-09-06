@@ -96,7 +96,38 @@ read_egress_mode() {
             printf 'deny' ;;
     esac
 }
-EGRESS_MODE=$(read_egress_mode)
+# `--mode <m>` overrides the file for THIS run only, and nothing writes the
+# file. That is what makes `agentbox egress` transactional: the new mode is
+# applied and verified first, and the file is written only once it has held.
+# Writing the file first and rebuilding second left a failed change armed —
+# the CLI reported that nothing had happened and the 15-minute timer applied it
+# a quarter of an hour later.
+# Scanned rather than positional, so `--mode X --verify-only` means what it
+# reads as. `--verify-only` used to be tested as `$1` alone, which made the
+# order load-bearing in a way nothing said.
+EGRESS_MODE_OVERRIDE=""
+ABX_VERIFY_ONLY=0
+ABX_DOCKER_HOOK=0
+for _i in "$@"; do
+    case "${_prev:-}" in
+        --mode) EGRESS_MODE_OVERRIDE="$_i" ;;
+    esac
+    case "$_i" in
+        --verify-only) ABX_VERIFY_ONLY=1 ;;
+        --docker-hook) ABX_DOCKER_HOOK=1 ;;
+    esac
+    _prev="$_i"
+done
+unset _prev
+if [ -n "$EGRESS_MODE_OVERRIDE" ]; then
+    case "$EGRESS_MODE_OVERRIDE" in
+        deny|observe|open) ;;
+        *) log "ERROR: --mode expects deny, observe or open, got '${EGRESS_MODE_OVERRIDE}'" >&2; exit 2 ;;
+    esac
+    EGRESS_MODE="$EGRESS_MODE_OVERRIDE"
+else
+    EGRESS_MODE=$(read_egress_mode)
+fi
 
 # dnsmasq answers on loopback and feeds the set as it resolves. See the
 # resolver section below and docs/decisions.md.
@@ -290,10 +321,23 @@ DOCKER_BRIDGE_DEFAULT="172.17.0.1"
 # container on the box would be unable to resolve anything. When Docker is
 # installed, its default address is used whether or not the interface has
 # appeared, and `bind-dynamic` (see the config) binds to it when it does.
+# ONE author. daemon.json's `dns` is what containers are actually told to use,
+# so that file is the source of truth and this reads it rather than deriving the
+# same value a second way. Two independent derivations of "the container
+# resolver address" can disagree, and the failure when they do is silent: the
+# firewall permits one address and containers query another.
+DOCKER_DAEMON_JSON="${AGENT_BOX_DOCKER_DAEMON_JSON:-/etc/docker/daemon.json}"
 docker_bridge_addr() {
-    local a
-    a=$(ip -4 -o addr show dev docker0 2>/dev/null \
-        | awk 'NR == 1 { print $4 }' | cut -d/ -f1 || true)
+    local a=""
+    if [ -r "$DOCKER_DAEMON_JSON" ] && command -v jq >/dev/null 2>&1; then
+        a=$(jq -r '.dns[0] // empty' "$DOCKER_DAEMON_JSON" 2>/dev/null || true)
+    fi
+    # Falling back rather than failing: a box whose daemon.json has no `dns`
+    # (an older one, or one an operator edited) still needs an address here.
+    if [ -z "$a" ]; then
+        a=$(ip -4 -o addr show dev docker0 2>/dev/null \
+            | awk 'NR == 1 { print $4 }' | cut -d/ -f1 || true)
+    fi
     if [ -z "$a" ] && docker_installed; then
         a="$DOCKER_BRIDGE_DEFAULT"
     fi
@@ -689,12 +733,27 @@ verify() {
             conf_ok=0
         fi
         # The two protections that decide what an answer may put in the set.
-        for opt in stop-dns-rebind max-cache-ttl; do
-            if ! grep -qE "^${opt}(=|\$)" "$DNSMASQ_CONF" 2>/dev/null; then
-                log "FAIL  resolver-conf      ${DNSMASQ_CONF} is missing ${opt}"
-                conf_ok=0
-            fi
-        done
+        # The VALUES, not merely the presence of the words. `max-cache-ttl=99999`
+        # satisfies a presence check and breaks the one relationship the feed
+        # depends on, and a `rebind-domain-ok=*` next to `stop-dns-rebind`
+        # switches the protection off for everything while leaving the line
+        # that appears to enable it.
+        local mct
+        mct=$(sed -n 's/^max-cache-ttl=//p' "$DNSMASQ_CONF" 2>/dev/null | head -1)
+        if [ -z "$mct" ]; then
+            log "FAIL  resolver-conf      ${DNSMASQ_CONF} is missing max-cache-ttl"
+            conf_ok=0
+        elif ! [ "$mct" -lt "$RESOLVED_TTL" ] 2>/dev/null; then
+            log "FAIL  resolver-conf      max-cache-ttl=${mct} is not below the entry lifetime ${RESOLVED_TTL}; a host can go dark silently"
+            conf_ok=0
+        fi
+        if ! grep -qE '^stop-dns-rebind([[:space:]]|$)' "$DNSMASQ_CONF" 2>/dev/null; then
+            log "FAIL  resolver-conf      ${DNSMASQ_CONF} is missing stop-dns-rebind"
+            conf_ok=0
+        elif grep -qE '^rebind-domain-ok=(\*|/\*/)?$' "$DNSMASQ_CONF" 2>/dev/null; then
+            log "FAIL  resolver-conf      rebind-domain-ok exempts everything, so stop-dns-rebind protects nothing"
+            conf_ok=0
+        fi
         if [ "$conf_ok" -eq 1 ]; then
             log "PASS  resolver-conf      dnsmasq reads only our file, its feed matches the allowlist, and it parses"
             failures=$((failures + 0))
@@ -860,7 +919,7 @@ verify() {
 
 # `iptables -S` needs CAP_NET_ADMIN, so verification is a root operation too.
 # `agentbox firewall-check` runs this under sudo for that reason.
-if [ "${1:-}" = "--verify-only" ]; then
+if [ "$ABX_VERIFY_ONLY" -eq 1 ]; then
     if [ "$(id -u)" -ne 0 ]; then
         log "ERROR: --verify-only must run as root (it reads the ruleset)" >&2
         exit 1
@@ -1000,7 +1059,7 @@ docker_hook() {
     return "$HOOK_RC"
 }
 
-if [ "${1:-}" = "--docker-hook" ]; then
+if [ "$ABX_DOCKER_HOOK" -eq 1 ]; then
     # The same lock the rebuild takes, so the hook cannot append to
     # AGENTBOX-FWD while a restore is replacing it. A shorter wait than the
     # rebuild's, and it proceeds anyway on a timeout: this runs as docker's
@@ -1072,8 +1131,32 @@ _close_and_exit() {
     # ruleset was right; the sentence was false, which is worse than either.
     case "$EGRESS_MODE" in
         open)
-            log "ERROR: ${reason}; the mode is 'open', so the unfiltered ruleset is left as it is" >&2
-            log "Nothing has been closed. Fix the cause and re-run 'agentbox firewall-check'." >&2
+            # "Left as it is" assumes there is something to leave. On the first
+            # rebuild of an `open` box there is not: the chains have never been
+            # built, INPUT is whatever the kernel started with, and claiming
+            # nothing was closed would be true about egress and wrong about the
+            # box — it would be wide open inbound as well, which no mode asks
+            # for. INPUT is DROP in every mode, so it is placed here.
+            if chain_exists iptables "$CHAIN_IN" && [ -n "$(first_rule iptables "$CHAIN_IN")" ]; then
+                log "ERROR: ${reason}; the mode is 'open', so the unfiltered egress ruleset is left as it is" >&2
+                log "Nothing has been closed. Fix the cause and re-run 'agentbox firewall-check'." >&2
+                exit "$rc"
+            fi
+            log "ERROR: ${reason}; the mode is 'open' and no ruleset has ever been built, so inbound is being closed" >&2
+            log "Egress is left unfiltered, as 'open' asks. Only the way IN is being shut." >&2
+            ensure_chain iptables "$CHAIN_IN" 2>/dev/null || true
+            iptables -w "$IPT_WAIT" -F "$CHAIN_IN" 2>/dev/null || true
+            iptables -w "$IPT_WAIT" -A "$CHAIN_IN" -i lo -j ACCEPT 2>/dev/null || true
+            iptables -w "$IPT_WAIT" -A "$CHAIN_IN" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+            _ogw=$(ip route 2>/dev/null | awk '/^default/ && !seen { print $3; seen = 1 }')
+            if [ -n "${_ogw:-}" ]; then
+                iptables -w "$IPT_WAIT" -A "$CHAIN_IN" -s "${_ogw}/32" -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
+            else
+                iptables -w "$IPT_WAIT" -A "$CHAIN_IN" -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
+            fi
+            ensure_jump_first iptables INPUT "$CHAIN_IN" 2>/dev/null || true
+            iptables -w "$IPT_WAIT" -P INPUT DROP 2>/dev/null || true
+            log "Inbound is closed; ssh from the host still works." >&2
             exit "$rc"
             ;;
         observe)
@@ -1242,12 +1325,19 @@ classify_allowlist_line() {
             else
                 printf 'bad'
             fi ;;
-        \*.*)
-            printf 'suffix' ;;
-        .*)
-            printf 'suffix' ;;
+        \*.*|.*)
+            # The same hostname grammar as an exact name, applied to what is
+            # left after the dot. `.exa mple..com` reached dnsmasq unchecked
+            # before, and a line dnsmasq rejects is a resolver that will not
+            # start — one bad character in allowlist.local taking the box's
+            # name resolution with it. A bad line never reaches the file.
+            if valid_hostname "$(suffix_domain "$t")"; then
+                printf 'suffix'
+            else
+                printf 'bad'
+            fi ;;
         *)
-            if printf '%s' "$t" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'; then
+            if valid_hostname "$t"; then
                 printf 'name'
             else
                 printf 'bad'
@@ -1259,6 +1349,19 @@ classify_allowlist_line() {
 # dnsmasq, which wants the bare domain.
 suffix_domain() {
     printf '%s' "${1#\*}" | sed 's/^\.//'
+}
+
+# A real hostname: labels of letters, digits and hyphens, not starting or
+# ending with a hyphen, joined by SINGLE dots.
+#
+# The looser pattern this replaces allowed a dot anywhere in the middle, so
+# `example..com` passed — and it passed because whitespace is stripped from
+# every line before validation, which turns `.exa mple..com` into something
+# that then looks almost plausible. An empty label is not a hostname, and the
+# check that is supposed to stop a bad line reaching dnsmasq has to know that.
+valid_hostname() {
+    printf '%s' "${1:-}" \
+        | grep -qE '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$'
 }
 
 [ -f "$ALLOWLIST_BASE" ] || die_fw "allowlist not found at ${ALLOWLIST_BASE}"
@@ -1375,14 +1478,36 @@ printf '%s\n' "$RESOLVERS" | sed 's/^/  /'
 # has always had. Giving it a default timeout was the first design; it made
 # `ipset create -exist` fail against a set an older box already had without one,
 # and the ERR trap turned that into a hard close on upgrade.
-ipset create "$IPSET_NAME" hash:net -exist
+# `-exist` is a no-op only when the existing set has the SAME parameters. It is
+# an error when they differ, and both directions have now happened on real
+# boxes: a set built before the timeout was introduced, and a set built during
+# the window when the main set carried one. Under the ERR trap either is a
+# rebuild failure that hard-closes the guest on upgrade, for a set that could
+# simply have been migrated.
+#
+# `ipset swap` carries the new header across and works between sets of the same
+# TYPE whatever their parameters, so a temp set is all the migration needs.
+ensure_set() {
+    local name="${1:?}" ; shift
+    if ipset create "$name" "$@" -exist 2>/dev/null; then
+        return 0
+    fi
+    log "Set ${name} exists with different parameters; migrating it"
+    local mig="${name}-migrate"
+    ipset destroy "$mig" 2>/dev/null || true
+    ipset create "$mig" "$@"
+    ipset swap "$mig" "$name"
+    ipset destroy "$mig"
+}
+
+ensure_set "$IPSET_NAME" hash:net
 ipset destroy "$IPSET_TMP" 2>/dev/null || true
 ipset create "$IPSET_TMP" hash:net
 
 # The resolver's set. Created if absent and otherwise left exactly alone: the
 # rebuild must never swap it, copy it, or clear it except when the suffix list
 # itself changes, which is handled after the config is written.
-ipset create "$IPSET_RESOLVED" hash:net timeout "$RESOLVED_TTL" -exist
+ensure_set "$IPSET_RESOLVED" hash:net timeout "$RESOLVED_TTL"
 
 log "Fetching GitHub IP ranges from ${GH_META_URL}..."
 gh_ranges=$(curl -sS -m 20 "$GH_META_URL" || true)
@@ -1744,9 +1869,17 @@ done
     #
     # Narrow on purpose: only from the bridge, only to the bridge address, only
     # port 53. It does not open the guest to the container for anything else.
+    #
+    # From EVERY docker bridge, not only docker0. A container on a user-defined
+    # network — which is every `docker compose` project — arrives on a `br-<id>`
+    # interface, so `-i docker0` alone left compose stacks with no DNS at all
+    # while the default bridge worked, which is the shape of bug that gets
+    # blamed on the application.
     if [ -n "$DNSMASQ_BRIDGE" ]; then
-        printf -- '-A %s -i docker0 -d %s/32 -p udp --dport 53 -j ACCEPT\n' "$CHAIN_IN" "$DNSMASQ_BRIDGE"
-        printf -- '-A %s -i docker0 -d %s/32 -p tcp --dport 53 -j ACCEPT\n' "$CHAIN_IN" "$DNSMASQ_BRIDGE"
+        for _in in docker0 'br+'; do
+            printf -- '-A %s -i %s -d %s/32 -p udp --dport 53 -j ACCEPT\n' "$CHAIN_IN" "$_in" "$DNSMASQ_BRIDGE"
+            printf -- '-A %s -i %s -d %s/32 -p tcp --dport 53 -j ACCEPT\n' "$CHAIN_IN" "$_in" "$DNSMASQ_BRIDGE"
+        done
     fi
 
     # --- the guest's own egress -------------------------------------------

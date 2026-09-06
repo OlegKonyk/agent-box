@@ -1637,6 +1637,14 @@ if jq -e '.boxes[0] | .firewall == "deny"' "$STATUSJ" >/dev/null 2>&1; then
 else
     bad "status --json does not report the egress mode as deny"
 fi
+# Present only when there is something to say. `null` on a healthy box would
+# read as a fourth unknown rather than as nothing to report, because every
+# other nullable key in this object means "asked for and unavailable".
+if jq -e '.boxes[0] | has("firewall_detail") | not' "$STATUSJ" >/dev/null 2>&1; then
+    ok "and firewall_detail is absent on a healthy box, not null"
+else
+    bad "firewall_detail is present on a healthy box: $(jq -c '.boxes[0].firewall_detail' "$STATUSJ" 2>/dev/null)"
+fi
 if jq -e '.boxes[0] | has("name") and has("instance") and has("repo") and has("state") and has("claude_version") and has("run") and has("runs_total") and has("sessions")' "$STATUSJ" >/dev/null 2>&1; then
     ok "status --json carries every documented key"
 else
@@ -1701,6 +1709,13 @@ if jq -e --arg n "$INSTANCE" '.boxes[] | select(.instance == $n) | .state == "ru
     ok "and it is reported as running with firewall unknown"
 else
     bad "a running box with a broken status script is not reported as running/unknown"
+fi
+# The other half of the presence rule: whenever the mode is unknown, the key is
+# there and says why. An unexplained unknown is the thing this avoids.
+if jq -e --arg n "$INSTANCE" '.boxes[] | select(.instance == $n) | (.firewall_detail // "") | length > 0' "$BROKENJ" >/dev/null 2>&1; then
+    ok "and firewall_detail says why it is unknown"
+else
+    bad "firewall is unknown with no firewall_detail to explain it"
 fi
 
 BROKENT="${TMP_ROOT}/status-broken.txt"
@@ -3389,6 +3404,126 @@ fi
 "$AGENTBOX" egress "$CLEAN_REPO" deny >/dev/null 2>&1 || true
 
 # ===========================================================================
+step "9h. the live reading, and a mode change that has to be all or nothing"
+# ===========================================================================
+#
+# Two things one box can prove and the host's own record cannot.
+#
+# The mode every reporter shows must come from the RULESET. Planting a
+# disagreement — the file saying one thing, the kernel doing another — is the
+# only way to tell a reader that reads the ruleset from one that reads the file
+# and is right by luck. The host's record cannot know the difference.
+
+printf -- '--- a planted disagreement is reported, not believed ---\n'
+DISAGREE_OUT="${TMP_ROOT}/disagree.out"
+# shellcheck disable=SC2016  # the expansion is the guest's, not this shell's.
+guest sudo bash -c '
+cp /etc/agent-box/egress-mode /tmp/abx-mode.bak
+printf "open\n" > /etc/agent-box/egress-mode
+echo "FILE_NOW=$(cat /etc/agent-box/egress-mode)"' > "$DISAGREE_OUT" 2>&1
+cat "$DISAGREE_OUT"
+
+DIS_CLI="${TMP_ROOT}/disagree-cli.out"
+"$AGENTBOX" egress "$CLEAN_REPO" > "$DIS_CLI" 2>&1 || true
+cat "$DIS_CLI"
+if grep -qx 'unknown' "$DIS_CLI"; then
+    ok "agentbox egress reports unknown when the file and the ruleset disagree"
+else
+    bad "agentbox egress believed one of the two: $(head -1 "$DIS_CLI")"
+fi
+if grep -q "mode file says 'open'" "$DIS_CLI" && grep -q "ruleset is 'deny'" "$DIS_CLI"; then
+    ok "and it names both, so the reader can tell which to fix"
+else
+    bad "the disagreement was not explained"
+fi
+
+DIS_JSON="${TMP_ROOT}/disagree.json"
+"$AGENTBOX" status "$CLEAN_REPO" --json > "$DIS_JSON" 2>/dev/null || true
+if jq -e '.boxes[0].firewall == "unknown"' "$DIS_JSON" >/dev/null 2>&1 \
+    && jq -e '.boxes[0] | has("firewall_detail")' "$DIS_JSON" >/dev/null 2>&1; then
+    ok "status --json reports unknown with a detail on a disagreeing box"
+else
+    bad "status --json did not report the disagreement"
+    cat "$DIS_JSON"
+fi
+
+# The banner, in the place an operator is about to set an agent going. `run`
+# without a token stops at the token check, which is after the banner.
+DIS_RUN="${TMP_ROOT}/disagree-run.out"
+printf 'Do nothing.\n' > "${TMP_ROOT}/dis-brief.md"
+run_bounded 240 "$DIS_RUN" "$AGENTBOX" run "$CLEAN_REPO" "${TMP_ROOT}/dis-brief.md" --wait
+cat "$DIS_RUN"
+if grep -q 'egress mode: UNKNOWN' "$DIS_RUN"; then
+    ok "run says so on its first line, where somebody is about to start an agent"
+else
+    bad "run did not warn about the disagreement"
+fi
+
+guest sudo cp /tmp/abx-mode.bak /etc/agent-box/egress-mode
+if [ "$("$AGENTBOX" egress "$CLEAN_REPO" 2>/dev/null)" = "deny" ]; then
+    ok "and the reading is right again once the file is put back"
+else
+    bad "the mode did not read correctly after the file was restored"
+fi
+
+printf -- '\n--- a mode change that fails leaves nothing armed ---\n'
+# Writing the mode file first and rebuilding second left a failed change armed:
+# the CLI said nothing had happened and the 15-minute timer applied it a
+# quarter of an hour later.
+#
+# The rebuild is made to fail through /etc/hosts rather than through the unit's
+# environment, and the difference matters: `agentbox egress` now runs the script
+# directly with `--mode`, so a systemd drop-in on the unit would not be read and
+# the "failure" would quietly succeed. glibc consults /etc/hosts before DNS, so
+# this reaches the curl the rebuild actually makes.
+ARMED_OUT="${TMP_ROOT}/armed.out"
+guest sudo bash -c '
+cp /etc/hosts /tmp/abx-hosts.bak
+printf "127.0.0.1 api.github.com\n" >> /etc/hosts
+echo BREAK_OK' > "$ARMED_OUT" 2>&1
+cat "$ARMED_OUT"
+if grep -q '^BREAK_OK' "$ARMED_OUT"; then
+    ok "the rebuild was really made to fail, so the checks below are not vacuous"
+else
+    bad "could not break the rebuild; the checks below would prove nothing"
+fi
+
+FAILCHANGE="${TMP_ROOT}/failchange.out"
+run_bounded 300 "$FAILCHANGE" "$AGENTBOX" egress "$CLEAN_REPO" observe
+fc_rc=$BOUNDED_RC
+cat "$FAILCHANGE"
+if [ "$fc_rc" -ne 0 ]; then
+    ok "a mode change whose rebuild fails exits non-zero"
+else
+    bad "a failing mode change reported success"
+fi
+ARMED_STATE="${TMP_ROOT}/armed-state.out"
+# shellcheck disable=SC2016  # the expansion is the guest's, not this shell's.
+guest sudo bash -c '
+echo "MODE_FILE=$(cat /etc/agent-box/egress-mode)"
+echo "LIVE=$(/opt/agent-box/guest/egress-mode.sh)"
+cp /tmp/abx-hosts.bak /etc/hosts' > "$ARMED_STATE" 2>&1
+cat "$ARMED_STATE"
+if grep -qx 'MODE_FILE=deny' "$ARMED_STATE"; then
+    ok "the guest mode file was NOT left holding the mode that failed"
+else
+    bad "a failed change left '$(sed -n 's/^MODE_FILE=//p' "$ARMED_STATE")' armed for the timer to apply"
+fi
+if grep -qx 'egress=deny' "${AGENT_BOX_CONFIG_DIR}/instances/${INSTANCE}" 2>/dev/null; then
+    ok "and the host record still says the mode the box is actually on"
+else
+    bad "the host record and the box disagree after a failed change"
+fi
+# The ruleset too, not just the two records: a revert that wrote the files and
+# left the kernel on the new mode would satisfy everything above.
+if grep -q '^LIVE=live=deny' "$ARMED_STATE"; then
+    ok "and the live ruleset is back on the previous mode"
+else
+    bad "the live ruleset was left on the mode that failed: $(sed -n 's/^LIVE=//p' "$ARMED_STATE")"
+fi
+guest sudo systemctl restart agent-box-firewall.service >/dev/null 2>&1 || true
+
+# ===========================================================================
 step "10. destroy the instance, by bare name"
 # ===========================================================================
 #
@@ -4093,8 +4228,30 @@ echo \"SET_BEFORE=\$(sudo ipset save ${IPSET_RESOLVED_NAME} | grep -c '^add ' ||
 docker run --rm alpine:3 nslookup ${SUFFIX_HOST} >/dev/null 2>&1 || true
 sleep 2
 echo \"SET_AFTER=\$(sudo ipset save ${IPSET_RESOLVED_NAME} | grep -c '^add ' || true)\"
-docker run --rm alpine:3 wget -T 8 -q -O /dev/null https://${SUFFIX_HOST}/ 2>&1 | tail -1
-echo \"CONTAINER_FETCH=\$?\"
+# The status of the wget, not of the tail that was reading its output. A bare
+# dollar-question after a pipeline is the LAST command status, so the old form
+# read tail exit status, which is 0 whatever the container did: the assertion
+# could not fail.
+out=\$(docker run --rm alpine:3 wget -T 8 -q -O /dev/null https://${SUFFIX_HOST}/ 2>&1); rc=\$?
+printf '%s\\n' \"\$out\" | tail -1
+echo \"CONTAINER_FETCH=\$rc\"
+
+# And an OFF-list host must fail for the firewall's reason, not because DNS
+# broke. busybox says 'bad address' when it could not resolve and
+# 'can't connect' or 'Connection refused' when the packet was refused; only the
+# second proves the allowlist did the work, and reading them as the same thing
+# would let a total DNS outage pass as containment.
+oout=\$(docker run --rm alpine:3 wget -T 8 -q -O /dev/null https://example.com/ 2>&1); orc=\$?
+echo \"OFFLIST_RC=\$orc\"
+if printf '%s' \"\$oout\" | grep -qi 'bad address'; then
+    echo 'OFFLIST_REASON=dns'
+elif printf '%s' \"\$oout\" | grep -qiE \"can't connect|refused|unreachable|prohibited\"; then
+    echo 'OFFLIST_REASON=refused'
+elif [ \"\$orc\" -eq 0 ]; then
+    echo 'OFFLIST_REASON=reached'
+else
+    echo \"OFFLIST_REASON=other: \$(printf '%s' \"\$oout\" | tr '\\n' ' ')\"
+fi
 "
 cat "$CDNS_OUT"
 if grep -qE '^CONTAINER_RESOLV=172\.' "$CDNS_OUT"; then
@@ -4111,6 +4268,15 @@ if grep -q '^CONTAINER_FETCH=0' "$CDNS_OUT"; then
     ok "and the container then reaches the suffix-matched host"
 else
     bad "the container could not reach the suffix-matched host"
+fi
+if grep -q '^OFFLIST_REASON=refused' "$CDNS_OUT"; then
+    ok "an off-list host is refused for the firewall's reason, not a DNS failure"
+elif grep -q '^OFFLIST_REASON=dns' "$CDNS_OUT"; then
+    bad "the off-list host failed to RESOLVE; that is not containment, it is broken DNS"
+elif grep -q '^OFFLIST_REASON=reached' "$CDNS_OUT"; then
+    bad "a container reached an off-list host"
+else
+    bad "the off-list probe was inconclusive: $(sed -n 's/^OFFLIST_REASON=//p' "$CDNS_OUT")"
 fi
 
 printf -- '\n--- a real pull from ghcr.io, not just a reachable /v2/ ---\n'

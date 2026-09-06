@@ -207,6 +207,12 @@ file that records what was asked for. When the two disagree the answer is
 `unknown`, with a `firewall_detail` saying what each of them said — which is
 the honest answer to "which of these should I believe".
 
+`firewall_detail` is **present only when there is something to say**: the mode
+is `unknown`, or the file and the ruleset disagree. On a healthy box the key is
+absent, not null. Every other nullable key in that object means "this was asked
+for and is unavailable", so a null here would read as a fourth unknown rather
+than as nothing to report.
+
 Changing the mode rebuilds the firewall immediately and prints the
 verification, so the answer to "did that take" is on the screen. `open` prints
 a warning naming what it gives up. The mode appears in the create summary, in
