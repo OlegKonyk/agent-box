@@ -43,6 +43,30 @@ listed rather than debugged" in `docs/daily-use.md`.
 npm test
 ```
 
+If the task needs the application running — only on a VM created with
+`--docker` — say so as commands rather than as an aspiration, and say how the
+agent knows the stack is up. "Start the app" is a guess; the four lines below
+are not. Bring it down at the end, whatever happened, so a failed run does not
+leave a stack holding the port and the disk.
+
+```
+docker compose up -d
+timeout 120 sh -c 'until curl -sf http://127.0.0.1:3000/health; do sleep 2; done'
+npx playwright test --trace on --output /work/test-results
+docker compose down          # in a trap, or as the last step either way
+```
+
+Three things worth naming in the brief itself:
+
+- Tests are **headless**. There is no display in the guest, so `--headed` and
+  `--ui` do nothing useful. Traces, screenshots and videos are the evidence,
+  and they must be written under `/work` to reach the host at all.
+- The first Playwright run in a fresh VM **downloads its browsers**, which
+  takes a minute or two. That is not a hang.
+- Anything the app calls out to needs an allowlist entry; the app itself does
+  not. If the brief expects a third-party sandbox to answer, name it here so
+  whoever runs this knows to add it before starting.
+
 ## Out of scope
 
 The things that look adjacent and are not wanted. Being explicit here is

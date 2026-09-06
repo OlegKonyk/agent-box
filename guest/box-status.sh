@@ -57,7 +57,10 @@ fi
 # still in force. `unknown` when the ruleset cannot be read at all, which is
 # honest — this command must never claim `drop` it did not see.
 FIREWALL="unknown"
-if POLICY=$(sudo -n iptables -S 2>/dev/null | grep -- '-P OUTPUT'); then
+# `-w`: a rebuild can hold the xtables lock for a stretch, and iptables 1.8
+# without it exits non-zero rather than waiting — which would report `unknown`
+# on a perfectly healthy box every time `status --watch` landed on a rebuild.
+if POLICY=$(sudo -n iptables -w 5 -S 2>/dev/null | grep -- '-P OUTPUT'); then
     case "$POLICY" in
         *DROP*) FIREWALL="drop" ;;
         *)      FIREWALL="open" ;;

@@ -252,8 +252,12 @@ So the new state is built beside the old one and swapped in:
 
 - addresses go into a second ipset, populated fully, then `ipset swap`ped with
   the live one — atomic from the kernel's point of view;
-- rules are applied with a single `iptables-restore`, which replaces the filter
-  table as one transaction.
+- rules are applied with a single `iptables-restore --noflush`, which replaces
+  the contents of the three chains agent-box owns as one transaction and leaves
+  every other chain in the table alone. The original version omitted
+  `--noflush` and replaced the whole filter table instead, which was equivalent
+  until Docker arrived and then was not; see "Why the firewall owns three
+  chains rather than the whole table" below.
 
 The rebuild therefore runs *under* the standing deny. It needs only DNS to the
 configured resolvers and the GitHub ranges, both of which the previous run's
@@ -821,3 +825,636 @@ because the leak is the headline and nothing may reinterpret it.
 The general rule is worth stating on its own: a value with downstream meaning
 does not get overwritten to express something else. If two facts need
 recording, record two facts.
+
+## Why the Docker profile is opt-in per instance
+
+Every instance could have Docker, Node 22 and Playwright's system libraries.
+None of them is dangerous on its own, and the firewall now holds containers to
+the same allowlist as the guest. The reason not to is that all three are large,
+slow and attack surface: the Docker packages, containerd and the buildx and
+compose plugins are a few hundred megabytes, `playwright install-deps` pulls in
+most of a desktop's graphics and font stack, and both need the disk to be twice
+the size before a single image is pulled. A box that exists to run one agent
+against one repository of TypeScript should not carry a container runtime it
+will never start.
+
+So the profile is three flags on `create`, and it is fixed for the life of the
+instance — the same reasoning as the mounts. "Can this VM run containers" is
+answerable once, from the command that made it, rather than being a thing that
+might have been turned on at some point. Sizing is the one exception:
+`agentbox resize` exists because outgrowing a 60GiB disk is an ordinary event
+and rebuilding the VM to fix it is not a reasonable answer.
+
+## Why rootful Docker, not the rootless engine
+
+Lima ships a `docker` template that installs the rootless engine, and rootless
+is the better default nearly everywhere: the daemon runs as the user, a
+container escape lands in an unprivileged account, and nothing needs
+`CAP_NET_ADMIN`.
+
+It cannot be used here, for a specific and checkable reason. Rootless Docker
+does its networking inside a user network namespace with slirp4netns or
+pasta, and populates **none** of the `DOCKER*` chains in the host namespace.
+There is no `DOCKER-USER` to hook into, no `FORWARD` traffic to filter — the
+container's packets appear on the guest's uplink as if the daemon's own process
+had sent them, and the only thing standing between a container and the internet
+would be the guest's `OUTPUT` chain, which is the daemon's, not the container's.
+The egress allowlist would still hold at the outer boundary, but "which
+container reached what" would be unanswerable and the per-container rules the
+`AGENTBOX-FWD` chain expresses would have nowhere to live.
+
+The rootful engine, from Docker's own apt repository, creates
+`DOCKER-USER` and `FORWARD` jumps to it before anything else. That chain is
+Docker's documented place for exactly this, and since Engine 28.0.1 it has no
+implicit `RETURN`, so a rule placed there governs container traffic properly.
+
+The cost is stated rather than hidden: the guest user is in the `docker` group,
+which is root-equivalent on that guest. It changes nothing about the threat
+model, because the guest user already has passwordless sudo — see the first
+entry under "Limits and known weaknesses" in the README. The VM boundary is
+what protects the host; the firewall is a guard rail against carelessness.
+
+**And a cost that is new with containers, accepted rather than closed.** The
+CLI is handed its credential in its environment, and everything it spawns for
+the length of a run inherits it — `docker` and `docker compose` included. Two
+paths follow. The obvious one is `docker run -e CLAUDE_CODE_OAUTH_TOKEN` or a
+bind mount of the home directory, which a container process running as root
+reads straight through the 0600 on the token file. The one worth naming because
+nobody expects it is that `docker compose` interpolates variables into the
+compose file from the CLIENT's environment: a compose file in `/work` with
+`environment: [X=${CLAUDE_CODE_OAUTH_TOKEN}]` receives the real token without
+anyone passing `-e` and without the agent doing anything that looks unusual.
+Egress from that container is not a dead end either, because the allowlist
+admits GitHub's whole web, api and git ranges — the trade-off recorded under
+"Why DNS is restricted to the configured resolvers" and reachable by any
+allowlisted host, container or not.
+
+This is not closed, and the reason is that closing it properly means not putting
+the credential in the environment at all, which is a change to how the CLI is
+invoked rather than to the Docker profile. A `docker` wrapper that unsets the
+variable is the cheap version and was rejected: PATH is the agent's to change,
+so a wrapper it can step around is a rule that reads stronger than it is. What
+holds instead is what has always held — the VM boundary, the egress allowlist,
+and a token that is worth revoking rather than protecting. The README's Limits
+list says so beside the `docker` group note.
+
+The repository key is pinned. Docker's current install pages give the key's URL
+and no fingerprint beside it, so provisioning fetches the key once, reads its
+fingerprint with `gpg --show-keys`, and refuses to point apt at the repository
+unless it is `9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88` — the
+fingerprint of "Docker Release (CE deb) <docker@docker.com>", rsa4096, created
+2017-02-22, read back from that URL in a guest on 2026-09-05. That is a pin
+against a future substitution, not proof of provenance today: the first fetch
+was trusted, and it is the pin that makes the second and every later one
+checkable. Saying so is the point.
+
+Playwright's version is pinned for the same reason and it is the weakest of the
+three, so it is worth being exact about what it buys. `npx playwright
+install-deps` runs as **root**, at the one moment provisioning has set all three
+policies to ACCEPT and flushed the AGENTBOX chains, in a guest with read-write
+access to the host's real repository directory at `/work`. `playwright@latest`
+resolved at provision time and executed whatever had been published that day;
+`playwright@1.63.0` executes a version that cannot be changed retroactively. It
+is a pin, not a checksum — npm's own integrity metadata is what stands behind
+the bytes — and it governs only the apt system libraries, since the browser
+builds come from each repository's own Playwright on first use. 1.63.0 was the
+`latest` dist-tag on registry.npmjs.org, read on 2026-09-05. Raise it
+deliberately.
+
+## Why the firewall owns three chains rather than the whole table
+
+The old ruleset was applied with `iptables-restore` and no `--noflush`, which
+replaces the entire filter table in one transaction. That was a virtue while
+agent-box was the only thing writing rules. With Docker installed it is a
+defect, and a quiet one.
+
+Docker creates six chains — `DOCKER`, `DOCKER-USER`, `DOCKER-FORWARD`,
+`DOCKER-CT`, `DOCKER-BRIDGE`, `DOCKER-INTERNAL` — and **does not put them back
+if something else removes them**. Only a daemon restart does. So the
+whole-table restore would have cut every container off the network on the first
+15-minute timer tick after the daemon started, and left it that way: the
+symptom is a compose stack that worked for twelve minutes and then did not,
+with nothing in any log to say why.
+
+The fix is to own three chains and nothing else:
+
+| chain | reached from | holds |
+|---|---|---|
+| `AGENTBOX-IN` | `INPUT` rule 1 | loopback, established, port 22 from the gateway |
+| `AGENTBOX-OUT` | `OUTPUT` rule 1 | the guest's own egress allowlist |
+| `AGENTBOX-FWD` | `DOCKER-USER` rule 1 | the same allowlist, for container traffic |
+
+and to declare only those three, plus the three policies, in a restore file
+applied with `--noflush`. Two behaviours make that work, and both were checked
+in a guest rather than taken from documentation:
+
+- declaring a **user** chain (`:AGENTBOX-OUT - [0:0]`) under `--noflush`
+  replaces its contents outright, so a rebuild is still one atomic swap and
+  never duplicates a rule;
+- declaring a **builtin** chain (`:INPUT DROP [0:0]`) under `--noflush` sets its
+  policy and leaves its rules alone.
+
+That asymmetry is the whole reason the accept rules moved out of `INPUT` and
+`OUTPUT` into chains of our own. Rules left directly in a builtin chain could
+not be rebuilt in place: appending them again each run would duplicate them,
+and flushing the builtin first would remove `FORWARD`'s jumps to Docker's
+chains.
+
+The jumps themselves are placed with `-C || -I`, inserted before any duplicate
+is deleted, so there is no instant in which `DOCKER-USER` does not reach our
+rules. `AGENTBOX-FWD` begins with `! -o <uplink> -j RETURN`: traffic that is not
+leaving by the default route's interface is container-to-container or a
+published port arriving from the other side, neither of which is egress, and
+`DOCKER-FORWARD` is the chain that should decide it.
+
+`iptables -F` with no argument has the same defect as the whole-table restore
+and appears in two more places — the provisioner opening the network for a
+download, and the hard-close path. Both now flush the three builtin chains and
+our own three, never the table.
+
+**What this does not cover: macvlan and ipvlan.** The whole container-egress
+argument rests on `FORWARD` jumping to `DOCKER-USER` before anything of
+Docker's own. That is true of bridge networks, which is every network Docker
+creates by default and every network this profile was built for. It is not true
+of `macvlan` or `ipvlan`: those attach the container to a sub-interface of the
+parent NIC, so the packets leave through the parent without traversing the
+host's `FORWARD` chain at all. `DOCKER-USER` never sees them, and therefore
+neither does `AGENTBOX-FWD`.
+
+A compose file that declares such a network — a normal thing to do when a
+service needs a routable address of its own — would have unfiltered egress, and
+`agentbox firewall-check` would still report every check PASS, because its
+container probe runs on a bridge network. Refusing those drivers needs an
+authorization plugin or a wrapper, and both are more machinery than the risk
+justifies on a box whose user already has passwordless sudo. So it is written
+down instead: the firewall is a guard rail against carelessness, and this is
+one kind of carelessness it does not catch. The VM boundary is what protects
+the host, and it is unaffected.
+
+**And one rule that is inbound, in a chain that is otherwise about egress.**
+`AGENTBOX-FWD` rule 1 drops NEW connections arriving on the uplink. Without it
+the `! -o <uplink> -j RETURN` below is symmetric in a way its reasoning is not:
+`docker run -p 8080:80` publishes on 0.0.0.0, Docker DNATs the inbound packet
+in PREROUTING, and it is then FORWARDed rather than INPUTed — so it never meets
+the `INPUT DROP` policy that implements "nothing the guest listens on is
+reachable from outside it", and the RETURN hands it to `DOCKER-FORWARD`, which
+accepts published-port traffic by construction.
+
+Measured, and the measurement is worth recording because it cuts both ways. On
+this Mac the guest sits behind Lima's usernet, and the host has no route to the
+guest's address at all — `curl 192.168.5.15:4999` from the Mac times out with
+or without the rule. So the rule closes nothing that is open today. It is here
+because the invariant is stated in three places as a property of the box, and
+it was in fact a property of the network Lima happened to give it: a
+`networks:` entry added later, or a vmnet-shared configuration, would have
+made the claim false with nothing in the repository changing. The rule makes it
+true at the boundary that the claim is about.
+
+`--forward` is unaffected, and structurally rather than by luck: Lima serves a
+forwarded port over ssh, so the connection to it is opened by sshd *inside* the
+guest and leaves through `OUTPUT`, never crossing `FORWARD` from the uplink.
+Verified with the rule in place — a container published `-p 4998:80` on a box
+created with `--forward 4998` still answers on the Mac at `127.0.0.1:4998`,
+while the same container on a port that was not named does not.
+
+## Why a probe that needs the internet cannot decide whether the box is safe
+
+`verify()` is the last thing `init-firewall.sh` does, so its return value is the
+unit's exit status. Provisioning restarts that unit as a bare command under
+`set -euo pipefail`, and the EXIT trap retries once and then hard-closes the
+guest. That cascade is sound when every check is an assertion about the ruleset:
+those are read from the kernel, need no network, and are true or false
+regardless of what any remote host is doing.
+
+The Docker profile added three checks that are not like that. Two launch a
+container, and the third used to pull `alpine:3` from Docker Hub. Docker Hub
+rate-limits anonymous pulls at 100 per six hours per address. So a `--docker`
+create on a busy afternoon could end like this: the pull returns 429, two checks
+FAIL, `verify()` returns 1, the unit fails, `systemctl restart` returns
+non-zero, `set -e` aborts provisioning, the EXIT trap restarts the unit, it
+fails identically, and the guest is left on loopback and ssh only. A ten-minute
+`agentbox create` exits non-zero and hands back a new VM with no egress —
+because a registry had a bad minute.
+
+Two changes, and the principle is the second one.
+
+**Nothing in this unit pulls.** If `alpine:3` is not present locally the two
+container probes print SKIP with that reason. Using the pull as a registry test
+was a genuinely nice idea and it belongs in the smoke test, where a failure is a
+test result rather than a boot outcome. It also removes a second problem nobody
+would have connected to it: the timer ran `verify()` every fifteen minutes, so a
+box whose operator followed this project's own advice and ran
+`docker system prune -af --volumes` would have re-pulled the image four times an
+hour, for ever.
+
+**And the checks that leave the machine are advisory.** They print `WARN`, they
+are counted separately, and they do not touch the exit status; only the ruleset
+checks do. The distinction is worth stating as a rule, because it will come up
+again the next time someone adds a check here: *this function answers "is the
+ruleset what it should be", not "is the internet working".* The two questions
+have different failure modes and only the first one should be able to close a
+box.
+
+What is deliberately NOT advisory is `docker-user-jump`. It reads the live
+ruleset like every other fatal check, needs no network, and is only evaluated
+once `docker info` has answered — so if it fails, containers really are
+unfiltered, and that is exactly the kind of thing this unit exists to refuse to
+be quiet about.
+
+**The line is the direction of failure, not local versus remote.** The first
+version of this entry said "a probe that needs the internet cannot decide
+whether the box is safe", moved the Docker probes, and left five outbound
+checks fatal — so the cascade it described was still reachable, now through
+`api.anthropic.com` instead of Docker Hub. Stated properly:
+
+- A check is **fatal** when it can only fail on affirmative evidence that the
+  ruleset is wrong. `literal-ip-denied`, `foreign-dns-denied` and
+  `egress-denied` all send packets and all three are fatal, because the only
+  way they fail is by something ANSWERING that should have been refused. No
+  outage produces that.
+- A check is **advisory** when it fails on an absence. `anthropic-allowed` and
+  `github-allowed` are absences, and an outage, a rate limit, a rotated CDN
+  address or a captive network all produce them identically.
+
+`docker-egress` was the case that showed the first version had the wrong idea,
+because it fails in both directions and was given one treatment. A container
+that could not be tested at all is inconclusive — a warning. A container that
+REACHED `example.com` is a containment breach, is a fact about this box that no
+remote condition can fabricate, and is fatal. Those are three outcomes and
+`container_probe` already returned three values; the code was collapsing them
+into two.
+
+## The check that the allowlist permits something, without asking the internet
+
+Applying that rule left a hole, and it is worth naming because it is the
+predictable cost of getting the rule right. Once the outbound probes became
+advisory, **no fatal check asserted that the allowlist lets anything through.**
+`allowlist-rule` looks like it does and does not: it greps the chain for a rule
+referencing the set, which is exactly as true of a set holding nothing.
+
+The state is reachable without any race. One name that fails to resolve is a
+journal WARN and a `continue`, and `resolved_any` is satisfied by a single name
+out of nineteen, while the GitHub ranges are added unconditionally. So a rebuild
+during a partial DNS failure could swap in a set holding the GitHub ranges and
+almost nothing else, exit 0, and leave the unit active — with `firewall-check`
+exiting 0, `agentbox status` reporting `drop`, and an overnight run starting at
+02:30 and dying on its first call to the model API. Every signal green on a box
+where no agent can work.
+
+Two changes close it, and both keep the direction-of-failure rule intact.
+
+**The rebuild records what it resolved.** One line per name in
+`/run/agent-box-firewall-resolved`, written only once the swap has happened, so
+the file can never describe a set that is not live. `verify()` then asks a
+question that is entirely local: does the live set still contain every address
+the last rebuild recorded for `api.anthropic.com`? Both halves are readable from
+the kernel, and it fails only on affirmative evidence — the file says these went
+in, and `ipset test` says they are not there.
+
+**And that one name's resolution failure is a rebuild failure.** Not a WARN and
+a `continue`. Without `api.anthropic.com` the box cannot do the single thing it
+exists to do, so the rebuild refuses the swap, keeps the standing ruleset with
+its previous addresses, and exits non-zero — visible, and retried on the next
+tick.
+
+### An emptied allowlist is self-sealing, which the test had to learn
+
+Worth recording because the obvious repair does not work. The smoke empties the
+live set and asserts the new check fails; the first version then simply
+restarted the unit to put the box back, and the restart failed. It has to: the
+rebuild needs `api.github.com` for the meta ranges, `api.github.com` is only
+reachable through the ipset, and the ipset is what was emptied. A box in that
+state cannot rebuild its way out on its own.
+
+That is the same property the hard close has, and the recovery is the same
+shape: open egress by hand, then rebuild. There is a second step to it that is
+easy to get wrong, and the test got it wrong once before measuring it: **the
+policy is not what refuses the packet.** `AGENTBOX-OUT` is jumped from `OUTPUT`
+rule 1 and ends in REJECT, so a rejected connection never reaches the `OUTPUT`
+policy at all, and `iptables -P OUTPUT ACCEPT` on its own changes nothing. The
+chain has to be flushed as well:
+
+```
+sudo iptables -P OUTPUT ACCEPT
+sudo iptables -F AGENTBOX-OUT          # not -F on its own: that takes Docker's chains
+sudo systemctl restart agent-box-firewall.service
+```
+
+Which is precisely what `open_network_for_provisioning` does, for precisely this
+reason. Anyone who empties that set on a real box needs both lines, and the
+recovery text the hard close prints is right to name the chain flush rather than
+only the policy.
+
+## Why `firewall-check` rebuilds, having only verified
+
+`agentbox firewall-check` ran `init-firewall.sh --verify-only`, which returns
+before the allowlist is read, before any name is resolved, and before the ipset
+is swapped. Four sentences in this repository — two of them in `daily-use.md`,
+one here, one in `allowlist.base` — offered the command as the fix for a
+problem that only a rebuild solves:
+
+- a name added to `allowlist.local`, which will not be in the set for up to
+  fifteen minutes;
+- a CDN that handed out an address which was not in the set when it was last
+  resolved, which is the `cdn.playwright.dev` case argued at length above.
+
+In both, the operator ran the command, watched every line print PASS, retried,
+and was refused again with nothing to explain it. The documentation was not
+describing the code; it was describing what the command obviously ought to do.
+
+So the command now does it. **How it does it matters more than that it does.**
+The obvious implementation — exec the whole script under sudo — was written
+first and was wrong in three ways at once, all of which come from bypassing
+systemd:
+
+- **It raced the timer.** The timer rebuilds by restarting the unit, which
+  serialises against itself because a `Type=oneshot` already running will not
+  start twice. A direct exec is invisible to that. Both paths then destroy and
+  refill one fixed ipset name, `allowed-domains-new`, so one run's
+  `ipset destroy` lands on the other's half-filled set. The loud outcome is a
+  failed unit, which blocks every agent run. The quiet one is worse: whoever
+  wins the swap with a nearly empty set leaves the live allowlist short of most
+  of its addresses while every check still prints PASS.
+- **It could not clear a failed unit.** `guest/lib.sh` gates every run on the
+  unit being active. An operator whose unit had failed would repair the ruleset,
+  watch every line print PASS, and still be told "the egress firewall is not
+  active" by `agentbox run`. Three signals disagreeing is worse than one bad
+  signal.
+- **It could print nothing at all.** A full run exits at its first failure —
+  the `api.github.com` fetch, the schema check, a resolution pass — all of
+  which come before `verify()`. A diagnostic tool that goes silent exactly when
+  the network is broken is a diagnostic tool for the case you do not have.
+
+So `firewall-check` restarts the unit and then runs `--verify-only` as a
+separate step. That rebuilds, serialises through systemd, clears a failed unit,
+and prints the table whether or not the rebuild worked, saying which happened.
+`--verify-only` remains the right thing for any caller that must not depend on
+DNS or on `api.github.com`.
+
+**And the script takes a lock of its own**, `flock` on
+`/run/agent-box-firewall.lock`, held by the rebuild and by the Docker hook.
+Driving the unit is the fix for the paths this repository controls; the lock is
+what protects a box where someone runs the script by hand. Every `iptables` and
+`iptables-restore` call also carries `-w 5`, which covers the xtables lock
+independently of either.
+
+## Why docker.service gets a drop-in, and why the socket is owned by name
+
+Two lines in `/etc/systemd/system/docker.service.d/agent-box-firewall.conf`,
+for two different failures.
+
+`After=agent-box-firewall.service` orders the daemon behind the firewall at
+boot, so `AGENTBOX-FWD` exists before `DOCKER-USER` does.
+
+`ExecStartPost=…/init-firewall.sh --docker-hook` closes the window a restart
+would otherwise open. A daemon restart recreates whatever of its chains are
+missing; if the jump were left to the 15-minute timer, a `systemctl restart
+docker` at 12:01 would leave containers reaching anything they liked until
+12:15. As an `ExecStartPost` the hook runs as part of starting the daemon, so
+`systemctl restart docker` does not return until the jump is back. The hook
+does one thing and does not rebuild anything, because a rebuild needs DNS and
+`api.github.com` and must never be on the critical path of starting a daemon.
+
+A second drop-in, on `docker.socket`, names the guest user as the socket's
+owner. `usermod -aG docker` is also done and is not enough: supplementary
+groups are fixed when an SSH connection authenticates, and Lima multiplexes
+every `limactl shell` over one long-lived connection opened before provisioning
+ran. Verified rather than assumed — after `usermod`, a fresh `limactl shell`
+still reported the old group list and `docker info` said "permission denied".
+The group would only take effect after a stop and start, which means the box
+you just built to run Docker cannot run Docker. Lima's own docker template sets
+`SocketUser` for the same reason.
+
+**The ordering that fixes one problem creates another, and the second one
+deadlocks the boot.** `After=agent-box-firewall.service` means that while the
+firewall unit runs at boot, dockerd has not started. `docker.socket`, however,
+is already listening — systemd socket activation is independent of the service
+job. So the container probes at the end of `verify()` connected to that socket,
+systemd queued a `docker.service` start job that could not run until the
+firewall unit finished, and the firewall unit waited for a reply that could
+never come. Measured on a `--docker` box, ten minutes after a restart:
+
+```
+$ systemctl list-jobs
+150 agent-box-firewall.service           start running
+152 docker.service                       start waiting
+2   multi-user.target                    start waiting
+
+$ ps -eo pid,ppid,etime,args
+685   1    10:44  /bin/bash /opt/agent-box/guest/init-firewall.sh
+1609  685  10:39  docker image inspect alpine:3
+
+$ systemctl show agent-box-firewall.service -p TimeoutStartUSec
+TimeoutStartUSec=infinity
+```
+
+Nothing would ever have broken it: the unit is a oneshot with no start timeout,
+`multi-user.target` never came up, and Lima's own `agentbox start` therefore
+timed out after ten minutes waiting for the guest to be ready. Downstream,
+`guest/lib.sh` refuses to run an agent unless the firewall unit is active, so
+the box also reported itself unprotected while being, in fact, protected.
+
+Two changes, and the second is the one that generalises. The container checks
+are now gated on a *reachable daemon* — `timeout 5 docker info` — rather than on
+an installed binary, and print `SKIP` with the reason when it is not up, because
+at boot that is the correct and expected state: the jump is installed moments
+later by the `ExecStartPost` hook. And every call into the container runtime
+from this unit is bounded by `timeout`, on the principle that the firewall must
+never be held open by the runtime it exists to constrain. After the change the
+same restart brings the unit up in under three seconds with three SKIP lines,
+and a second run once dockerd is up reports all three as PASS.
+
+## Why there is still one Lima template, and no generated file per instance
+
+`--docker`, `--playwright` and `--rosetta` reach the guest as template
+parameters, which Lima expands in the provision script. `--forward`, the
+Rosetta setting and the sizing cannot work that way, and the reason is worth
+recording because it looks like it should.
+
+Lima parses the template as YAML **first** and expands `{{.Param.x}}`
+afterwards, in a handful of string fields only. So `enabled: {{.Param.rosetta}}`
+is a YAML parse error before any parameter exists, `enabled: "{{.Param.rosetta}}"`
+parses but is never expanded and reaches the VM as that literal string, and
+`- guestPort: "{{.Param.port}}"` is rejected outright because `guestPort` is an
+integer. All three were tried against `limactl validate` rather than reasoned
+about.
+
+The obvious next step is a derived per-instance YAML written under
+`~/.config/agent-box/instances/`, and it is not needed: `limactl create` takes
+`--rosetta`, and `--set` with a yq expression, which together express both. So
+`agentbox create` passes `--set '.cpus = N | .memory = "…" | .disk = "…"'`,
+adds `--rosetta` when asked, and prepends port-forward entries with
+`--set '.portForwards = [{"guestPort": N}] + .portForwards'`. Prepends, because
+the template's two catch-all entries ignore every port and Lima takes the first
+entry that matches.
+
+The result keeps the property that mattered: **one template, in the repository,
+readable as a file**. A generated per-instance YAML would have put the real
+configuration of a running VM somewhere nobody reviews, and would have needed
+its own regeneration story every time the template changed. `agentbox resize`
+uses the same mechanism against an existing instance with `limactl edit --set`.
+
+## What `--forward` gives up
+
+Every other design decision here points one way: nothing the guest listens on
+is reachable from the host. `--forward` is the exception, and it exists because
+watching a browser test against a stack running in the VM is otherwise
+impossible — you cannot look at `http://localhost:3000` if nothing is
+forwarded.
+
+It is a widening in the direction the rest of the file spends its effort
+closing, so it is opt-in per port, per instance, fixed at create time, warned
+about in one line at create, and recorded in the instance summary.
+
+**Which guest sockets a forwarded port actually reaches, measured.** The
+prepended entry is `{"guestPort": N}` and takes Lima's defaults, so the answer
+is not obvious and the failure mode is silence: a port that does not match
+falls through to the template's catch-alls, which are `ignore: true`, and
+nothing on either side says why the page will not load. On a `--docker` box
+created with `--forward 4998`, with a container published each way:
+
+| the guest socket is bound to | in `--forward`? | `127.0.0.1:N` on the Mac |
+|---|---|---|
+| `0.0.0.0` — `docker run -p N:80`, the default | yes | answers |
+| `127.0.0.1` — `docker run -p 127.0.0.1:N:80` | yes | answers |
+| the guest's own address — `-p 192.168.5.15:N:80` | yes | **does not answer** |
+| any of the above | no | does not answer |
+
+So the ordinary habit works and only the third form is a trap, which is the
+opposite of what the entry's `guestIP` default suggests. `agentbox create` now
+prints that as a second line beside the widening warning, because a rule that
+holds three times out of four is exactly the kind that gets misremembered. What it
+grants is narrow: a process on the Mac can connect to that one guest port at
+`127.0.0.1`. It grants the guest nothing new in the other direction. The
+alternative considered and rejected was forwarding on demand from a separate
+subcommand, which would have made "what is exposed right now" a question with a
+time-varying answer — the same thing the fixed-mounts rule exists to avoid.
+
+## Why the allowlist resolves through two paths, and more than once
+
+The allowlist is names; the ipset is addresses. Something has to turn one into
+the other, and `dig` on its own turns out to be the wrong instrument.
+
+**`dig` does not resolve the way anything else does.** It sends its query
+straight to the nameserver in `/etc/resolv.conf` — on this guest, Lima's host
+resolver on the gateway. Every other program goes through glibc to
+systemd-resolved on `127.0.0.53`, which keeps its own cache and its own idea of
+which address the name has. For a name with eight A records the two answers
+overlap enough that nothing is noticed. For `cdn.playwright.dev` — an Azure
+Front Door endpoint that answers with exactly **one** A record, on a near-zero
+TTL — they disagreed outright, in the same second, in a guest:
+
+```
+$ dig +short A cdn.playwright.dev        # what the firewall pinned
+150.171.109.113
+$ getent ahostsv4 cdn.playwright.dev     # what curl would use
+150.171.109.70
+```
+
+So the firewall allowlisted an address nothing was going to connect to, and
+rejected the one everything did. The symptom is a host that is plainly on the
+allowlist being refused, which is the most misleading failure this design can
+produce: it looks like the allowlist file is wrong when it is right.
+
+The fix is to resolve the way the applications resolve. `getent ahostsv4` goes
+through the same NSS path curl, Node and apt do, and its result is unioned with
+`dig`'s, which still contributes the fuller multi-address answers that `getent`
+returns one line at a time. Measured in a guest after the change: five
+consecutive requests to `cdn.playwright.dev` under the standing deny all
+connected, all to `150.171.109.66`, the address both paths now agree on.
+
+**And a pass count that defaults to one, having been three.** A CDN hands out
+part of its pool per query, so a single lookup pins a single slice for fifteen
+minutes. Several passes over the whole list, spaced past the TTL, collect more
+of it. That was implemented, measured, and then turned down to one pass,
+because the measurement said so:
+
+| resolution passes | first boot of a plain instance |
+|---|---|
+| 1 | 50-59s, across four runs |
+| 3 | 611s, past Lima's own start budget, so `agentbox create` failed |
+
+The cost is not the DNS traffic. It is `getent`: it takes no timeout of its own
+and NSS blocks while systemd-resolved is still coming up, which is exactly when
+this script first runs. The lookup is now bounded with `timeout`, and the extra
+passes — which on the case above changed nothing, because the two-path union
+had already fixed it — sit behind `AGENT_BOX_RESOLVE_PASSES` for whoever meets
+a CDN that needs the breadth and can afford the boot time.
+
+**This is a mitigation, not a guarantee, and pretending otherwise would be the
+real defect.** An address that enters a pool between rebuilds still fails.
+Three things follow:
+
+- A rejected connection to an allowlisted CDN is worth retrying before it is
+  worth debugging. `agentbox firewall-check` forces a rebuild and refreshes the
+  set.
+- The smoke test's reachability checks retry up to six times each, the same
+  shape a real downloader has. A name that is genuinely absent still fails all
+  six, and the check that found this in the first place is the one that curls
+  every newly allowlisted name from inside the guest *under the standing deny*
+  — provisioning downloads with the firewall stopped, so nothing else would
+  ever have noticed.
+- Two alternatives were considered and not taken. Widening to the CDN's
+  covering prefix (`150.171.108.0/22` for that Front Door pool) allowlists
+  every other tenant on the same CDN. Keeping addresses with an `ipset`
+  timeout instead of replacing them wholesale would accumulate a pool over
+  hours, but it trades the atomic swap — the property that makes a rebuild safe
+  under the standing deny — for an hour-long tail of addresses that are no
+  longer the allowlisted host's.
+
+### What the pool actually does, measured
+
+The earlier characterisation had `cdn.playwright.dev` answering with one address
+that the two-path union then agreed on. That was true on the day. It is not the
+steady state. Six lookups from the host over thirty seconds, on 2026-09-05:
+
+```
+19:42:06  150.171.109.66
+19:42:11  150.171.109.118
+19:42:16  150.171.109.66
+19:42:21  13.107.253.41  13.107.226.41     <- a different Front Door pool entirely
+19:42:26  150.171.109.116
+19:42:32  150.171.109.115
+```
+
+Five addresses in half a minute, across two unrelated /16s. No single resolution
+pass can hold that, which means no snapshot-based allowlist can. Both rejected
+alternatives get worse in the light of it, not better: the covering prefix is
+now *two* prefixes, one of which (`13.107.0.0/16`) is a large slice of
+Microsoft's edge; and an `ipset` timeout long enough to accumulate this pool is
+long enough to keep a meaningful tail of addresses that have moved on to some
+other tenant.
+
+### So the smoke's runtime check for this one host is advisory
+
+The check was asserting something the box does not promise. What is promised is
+that the name is on the allowlist, and that Playwright's browsers are fetched
+during provisioning, when the network is open. Reachability of that host at an
+arbitrary later moment is not a property of this design, and an agent that needs
+a browser later has the documented remedy — `agentbox firewall-check`, which
+rebuilds and re-pins.
+
+So it prints WARN, counted separately from passes and failures, and it prints it
+only after the retry has run that remedy and it did not help. `api.anthropic.com`
+and `github.com` stay hard failures: they are not behind a pool that behaves
+like this, and the box does promise them.
+
+### The structural fix, for later
+
+A snapshot allowlist and a name that rotates faster than the snapshot is a
+design mismatch, not a tuning problem, and there is a known shape that resolves
+it: **make the set follow resolution instead of polling for it.** `dnsmasq` can
+add an answer's addresses to an ipset as it resolves the name —
+`ipset=/cdn.playwright.dev/allowed-domains` — so the guest's own lookup is what
+authorises the address it is about to connect to. The window between resolving
+and connecting is milliseconds rather than up to fifteen minutes, and it works
+for every rotating host without naming any prefix.
+
+It is not free and that is why it is recorded rather than done. It puts a
+resolver in the guest that everything must go through, it needs the atomic-swap
+rebuild to coexist with entries dnsmasq adds between rebuilds (an ipset with a
+timeout for the dnsmasq-added half, alongside the swapped base set, is the
+obvious shape), and it makes the firewall depend on a daemon that can itself
+fail. Worth evaluating as its own piece of work, against the current behaviour,
+which is: correct, occasionally inconvenient for one host, and honest about it.
+

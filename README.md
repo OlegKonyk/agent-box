@@ -58,7 +58,8 @@ One instance per repository, named `agent-box-<repo basename>`.
 | Command | What it does |
 |---|---|
 | `agentbox preflight <repo>` | Scan a repo for secrets and configured terms. Exit 1 on findings. |
-| `agentbox create <repo>` | Preflight, then create and start that repo's VM. |
+| `agentbox create <repo> [options]` | Preflight, then create and start that repo's VM. Options below. |
+| `agentbox resize <repo\|name> [--cpus N] [--memory SIZE] [--disk SIZE]` | Resize an existing VM. Stops it if running, then starts it again. The disk can only grow. |
 | `agentbox start <repo>` | Preflight, then start an existing VM. |
 | `agentbox token <repo>` | Read an OAuth token from the terminal into the VM. Never echoed, never stored on the host. |
 | `agentbox verify-auth <repo>` | Prove the token authenticates, with one real model call. |
@@ -76,21 +77,47 @@ One instance per repository, named `agent-box-<repo basename>`.
 | `agentbox stop <repo\|name>` | Stop the VM. |
 | `agentbox destroy <repo\|name>` | Stop and delete the VM, and remind you to revoke the token. |
 | `agentbox status [repo] [--json] [--watch [SECS]]` | One line per box: current run, sessions, firewall. |
-| `agentbox firewall-check <repo\|name>` | Re-run the egress verification inside the VM. |
+| `agentbox firewall-check <repo\|name>` | Rebuild the egress allowlist and re-verify it, inside the VM. The container probes are advisory. |
 
 `run` takes `--model M`, `--max-turns N`, `--max-budget-usd X`, `--wait` and
-`--notify`. `stop`, `destroy` and `firewall-check` also take a bare instance
-name, so a VM can still be shut down and deleted after its repository directory
-is gone. Every subcommand stops reading options at a literal `--`, so a caller
-that builds a command line rather than typing it can always say where its
-operands begin: `agentbox runs --json -- <repo>`. For `agentbox claude` the
-`--` may only come before the repository, because everything after it belongs
-to the CLI.
+`--notify`. `resize`, `stop`, `destroy` and `firewall-check` also take a bare
+instance name, so a VM can still be shut down, resized and deleted after its
+repository directory is gone. Every subcommand stops reading options at a
+literal `--`, so a caller that builds a command line rather than typing it can
+always say where its operands begin: `agentbox runs --json -- <repo>`. For
+`agentbox claude` the `--` may only come before the repository, because
+everything after it belongs to the CLI.
 
 Runs are detached: `agentbox run` returns as soon as the task has started, and
 `runs`, `logs -f`, `stop-run` and `status --watch` are how you follow it. The
 whole loop is in [docs/daily-use.md](docs/daily-use.md) under "Watching and
 steering".
+
+### create options
+
+All optional, all off by default, and all fixed for the life of the instance
+except the sizing. The same reasoning as the mounts: what a VM can do is
+decided when it is made, not adjusted while it runs.
+
+| Option | What it adds |
+|---|---|
+| `--docker` | Docker Engine, buildx and compose inside the guest. Containers are held to the same egress allowlist as the guest itself. |
+| `--playwright` | Node 22 from nodejs.org, plus the system libraries `playwright install-deps` installs. Browsers are not baked in: each repository's own Playwright downloads the builds it was pinned against, on first use. |
+| `--rosetta` | Run `linux/amd64` images on Apple silicon. Needs Rosetta 2 on the Mac; `softwareupdate --install-rosetta` if Lima stalls at "Installing rosetta". |
+| `--forward PORT[,PORT...]` | Forward guest `127.0.0.1:PORT` to host `127.0.0.1:PORT`. Reaches a guest socket bound to `127.0.0.1` or `0.0.0.0`, not one bound only to the guest's own address. A widening — see Limits below. |
+| `--cpus N` | Default 4. |
+| `--memory SIZE` | Default `6GiB`, or `8GiB` with `--docker`. |
+| `--disk SIZE` | Default `30GiB`, or `60GiB` with `--docker`. |
+
+`--docker` raises the memory and disk defaults because images, layers and a
+build cache all land on the guest disk and a compose stack plus a browser is a
+different memory profile from a shell and an editor. An explicit `--memory` or
+`--disk` overrides that. The effective sizing is printed at create time and
+again in the summary.
+
+```
+./bin/agentbox create ~/dev/my-app --docker --playwright --forward 3000,8080
+```
 
 ## Layout
 
@@ -166,6 +193,29 @@ What of `claude/` crosses into the guest, and what is refused, is in
   has. `agentbox session` plus `agentbox attach` is the substitute: a session
   you can leave and come back to, over `limactl shell` rather than over the
   internet.
+- **`--forward` opens a hole in the other direction.** By default nothing the
+  guest listens on is reachable from the host. Each forwarded port becomes
+  reachable by any process on the Mac at `127.0.0.1`, for as long as the VM
+  runs. It is opt-in per port, fixed at create time, warned about once, and
+  recorded in the instance summary — but it is still the one place this design
+  gives something back.
+- **`--docker` puts the guest user in the `docker` group**, which is
+  root-equivalent on that guest. It changes nothing about the threat model,
+  because that user already has passwordless sudo, but it is worth knowing it
+  is there.
+- **Containers inherit the token.** The CLI is given its credential in its
+  environment, so everything it spawns for the length of a run can read it,
+  including `docker`. `docker compose` also interpolates it into a compose
+  file that asks for `${CLAUDE_CODE_OAUTH_TOKEN}`, with no `-e` and nothing
+  that looks unusual in the log. The VM boundary and the egress allowlist are
+  what contain it; the token is meant to be revocable, not secret from the
+  agent. See docs/decisions.md.
+- **A macvlan or ipvlan network escapes the allowlist.** Container egress is
+  filtered in `DOCKER-USER`, which only sees traffic that traverses `FORWARD` —
+  true of bridge networks, not of macvlan or ipvlan, whose packets leave
+  through a sub-interface of the NIC. `agentbox firewall-check` still passes,
+  because it probes on a bridge. The firewall is a guard rail against
+  carelessness; the VM is the boundary.
 - **DNS resolves through the host's resolver.** The guest can resolve internal
   names it cannot connect to, and each lookup reaches the host's resolver with
   the VM as its origin. See "What the guest can still see: names" in

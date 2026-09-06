@@ -53,7 +53,13 @@ containerd:
   system: false
   user: false
 
-# Nothing the guest listens on is reachable from the host or the LAN.
+# Nothing the guest listens on is reachable from the host or the LAN, unless
+# `agentbox create --forward PORT` said otherwise. That flag prepends
+# `- guestPort: PORT` entries ahead of the two catch-alls below, because Lima
+# takes the FIRST matching entry. It cannot be expressed here: Lima parses this
+# file as YAML before expanding {{.Param.x}}, and only expands in a few string
+# fields, so a template parameter cannot produce a list entry or an integer.
+# See docs/decisions.md.
 #
 # guestIPMustBeZero has to be set explicitly. Lima defaults it to
 # `guestIP == 0.0.0.0` (pkg/limayaml/defaults.go), so leaving it out of the
@@ -85,12 +91,33 @@ ssh:
 # directory, which Lima's default template mounts read-only. The agent sees one
 # repository, this checkout, and the host's agent-box config — nothing else
 # belonging to the host user.
+#
+# One exception, and it is named here because this comment is where a reviewer
+# comes to answer "what of the host can this VM see". `agentbox create
+# --rosetta` passes `limactl create --rosetta`, which exposes the host's Rosetta
+# runtime to the guest as a FOURTH virtiofs share and registers it with
+# binfmt_misc — guest/provision.sh checks /proc/sys/fs/binfmt_misc/rosetta,
+# which is the evidence it arrived. The content is Apple's own translation
+# binaries, not the user's data, and the share is absent without --rosetta. But
+# "exactly three mounts" is true only of a box created without it.
 param:
   # Placeholders only. bin/agentbox always overrides all three with --param, so
   # that `limactl validate` on the bare template still resolves to real paths.
   repo: "/tmp"
   box: "/tmp"
   config: "/tmp"
+  # The optional profile. Each is the string "true" or "false" and reaches
+  # guest/provision.sh as an argument; the defaults here are what a bare
+  # `agentbox create <repo>` gets, which is the same VM as before this file
+  # grew any of it.
+  #
+  # rosetta is passed through for the provisioner to log and for the guest to
+  # check. What actually enables it is `limactl create --rosetta`, which writes
+  # vmOpts.vz.rosetta — a boolean field, and therefore one no template
+  # parameter can reach.
+  docker: "false"
+  playwright: "false"
+  rosetta: "false"
 
 mounts:
 - location: "{{.Param.repo}}"
@@ -165,4 +192,7 @@ provision:
   script: |
     #!/bin/bash
     set -euo pipefail
-    exec /opt/agent-box/guest/provision.sh "{{.User}}" "{{.Home}}"
+    exec /opt/agent-box/guest/provision.sh "{{.User}}" "{{.Home}}" \
+      --docker "{{.Param.docker}}" \
+      --playwright "{{.Param.playwright}}" \
+      --rosetta "{{.Param.rosetta}}"
