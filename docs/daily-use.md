@@ -464,12 +464,26 @@ that is enforced rather than assumed: `AGENTBOX-FWD` is jumped to from
 
 `agentbox firewall-check <repo>` rebuilds the allowlist and then checks it,
 including from inside a container: that one cannot reach `example.com` and can
-reach `api.anthropic.com`. Three things make those two lines honest to read.
+reach `api.anthropic.com`. The rebuild is a restart of the firewall unit rather
+than a direct run of the script, which serialises it against the 15-minute timer
+and clears the unit if it had failed — so the command also unblocks
+`agentbox run`, which refuses to start on a box whose firewall unit is not
+active. If the rebuild fails you still get the full table, for the ruleset that
+is still in force, with a line saying the rebuild did not work.
 
-They are **advisory**. They leave the machine, so they can fail for reasons that
-have nothing to do with this box, and a probe that needs the internet is not
-allowed to decide whether the box is safe to use. They print `WARN`, and the
-command's verdict is set by the ruleset checks alone.
+Three things make the container lines honest to read.
+
+They are **advisory in one direction only**. A container that could not reach
+`api.anthropic.com`, or one that could not be tested at all, prints `WARN`: an
+absence is what an outage, a rate limit or a rotated CDN address produces, and
+none of those is a reason to declare the box unsafe. A container that *reached*
+`example.com` prints `FAIL` and fails the command, because nothing outside this
+box can fabricate that — it means container egress is not being filtered.
+
+The same rule decides the guest's own checks. `anthropic-allowed` and
+`github-allowed` are advisory; `egress-denied`, `literal-ip-denied` and
+`foreign-dns-denied` are fatal, because the only way they fail is by something
+answering that should have been refused.
 
 They are **skipped, out loud, rather than silently**: `SKIP` with the reason on
 an instance without Docker, on one whose daemon is not up yet, and on one where

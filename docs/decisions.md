@@ -1061,6 +1061,29 @@ once `docker info` has answered — so if it fails, containers really are
 unfiltered, and that is exactly the kind of thing this unit exists to refuse to
 be quiet about.
 
+**The line is the direction of failure, not local versus remote.** The first
+version of this entry said "a probe that needs the internet cannot decide
+whether the box is safe", moved the Docker probes, and left five outbound
+checks fatal — so the cascade it described was still reachable, now through
+`api.anthropic.com` instead of Docker Hub. Stated properly:
+
+- A check is **fatal** when it can only fail on affirmative evidence that the
+  ruleset is wrong. `literal-ip-denied`, `foreign-dns-denied` and
+  `egress-denied` all send packets and all three are fatal, because the only
+  way they fail is by something ANSWERING that should have been refused. No
+  outage produces that.
+- A check is **advisory** when it fails on an absence. `anthropic-allowed` and
+  `github-allowed` are absences, and an outage, a rate limit, a rotated CDN
+  address or a captive network all produce them identically.
+
+`docker-egress` was the case that showed the first version had the wrong idea,
+because it fails in both directions and was given one treatment. A container
+that could not be tested at all is inconclusive — a warning. A container that
+REACHED `example.com` is a containment breach, is a fact about this box that no
+remote condition can fabricate, and is fatal. Those are three outcomes and
+`container_probe` already returned three values; the code was collapsing them
+into two.
+
 ## Why `firewall-check` rebuilds, having only verified
 
 `agentbox firewall-check` ran `init-firewall.sh --verify-only`, which returns
@@ -1078,10 +1101,41 @@ In both, the operator ran the command, watched every line print PASS, retried,
 and was refused again with nothing to explain it. The documentation was not
 describing the code; it was describing what the command obviously ought to do.
 
-So the command now does it: `firewall-check` is a full run — rebuild, then
-verify — and the four sentences became true without being edited. `--verify-only`
-remains as the guest-side flag, and remains the right thing for any caller that
-must not depend on DNS or on `api.github.com`.
+So the command now does it. **How it does it matters more than that it does.**
+The obvious implementation — exec the whole script under sudo — was written
+first and was wrong in three ways at once, all of which come from bypassing
+systemd:
+
+- **It raced the timer.** The timer rebuilds by restarting the unit, which
+  serialises against itself because a `Type=oneshot` already running will not
+  start twice. A direct exec is invisible to that. Both paths then destroy and
+  refill one fixed ipset name, `allowed-domains-new`, so one run's
+  `ipset destroy` lands on the other's half-filled set. The loud outcome is a
+  failed unit, which blocks every agent run. The quiet one is worse: whoever
+  wins the swap with a nearly empty set leaves the live allowlist short of most
+  of its addresses while every check still prints PASS.
+- **It could not clear a failed unit.** `guest/lib.sh` gates every run on the
+  unit being active. An operator whose unit had failed would repair the ruleset,
+  watch every line print PASS, and still be told "the egress firewall is not
+  active" by `agentbox run`. Three signals disagreeing is worse than one bad
+  signal.
+- **It could print nothing at all.** A full run exits at its first failure —
+  the `api.github.com` fetch, the schema check, a resolution pass — all of
+  which come before `verify()`. A diagnostic tool that goes silent exactly when
+  the network is broken is a diagnostic tool for the case you do not have.
+
+So `firewall-check` restarts the unit and then runs `--verify-only` as a
+separate step. That rebuilds, serialises through systemd, clears a failed unit,
+and prints the table whether or not the rebuild worked, saying which happened.
+`--verify-only` remains the right thing for any caller that must not depend on
+DNS or on `api.github.com`.
+
+**And the script takes a lock of its own**, `flock` on
+`/run/agent-box-firewall.lock`, held by the rebuild and by the Docker hook.
+Driving the unit is the fix for the paths this repository controls; the lock is
+what protects a box where someone runs the script by hand. Every `iptables` and
+`iptables-restore` call also carries `-w 5`, which covers the xtables lock
+independently of either.
 
 ## Why docker.service gets a drop-in, and why the socket is owned by name
 
@@ -1286,4 +1340,60 @@ Three things follow:
   hours, but it trades the atomic swap — the property that makes a rebuild safe
   under the standing deny — for an hour-long tail of addresses that are no
   longer the allowlisted host's.
+
+### What the pool actually does, measured
+
+The earlier characterisation had `cdn.playwright.dev` answering with one address
+that the two-path union then agreed on. That was true on the day. It is not the
+steady state. Six lookups from the host over thirty seconds, on 2026-09-05:
+
+```
+19:42:06  150.171.109.66
+19:42:11  150.171.109.118
+19:42:16  150.171.109.66
+19:42:21  13.107.253.41  13.107.226.41     <- a different Front Door pool entirely
+19:42:26  150.171.109.116
+19:42:32  150.171.109.115
+```
+
+Five addresses in half a minute, across two unrelated /16s. No single resolution
+pass can hold that, which means no snapshot-based allowlist can. Both rejected
+alternatives get worse in the light of it, not better: the covering prefix is
+now *two* prefixes, one of which (`13.107.0.0/16`) is a large slice of
+Microsoft's edge; and an `ipset` timeout long enough to accumulate this pool is
+long enough to keep a meaningful tail of addresses that have moved on to some
+other tenant.
+
+### So the smoke's runtime check for this one host is advisory
+
+The check was asserting something the box does not promise. What is promised is
+that the name is on the allowlist, and that Playwright's browsers are fetched
+during provisioning, when the network is open. Reachability of that host at an
+arbitrary later moment is not a property of this design, and an agent that needs
+a browser later has the documented remedy — `agentbox firewall-check`, which
+rebuilds and re-pins.
+
+So it prints WARN, counted separately from passes and failures, and it prints it
+only after the retry has run that remedy and it did not help. `api.anthropic.com`
+and `github.com` stay hard failures: they are not behind a pool that behaves
+like this, and the box does promise them.
+
+### The structural fix, for later
+
+A snapshot allowlist and a name that rotates faster than the snapshot is a
+design mismatch, not a tuning problem, and there is a known shape that resolves
+it: **make the set follow resolution instead of polling for it.** `dnsmasq` can
+add an answer's addresses to an ipset as it resolves the name —
+`ipset=/cdn.playwright.dev/allowed-domains` — so the guest's own lookup is what
+authorises the address it is about to connect to. The window between resolving
+and connecting is milliseconds rather than up to fifteen minutes, and it works
+for every rotating host without naming any prefix.
+
+It is not free and that is why it is recorded rather than done. It puts a
+resolver in the guest that everything must go through, it needs the atomic-swap
+rebuild to coexist with entries dnsmasq adds between rebuilds (an ipset with a
+timeout for the dnsmasq-added half, alongside the swapped base set, is the
+obvious shape), and it makes the firewall depend on a daemon that can itself
+fail. Worth evaluating as its own piece of work, against the current behaviour,
+which is: correct, occasionally inconvenient for one host, and honest about it.
 

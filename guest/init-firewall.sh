@@ -66,6 +66,46 @@ CHAIN_FWD="AGENTBOX-FWD"
 # RETURN of its own.
 DOCKER_USER="DOCKER-USER"
 
+# --- serialising two writers ------------------------------------------------
+#
+# There are two ways this script's rebuild is driven and they are not the same
+# mechanism. The timer restarts the systemd unit, which serialises against
+# itself because a Type=oneshot unit that is already running will not start
+# twice. `agentbox firewall-check` used to exec the script directly under sudo,
+# which systemd knows nothing about — and both paths mutate the same global
+# kernel state under fixed names. IPSET_TMP is a constant, so one run's
+# `ipset destroy` lands on the other's half-filled set; the loser either fails
+# its next `ipset add` (a failed unit, which blocks every agent run) or, worse,
+# wins the swap with a set that holds almost nothing, and the live allowlist is
+# silently short while every check still reports PASS.
+#
+# Two layers. `flock` on one file, taken by every writer, is the real fix.
+# `-w` on every iptables call is the cheap one, and it covers the xtables lock
+# even for a writer that predates this file or bypasses it.
+LOCK_FILE="${AGENT_BOX_FW_LOCK:-/run/agent-box-firewall.lock}"
+LOCK_WAIT_REBUILD=120
+LOCK_WAIT_HOOK=30
+IPT_WAIT=5
+
+# Returns 0 if the lock was taken, 1 if it timed out, and 0 if locking is not
+# available at all — a box without flock or without a writable /run is not made
+# safer by refusing to configure its firewall.
+take_fw_lock() {
+    local secs="${1:?}"
+    command -v flock >/dev/null 2>&1 || return 0
+    # The braces are load-bearing. `exec` with no command applies its
+    # redirections to THIS shell and keeps them, so a bare
+    # `exec 9>"$LOCK_FILE" 2>/dev/null` would silence the script's own stderr
+    # for the whole run — including the hard-close recovery instructions, which
+    # are the one thing an operator locked out of their box needs to read.
+    # Written that way first, and the smoke caught it: the hard close happened
+    # correctly and said nothing at all. Grouping scopes the 2>/dev/null to the
+    # open attempt, which is all it was ever meant to cover.
+    { exec 9>"$LOCK_FILE"; } 2>/dev/null || return 0
+    flock -w "$secs" 9 || return 1
+    return 0
+}
+
 # IFS is left alone deliberately: with IFS=$'\n\t', `log a b` would join its
 # arguments with a newline instead of a space.
 log() { printf '%s\n' "$*"; }
@@ -104,26 +144,61 @@ docker_daemon_up() {
 # The chain exists only once dockerd has run at least once.
 chain_exists() {
     local ipt="$1" chain="$2"
-    "$ipt" -n -L "$chain" >/dev/null 2>&1
+    "$ipt" -w "$IPT_WAIT" -n -L "$chain" >/dev/null 2>&1
 }
 
 # The interface the default route leaves by. Traffic forwarded out of anything
 # else — a Docker bridge — is container-to-container or a published port, never
 # egress, and must not be filtered by the allowlist.
 uplink_iface() {
-    ip route 2>/dev/null | awk '/^default/ {print $5; exit}'
+    # No `exit` in the awk, and that is not style. `awk '{...; exit}' ` closes
+    # the pipe as soon as it has what it wants, so `ip route` is killed with
+    # SIGPIPE whenever its output is longer than the pipe buffer — which on a
+    # --docker box with a couple of user-defined networks it is. Under
+    # `set -o pipefail` the pipeline then returns 141, and at every call site
+    # here the result is assigned with a plain command substitution, so `set -e`
+    # takes the whole script down.
+    #
+    # It went unseen because the plain box's routing table is three lines and
+    # fits in the buffer. Adding a caller inside verify() surfaced it on the
+    # Docker instance: the run died immediately after `out-chain-first`, and
+    # `agentbox firewall-check` exited 141 with the table half printed.
+    #
+    # Reading to EOF and keeping the first match costs nothing and cannot race.
+    ip route 2>/dev/null | awk '/^default/ && !seen { print $5; seen = 1 }'
+}
+
+# The two rules that must LEAD AGENTBOX-FWD (v4), emitted as bare rule bodies so
+# that both places which build the chain can use them: the full rebuild, which
+# prints them into an iptables-restore file, and docker_hook's fallback, which
+# appends them with `iptables -A`.
+#
+# One function because there were two, and they disagreed. The rebuild grew the
+# inbound DROP; the hook's fallback did not, so the branch that exists precisely
+# to cover the window before the first full rebuild — a fresh --docker box's
+# first daemon start, and the flush-and-restart recovery the hard-close message
+# recommends — installed a chain that was closed for egress and open inbound.
+# That is finding R3, and it reopened B1 in the one window B1's rule was for.
+#
+# Order matters and is asserted by the smoke: DROP first, RETURN second. The
+# reverse would return the inbound packet to DOCKER-FORWARD before it was judged.
+fwd_leading_rules() {
+    local uplink="$1"
+    [ -n "$uplink" ] || return 0
+    printf -- '-i %s -m conntrack --ctstate NEW -j DROP\n' "$uplink"
+    printf -- '! -o %s -j RETURN\n' "$uplink"
 }
 
 ensure_chain() {
     local ipt="$1" chain="$2"
-    chain_exists "$ipt" "$chain" || "$ipt" -N "$chain"
+    chain_exists "$ipt" "$chain" || "$ipt" -w "$IPT_WAIT" -N "$chain"
 }
 
 # `iptables -S CHAIN` prints the chain's own declaration first, so the Nth rule
 # is the (N+1)th line. This returns the first rule, or the empty string.
 first_rule() {
     local ipt="$1" chain="$2"
-    "$ipt" -S "$chain" 2>/dev/null | sed -n '2p'
+    "$ipt" -w "$IPT_WAIT" -S "$chain" 2>/dev/null | sed -n '2p'
 }
 
 # Make `-j TARGET` rule 1 of CHAIN, idempotently, leaving no duplicates.
@@ -135,15 +210,15 @@ ensure_jump_first() {
     local ipt="$1" chain="$2" target="$3" want line n
     want="-A ${chain} -j ${target}"
     if [ "$(first_rule "$ipt" "$chain")" != "$want" ]; then
-        "$ipt" -I "$chain" 1 -j "$target"
+        "$ipt" -w "$IPT_WAIT" -I "$chain" 1 -j "$target"
     fi
     # Every further copy, removed from the top down. The first match is the one
     # just placed (or already correct) at rule 1; the second is a duplicate.
     while :; do
-        line=$("$ipt" -S "$chain" 2>/dev/null | grep -n -x -F -- "$want" | sed -n '2p' | cut -d: -f1) || true
+        line=$("$ipt" -w "$IPT_WAIT" -S "$chain" 2>/dev/null | grep -n -x -F -- "$want" | sed -n '2p' | cut -d: -f1) || true
         [ -n "$line" ] || break
         n=$((line - 1))
-        "$ipt" -D "$chain" "$n"
+        "$ipt" -w "$IPT_WAIT" -D "$chain" "$n"
     done
 }
 
@@ -196,35 +271,50 @@ container_probe() {
 }
 
 verify() {
-    # Two counters, and the split is the whole of finding C1. `failures` are
-    # assertions about the RULESET — readable from the kernel, needing no
-    # network, and true or false regardless of what any remote host is doing.
-    # `warnings` are probes that leave the machine. A probe that needs the
-    # internet cannot be the thing that decides whether the box is safe to use:
-    # this function's return value is the unit's exit status, and a failed unit
-    # aborts provisioning, hard-closes the guest and makes guest/lib.sh refuse
-    # every run. Docker Hub having a bad minute is not a reason to do any of
-    # that. Only `failures` sets the exit status; `warnings` are reported, in
-    # the log and in `agentbox firewall-check`'s output, and that is all.
+    # Two counters. The line between them is NOT "local versus remote" — an
+    # earlier version of this comment said that and the code never matched it,
+    # which is finding R4. It is the direction the check fails in.
+    #
+    # `failures` are checks that can only fail on AFFIRMATIVE evidence that the
+    # ruleset is wrong: a policy that is not DROP, a jump that is not there, or
+    # something reachable that the allowlist says must not be. A remote host
+    # having a bad minute cannot produce any of them. Note what that includes:
+    # `literal-ip-denied`, `foreign-dns-denied` and `egress-denied` all send
+    # packets, and all three are still fatal, because the only way they fail is
+    # by something answering that should have been refused. That is a fact about
+    # this box.
+    #
+    # `warnings` are checks that fail on an ABSENCE — something allowlisted did
+    # not answer. api.anthropic.com, github.com and the container's reach to the
+    # model API are all in this half. An absence is exactly what an outage, a
+    # rate limit, a CDN rotating an address or a captive network produces, and
+    # this function's return value is the unit's exit status: a failed unit
+    # aborts provisioning under `set -e`, and the EXIT trap's second failed
+    # restart hard-closes the guest down to loopback and ssh. Handing that
+    # trigger to a third party is the defect; a ten-minute `agentbox create`
+    # must not end in a dead box because an API was briefly slow.
+    #
+    # Only `failures` sets the exit status. `warnings` are reported in the log
+    # and in `agentbox firewall-check`'s output, and that is all.
     local failures=0 warnings=0
 
     # --- the mechanism itself ---------------------------------------------
 
-    if iptables -S 2>/dev/null | grep -qx -- '-P OUTPUT DROP'; then
+    if iptables -w "$IPT_WAIT" -S 2>/dev/null | grep -qx -- '-P OUTPUT DROP'; then
         log "PASS  policy-drop        iptables OUTPUT policy is DROP"
     else
         log "FAIL  policy-drop        iptables OUTPUT policy is not DROP"
         failures=$((failures + 1))
     fi
 
-    if ip6tables -S 2>/dev/null | grep -qx -- '-P OUTPUT DROP'; then
+    if ip6tables -w "$IPT_WAIT" -S 2>/dev/null | grep -qx -- '-P OUTPUT DROP'; then
         log "PASS  policy-drop-v6     ip6tables OUTPUT policy is DROP"
     else
         log "FAIL  policy-drop-v6     ip6tables OUTPUT policy is not DROP"
         failures=$((failures + 1))
     fi
 
-    if iptables -S 2>/dev/null | grep -qx -- '-P FORWARD DROP'; then
+    if iptables -w "$IPT_WAIT" -S 2>/dev/null | grep -qx -- '-P FORWARD DROP'; then
         log "PASS  forward-drop       iptables FORWARD policy is DROP"
     else
         log "FAIL  forward-drop       iptables FORWARD policy is not DROP"
@@ -253,7 +343,7 @@ verify() {
     # Naming the bridges explicitly is deny-by-default for interfaces nobody
     # anticipated; this check is what makes the naming safe.
     local vuplink
-    vuplink=$(uplink_iface)
+    vuplink=$(uplink_iface || true)
     case "$vuplink" in
         br*|docker0)
             log "FAIL  uplink-not-bridge  the uplink is '${vuplink}', which ${CHAIN_OUT}'s bridge accepts would match, bypassing the allowlist"
@@ -268,7 +358,7 @@ verify() {
             ;;
     esac
 
-    if iptables -S "$CHAIN_OUT" 2>/dev/null | grep -q -- "--match-set ${IPSET_NAME} dst -j ACCEPT"; then
+    if iptables -w "$IPT_WAIT" -S "$CHAIN_OUT" 2>/dev/null | grep -q -- "--match-set ${IPSET_NAME} dst -j ACCEPT"; then
         log "PASS  allowlist-rule     the ${IPSET_NAME} ipset is referenced"
     else
         log "FAIL  allowlist-rule     no rule references the ${IPSET_NAME} ipset"
@@ -303,20 +393,23 @@ verify() {
         log "PASS  egress-denied      https://example.com blocked as expected"
     fi
 
+    # The two below are the ones that fail on an absence, so they are advisory.
+    # Everything above this line fails only when something answered that should
+    # not have.
     local code
     if code=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' https://api.anthropic.com/ 2>/dev/null) \
         && [ -n "$code" ] && [ "$code" != "000" ]; then
         log "PASS  anthropic-allowed  https://api.anthropic.com/ returned HTTP ${code}"
     else
-        log "FAIL  anthropic-allowed  https://api.anthropic.com/ did not answer"
-        failures=$((failures + 1))
+        log "WARN  anthropic-allowed  https://api.anthropic.com/ did not answer"
+        warnings=$((warnings + 1))
     fi
 
     if curl -sS -m 10 -o /dev/null https://github.com 2>/dev/null; then
         log "PASS  github-allowed     https://github.com reachable"
     else
-        log "FAIL  github-allowed     https://github.com unreachable"
-        failures=$((failures + 1))
+        log "WARN  github-allowed     https://github.com unreachable"
+        warnings=$((warnings + 1))
     fi
 
     # --- containers obey the same allowlist -------------------------------
@@ -372,14 +465,26 @@ verify() {
             log "SKIP  docker-egress      ${PROBE_IMAGE} is not present locally; not pulling from inside the firewall unit"
             log "SKIP  docker-allowed     ${PROBE_IMAGE} is not present locally"
         else
+            # Three ways, not two. container_probe already separates them and
+            # the old code threw the distinction away. `connected` means a
+            # container DID reach a host the allowlist forbids — affirmative
+            # evidence that DOCKER-USER is not reaching AGENTBOX-FWD, or that
+            # AGENTBOX-FWD is not filtering. No outage, rate limit or registry
+            # hiccup can produce it, and it is the exact containment breach this
+            # profile exists to prevent, so it is fatal. `error:` means the
+            # probe itself did not run — inconclusive, and a warning.
             local r
             r=$(container_probe https://example.com)
-            if [ "$r" = "blocked" ]; then
-                log "PASS  docker-egress      a container could not reach https://example.com"
-            else
-                log "WARN  docker-egress      a container reaching https://example.com: ${r}"
-                warnings=$((warnings + 1))
-            fi
+            case "$r" in
+                blocked)
+                    log "PASS  docker-egress      a container could not reach https://example.com" ;;
+                connected)
+                    log "FAIL  docker-egress      a container REACHED https://example.com; container egress is not filtered"
+                    failures=$((failures + 1)) ;;
+                *)
+                    log "WARN  docker-egress      the container probe was inconclusive: ${r}"
+                    warnings=$((warnings + 1)) ;;
+            esac
 
             r=$(container_probe https://api.anthropic.com/)
             if [ "$r" = "connected" ]; then
@@ -435,7 +540,7 @@ fi
 
 docker_hook() {
     local ipt rc=0 uplink fatal
-    uplink=$(uplink_iface)
+    uplink=$(uplink_iface || true)
 
     for ipt in iptables ip6tables; do
         # The v4 arm has to succeed; the v6 arm must never be able to take the
@@ -464,16 +569,31 @@ docker_hook() {
         # open, and let the next timer tick fill it in properly.
         if [ -z "$(first_rule "$ipt" "$CHAIN_FWD")" ]; then
             log "WARN: ${CHAIN_FWD} (${ipt}) was empty; closing it until the next rebuild"
-            if [ "$ipt" = "iptables" ] && [ -n "$uplink" ]; then
-                "$ipt" -A "$CHAIN_FWD" ! -o "$uplink" -j RETURN
-                "$ipt" -A "$CHAIN_FWD" -j REJECT --reject-with icmp-admin-prohibited
-            elif [ "$ipt" = "iptables" ]; then
-                "$ipt" -A "$CHAIN_FWD" -j REJECT --reject-with icmp-admin-prohibited
+            if [ "$ipt" = "iptables" ]; then
+                # The same leading pair the full rebuild emits, from the same
+                # function, so this branch can never drift open again.
+                while read -r _r; do
+                    [ -n "$_r" ] || continue
+                    # shellcheck disable=SC2086  # $_r is a rule body and must word-split.
+                    "$ipt" -w "$IPT_WAIT" -A "$CHAIN_FWD" $_r
+                done < <(fwd_leading_rules "$uplink")
+                "$ipt" -w "$IPT_WAIT" -A "$CHAIN_FWD" -j REJECT --reject-with icmp-admin-prohibited
             else
-                "$ipt" -A "$CHAIN_FWD" -j REJECT --reject-with icmp6-adm-prohibited
+                "$ipt" -w "$IPT_WAIT" -A "$CHAIN_FWD" -j REJECT --reject-with icmp6-adm-prohibited
             fi
         fi
-        "$ipt" -P FORWARD DROP || true
+        # v4 failures are real failures: with no `-` on the ExecStartPost, a
+        # non-zero return here stops a daemon whose containers this script
+        # cannot filter, which is the correct outcome. v6 egress is closed by
+        # policy, so its arm stays advisory.
+        if ! "$ipt" -w "$IPT_WAIT" -P FORWARD DROP; then
+            if [ "$fatal" -eq 1 ]; then
+                log "ERROR: docker-hook could not set the ${ipt} FORWARD policy to DROP" >&2
+                rc=1
+            else
+                log "WARN: docker-hook could not set the ${ipt} FORWARD policy to DROP"
+            fi
+        fi
         if chain_exists "$ipt" "$DOCKER_USER"; then
             ensure_jump_first "$ipt" "$DOCKER_USER" "$CHAIN_FWD" || true
             if [ "$(first_rule "$ipt" "$DOCKER_USER")" = "-A ${DOCKER_USER} -j ${CHAIN_FWD}" ]; then
@@ -495,8 +615,32 @@ docker_hook() {
 }
 
 if [ "${1:-}" = "--docker-hook" ]; then
+    # The same lock the rebuild takes, so the hook cannot append to
+    # AGENTBOX-FWD while a restore is replacing it. A shorter wait than the
+    # rebuild's, and it proceeds anyway on a timeout: this runs as docker's
+    # ExecStartPost, so blocking here blocks the daemon starting, and a rebuild
+    # in flight will place the jump itself when it finishes. The `-w` on every
+    # iptables call is what actually makes the unlocked path safe.
+    take_fw_lock "$LOCK_WAIT_HOOK" \
+        || log "WARN: docker-hook proceeding without the rebuild lock after ${LOCK_WAIT_HOOK}s"
     docker_hook
     exit $?
+fi
+
+# ---------------------------------------------------------------------------
+# One rebuild at a time
+# ---------------------------------------------------------------------------
+#
+# Taken before anything is fetched, resolved or written, and held for the rest
+# of the run. Two rebuilds racing corrupt the ipset swap: IPSET_TMP is a fixed
+# name, so one run's `ipset destroy` lands on the other's half-filled set.
+#
+# A timeout here is a real anomaly rather than a busy machine — a rebuild is
+# seconds — so it fails rather than proceeding, and it fails before touching
+# anything, which leaves the standing ruleset exactly as it was.
+if ! take_fw_lock "$LOCK_WAIT_REBUILD"; then
+    log "ERROR: another firewall rebuild has held ${LOCK_FILE} for more than ${LOCK_WAIT_REBUILD}s" >&2
+    exit 1
 fi
 
 # ---------------------------------------------------------------------------
@@ -504,7 +648,7 @@ fi
 # ---------------------------------------------------------------------------
 
 standing_deny_in_place() {
-    iptables -S 2>/dev/null | grep -qx -- '-P OUTPUT DROP'
+    iptables -w "$IPT_WAIT" -S 2>/dev/null | grep -qx -- '-P OUTPUT DROP'
 }
 
 # Nothing below tears down the live ruleset, so an error normally leaves the
@@ -544,20 +688,20 @@ _close_and_exit() {
     local ipt
     for ipt in iptables ip6tables; do
         command -v "$ipt" >/dev/null 2>&1 || continue
-        "$ipt" -P INPUT DROP   2>/dev/null || true
-        "$ipt" -P FORWARD DROP 2>/dev/null || true
-        "$ipt" -P OUTPUT DROP  2>/dev/null || true
-        "$ipt" -F INPUT   2>/dev/null || true
-        "$ipt" -F FORWARD 2>/dev/null || true
-        "$ipt" -F OUTPUT  2>/dev/null || true
+        "$ipt" -w "$IPT_WAIT" -P INPUT DROP   2>/dev/null || true
+        "$ipt" -w "$IPT_WAIT" -P FORWARD DROP 2>/dev/null || true
+        "$ipt" -w "$IPT_WAIT" -P OUTPUT DROP  2>/dev/null || true
+        "$ipt" -w "$IPT_WAIT" -F INPUT   2>/dev/null || true
+        "$ipt" -w "$IPT_WAIT" -F FORWARD 2>/dev/null || true
+        "$ipt" -w "$IPT_WAIT" -F OUTPUT  2>/dev/null || true
         ensure_chain "$ipt" "$CHAIN_IN"  2>/dev/null || true
         ensure_chain "$ipt" "$CHAIN_OUT" 2>/dev/null || true
         ensure_chain "$ipt" "$CHAIN_FWD" 2>/dev/null || true
-        "$ipt" -F "$CHAIN_IN"  2>/dev/null || true
-        "$ipt" -F "$CHAIN_OUT" 2>/dev/null || true
-        "$ipt" -F "$CHAIN_FWD" 2>/dev/null || true
-        "$ipt" -A "$CHAIN_IN"  -i lo -j ACCEPT 2>/dev/null || true
-        "$ipt" -A "$CHAIN_OUT" -o lo -j ACCEPT 2>/dev/null || true
+        "$ipt" -w "$IPT_WAIT" -F "$CHAIN_IN"  2>/dev/null || true
+        "$ipt" -w "$IPT_WAIT" -F "$CHAIN_OUT" 2>/dev/null || true
+        "$ipt" -w "$IPT_WAIT" -F "$CHAIN_FWD" 2>/dev/null || true
+        "$ipt" -w "$IPT_WAIT" -A "$CHAIN_IN"  -i lo -j ACCEPT 2>/dev/null || true
+        "$ipt" -w "$IPT_WAIT" -A "$CHAIN_OUT" -o lo -j ACCEPT 2>/dev/null || true
     done
 
     # Closing egress must not also lock the operator out. Lima reaches this
@@ -566,16 +710,16 @@ _close_and_exit() {
     # one needed to run the recovery printed below. These three rules keep that
     # door open without opening egress: no NEW outbound connection is permitted,
     # only replies on connections that already exist.
-    iptables -A "$CHAIN_IN"  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-    iptables -A "$CHAIN_OUT" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    iptables -w "$IPT_WAIT" -A "$CHAIN_IN"  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    iptables -w "$IPT_WAIT" -A "$CHAIN_OUT" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
     if [ -n "$gw" ]; then
-        iptables -A "$CHAIN_IN" -s "${gw}/32" -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
+        iptables -w "$IPT_WAIT" -A "$CHAIN_IN" -s "${gw}/32" -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
     else
-        iptables -A "$CHAIN_IN" -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
+        iptables -w "$IPT_WAIT" -A "$CHAIN_IN" -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
     fi
     # Containers, if any, are cut off with everything else.
-    iptables  -A "$CHAIN_FWD" -j REJECT --reject-with icmp-admin-prohibited 2>/dev/null || true
-    ip6tables -A "$CHAIN_FWD" -j REJECT --reject-with icmp6-adm-prohibited  2>/dev/null || true
+    iptables  -w "$IPT_WAIT" -A "$CHAIN_FWD" -j REJECT --reject-with icmp-admin-prohibited 2>/dev/null || true
+    ip6tables -w "$IPT_WAIT" -A "$CHAIN_FWD" -j REJECT --reject-with icmp6-adm-prohibited  2>/dev/null || true
     ensure_jumps iptables  2>/dev/null || true
     ensure_jumps ip6tables 2>/dev/null || true
 
@@ -651,7 +795,7 @@ HOST_IP=$(ip route | awk '/^default/ {print $3; exit}')
 [ -n "$HOST_IP" ] || die_fw "failed to detect the default gateway"
 log "Host gateway: ${HOST_IP}"
 
-UPLINK=$(uplink_iface)
+UPLINK=$(uplink_iface || true)
 [ -n "$UPLINK" ] || die_fw "failed to detect the uplink interface"
 log "Uplink interface: ${UPLINK}"
 
@@ -883,11 +1027,22 @@ done
     # than lucky: it is served over ssh, so the connection to the published port
     # is opened by sshd INSIDE the guest and leaves through OUTPUT, never
     # crossing FORWARD from the uplink. Measured both ways in the smoke test.
-    printf -- '-A %s -i %s -m conntrack --ctstate NEW -j DROP\n' "$CHAIN_FWD" "$UPLINK"
+    #
+    # One behaviour change this rule does make, worth knowing before debugging a
+    # silent container timeout: conntrack forgets a UDP flow after 30 seconds
+    # unreplied, 120 replied. A container that opens a UDP flow to a peer and
+    # then hears nothing for longer than that loses its entry, so the peer's
+    # next datagram arrives on the uplink as NEW and is dropped rather than
+    # returned to DOCKER-FORWARD. Before this rule it would have been accepted.
+    # Arguably the rule doing its job; either way, it is where to look.
     # Anything not leaving by the uplink — container to container, a published
-    # port coming the other way — is returned unjudged, because it is not egress
-    # and DOCKER-FORWARD is the chain that decides it.
-    printf -- '-A %s ! -o %s -j RETURN\n' "$CHAIN_FWD" "$UPLINK"
+    # port coming the other way — is returned unjudged after that, because it is
+    # not egress and DOCKER-FORWARD is the chain that decides it. Both rules come
+    # from fwd_leading_rules, which docker_hook's fallback also uses.
+    while read -r _r; do
+        [ -n "$_r" ] || continue
+        printf -- '-A %s %s\n' "$CHAIN_FWD" "$_r"
+    done < <(fwd_leading_rules "$UPLINK")
     printf -- '-A %s -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n' "$CHAIN_FWD"
     while read -r ns; do
         [ -n "$ns" ] || continue
@@ -900,7 +1055,7 @@ done
     printf 'COMMIT\n'
 } > "$RULES"
 
-iptables-restore --noflush < "$RULES"
+iptables-restore -w "$IPT_WAIT" --noflush < "$RULES"
 log "IPv4 ruleset applied"
 
 # IPv6: no allowlist is maintained for it, so it is closed completely. Not
@@ -922,7 +1077,7 @@ log "IPv4 ruleset applied"
     printf 'COMMIT\n'
 } > "$RULES6"
 
-ip6tables-restore --noflush < "$RULES6"
+ip6tables-restore -w "$IPT_WAIT" --noflush < "$RULES6"
 log "IPv6 ruleset applied (closed)"
 
 # Again, after the restore. The jumps live in chains this script does not own,

@@ -55,11 +55,16 @@ UNFORWARDED_PORT=3997
 
 PASS=0
 FAIL=0
+# Advisory. Counted and printed, never fatal, and deliberately a third category
+# rather than a quiet pass: a check that is allowed not to hold still has to say
+# when it did not. Exactly one check uses it — see cdn.playwright.dev below.
+WARN=0
 
 hr()   { printf '%s\n' '==============================================================='; }
 step() { hr; printf '## %s\n' "$*"; hr; }
 ok()   { PASS=$((PASS + 1)); printf 'PASS  %s\n' "$*"; }
 bad()  { FAIL=$((FAIL + 1)); printf 'FAIL  %s\n' "$*"; }
+adv()  { WARN=$((WARN + 1)); printf 'WARN  %s\n' "$*"; }
 
 # Set while the stand-in CLI is in place, so that an abort restores the real
 # one rather than leaving it parked at claude.real.
@@ -351,7 +356,7 @@ if "$LIMACTL" list --quiet | grep -qxF "$INSTANCE"; then
     ok "instance ${INSTANCE} exists"
 else
     bad "instance ${INSTANCE} does not exist; the remaining guest checks cannot run"
-    hr; printf 'RESULT: %s passed, %s failed\n' "$PASS" "$FAIL"; hr
+    hr; printf 'RESULT: %s passed, %s failed, %s advisory\n' "$PASS" "$FAIL" "$WARN"; hr
     exit 1
 fi
 
@@ -1102,7 +1107,7 @@ else
     # non-zero, which would make every assertion below report a pass for a run
     # that never happened.
     bad "the fake-token run printed no id; skipping the checks that depend on it"
-    hr; printf 'RESULT: %s passed, %s failed\n' "$PASS" "$FAIL"; hr
+    hr; printf 'RESULT: %s passed, %s failed, %s advisory\n' "$PASS" "$FAIL" "$WARN"; hr
     exit 1
 fi
 
@@ -2619,8 +2624,13 @@ printf 'This installs Docker Engine, Node 22 and Playwright system libraries.\n'
 printf 'It is slower than the first create; it is not stuck.\n'
 DK_CREATE_OUT="${TMP_ROOT}/dk-create.out"
 DK_TS=$(date +%s)
+# FORWARD_PORT twice, deliberately: the flag accumulates across repeats and
+# across a comma list, so a duplicate must be collapsed rather than prepending
+# two identical portForwards entries and printing `forwarded 3999 3999 3998`.
+# The summary assertion below is what proves it.
 run_bounded 2400 "$DK_CREATE_OUT" "$AGENTBOX" create "$DOCKER_REPO" \
-    --docker --playwright --rosetta --forward "${FORWARD_PORT},${FORWARD_PORT2}"
+    --docker --playwright --rosetta \
+    --forward "${FORWARD_PORT},${FORWARD_PORT}" --forward "${FORWARD_PORT2}"
 dk_rc=$BOUNDED_RC
 cat "$DK_CREATE_OUT"
 printf 'docker-profile create took %s seconds\n' "$(( $(date +%s) - DK_TS ))"
@@ -2632,9 +2642,9 @@ else
     bad "--forward printed no warning"
 fi
 if grep -qE "^  forwarded +${FORWARD_PORT} ${FORWARD_PORT2}\$" "$DK_CREATE_OUT"; then
-    ok "the summary records the forwarded port"
+    ok "the summary records both forwarded ports, with the repeated one collapsed"
 else
-    bad "the summary does not record the forwarded port"
+    bad "the summary does not read 'forwarded   ${FORWARD_PORT} ${FORWARD_PORT2}'; a repeated --forward was not de-duplicated"
 fi
 if grep -qE '^agentbox: sizing: 4 cpus, 8GiB memory, 60GiB disk$' "$DK_CREATE_OUT"; then
     ok "--docker raised the default sizing to 4/8GiB/60GiB"
@@ -2646,7 +2656,7 @@ if "$LIMACTL" list --quiet | grep -qxF "$DOCKER_INSTANCE"; then
     ok "instance ${DOCKER_INSTANCE} exists"
 else
     bad "instance ${DOCKER_INSTANCE} does not exist; the remaining Docker checks cannot run"
-    hr; printf 'RESULT: %s passed, %s failed\n' "$PASS" "$FAIL"; hr
+    hr; printf 'RESULT: %s passed, %s failed, %s advisory\n' "$PASS" "$FAIL" "$WARN"; hr
     exit 1
 fi
 
@@ -2936,6 +2946,41 @@ else
     bad "no container could run after the daemon restart"
 fi
 
+printf -- '\n--- the hook fallback closes AGENTBOX-FWD inbound too ---\n'
+# docker_hook has a second branch: when AGENTBOX-FWD is EMPTY it fills the chain
+# itself rather than leaving it open. That branch is reached on a fresh
+# --docker box's first daemon start and after the hard-close recovery, and it
+# used to write only `! -o eth0 -j RETURN` plus the REJECT — closed for egress
+# and wide open inbound, which is exactly the hole rule 1 exists to close, in
+# exactly the window the hook exists to cover. Both builders now emit the pair
+# from one function; this is the branch the full rebuild never reaches.
+FALLBACK_OUT="${TMP_ROOT}/hook-fallback.out"
+# shellcheck disable=SC2016  # every expansion here is the guest's, not this shell's.
+run_bounded 300 "$FALLBACK_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c '
+sudo iptables -F AGENTBOX-FWD
+echo "FLUSHED_RULE1=$(sudo iptables -S AGENTBOX-FWD | sed -n "2p")"
+sudo systemctl restart docker
+echo "FB_RULE1=$(sudo iptables -S AGENTBOX-FWD | sed -n "2p")"
+echo "FB_RULE2=$(sudo iptables -S AGENTBOX-FWD | sed -n "3p")"
+sudo iptables -S AGENTBOX-FWD
+'
+cat "$FALLBACK_OUT"
+if grep -qx 'FLUSHED_RULE1=' "$FALLBACK_OUT"; then
+    ok "AGENTBOX-FWD was really empty before the restart, so the fallback branch was taken"
+else
+    bad "AGENTBOX-FWD was not empty; the fallback branch was not exercised"
+fi
+if grep -qE '^FB_RULE1=-A AGENTBOX-FWD -i [a-z0-9]+ -m conntrack --ctstate NEW -j DROP$' "$FALLBACK_OUT"; then
+    ok "the hook fallback leads with the inbound DROP, like the full rebuild"
+else
+    bad "the hook fallback rebuilt AGENTBOX-FWD without the inbound DROP"
+fi
+if grep -qE '^FB_RULE2=-A AGENTBOX-FWD ! -o [a-z0-9]+ -j RETURN$' "$FALLBACK_OUT"; then
+    ok "the hook fallback puts the uplink RETURN second, after the drop"
+else
+    bad "the hook fallback's second rule is not the uplink RETURN"
+fi
+
 printf -- '\n--- a forced firewall rebuild leaves Docker chains intact ---\n'
 # `restart`, not `start`: agent-box-firewall is a RemainAfterExit oneshot, so
 # `start` on an already-active unit does nothing at all and would make this
@@ -3004,14 +3049,37 @@ else
     bad "node --version is not 22.x"
 fi
 
+# The pin, read from the provisioner rather than restated here, so the two can
+# never drift. `npx --yes playwright --version` resolves the `latest` dist-tag
+# again at test time, so on its own it asserts nothing about the pin and would
+# keep passing after 1.63.0 stopped being latest.
+PLAYWRIGHT_PIN=$(sed -n 's/^PLAYWRIGHT_VERSION="\(.*\)"$/\1/p' "${BOX_DIR}/guest/provision.sh" | head -1)
+printf 'the pin in guest/provision.sh is %s\n' "${PLAYWRIGHT_PIN:-<unread>}"
+if [ -n "$PLAYWRIGHT_PIN" ]; then
+    ok "guest/provision.sh carries a pinned Playwright version"
+else
+    bad "no PLAYWRIGHT_VERSION pin found in guest/provision.sh"
+fi
+
 PW_OUT="${TMP_ROOT}/playwright.out"
 run_bounded 300 "$PW_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- \
-    bash -lc 'npx --yes playwright --version'
+    bash -lc "npx --yes playwright@${PLAYWRIGHT_PIN} --version"
 cat "$PW_OUT"
-if grep -qiE 'Version [0-9]+\.[0-9]+' "$PW_OUT"; then
-    ok "npx playwright --version printed a version"
+if grep -qiE "Version ${PLAYWRIGHT_PIN}" "$PW_OUT"; then
+    ok "the pinned Playwright ${PLAYWRIGHT_PIN} resolves and runs in the guest"
 else
-    bad "npx playwright --version printed no version"
+    bad "playwright@${PLAYWRIGHT_PIN} did not report version ${PLAYWRIGHT_PIN}"
+fi
+
+# And that the pin is what provisioning actually used: the marker file
+# install_playwright_deps writes names the version it ran.
+PWMARK_OUT="${TMP_ROOT}/playwright-marker.out"
+dguest bash -c 'cat /var/lib/agent-box/playwright-deps-installed 2>&1' > "$PWMARK_OUT" 2>&1
+cat "$PWMARK_OUT"
+if grep -q "playwright@${PLAYWRIGHT_PIN} install-deps" "$PWMARK_OUT"; then
+    ok "install-deps was run from the pinned version, per its own marker"
+else
+    bad "the install-deps marker does not name playwright@${PLAYWRIGHT_PIN}"
 fi
 
 printf -- '\n--- a Playwright system library is installed ---\n'
@@ -3066,7 +3134,7 @@ AL_OUT="${TMP_ROOT}/allowlist-reach.out"
 # a pool is the shape a real download has, and a name that is genuinely absent
 # still fails all six.
 # shellcheck disable=SC2016  # $u and $code must expand in the guest, not here.
-run_bounded 600 "$AL_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c '
+run_bounded 1200 "$AL_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c '
 for u in http://ports.ubuntu.com/ \
          https://download.docker.com/linux/ubuntu/gpg \
          https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt \
@@ -3083,10 +3151,30 @@ for u in http://ports.ubuntu.com/ \
         [ -n "$code" ] && [ "$code" != 000 ] && break
         sleep 2
     done
+    # Six failures means the pinned address is not one this name is answering
+    # on. For most hosts that means the entry is missing, which is the defect
+    # this check exists to find. For a CDN that hands out one address from a
+    # rotating pool it can also just mean the pool moved since the last rebuild,
+    # and the documented remedy for that is a rebuild — daily-use.md tells the
+    # operator to run `agentbox firewall-check`, which restarts this very unit.
+    # So the retry runs the remedy and tries again: a name that is genuinely
+    # absent still fails, and this asserts that the advice we give actually
+    # works.
+    if [ "${code:-000}" = 000 ]; then
+        printf "REBUILD-RETRY %s\n" "$u"
+        sudo systemctl restart agent-box-firewall.service >/dev/null 2>&1 || true
+        for _try in 1 2 3 4 5 6; do
+            code=$(curl -sS -m 12 -o /dev/null -w "%{http_code}" "$u" 2>/dev/null || true)
+            [ -n "$code" ] && [ "$code" != 000 ] && break
+            sleep 3
+        done
+    fi
     printf "REACH %s %s\n" "${code:-000}" "$u"
 done
 '
-grep '^REACH' "$AL_OUT" || cat "$AL_OUT"
+# REBUILD-RETRY too, or the evidence that the documented remedy was tried is
+# filtered out of the displayed output while sitting in the file.
+grep -E '^(REACH|REBUILD-RETRY)' "$AL_OUT" || cat "$AL_OUT"
 # The three added last are the ones the review found unexercised: the two Docker
 # Hub blob CDNs (one of which was added only after a real pull was redirected to
 # it and refused) and the ghcr blob host, whose entry the allowlist's own comment
@@ -3096,6 +3184,27 @@ for host in ports.ubuntu.com download.docker.com nodejs.org cdn.playwright.dev g
             production.cloudflare.docker.com production.cloudfront.docker.com; do
     if grep -E "^REACH [1-5][0-9][0-9] " "$AL_OUT" | grep -q -- "${host}"; then
         ok "allowlisted and reachable: ${host}"
+    elif [ "$host" = cdn.playwright.dev ]; then
+        # Advisory, and only this one host. The box does not promise that this
+        # name is reachable at an arbitrary later moment, and the check was
+        # asserting something stronger than the design offers.
+        #
+        # It is an Azure Front Door endpoint answering with a single A record on
+        # a near-zero TTL, out of a pool it rotates through faster than any
+        # rebuild can sample. Measured from the host, six lookups in thirty
+        # seconds returned five different addresses across two unrelated /16s.
+        # The allowlist pins addresses; one resolution pass cannot hold that.
+        #
+        # What the box does promise still holds and is still tested elsewhere:
+        # the name is on the allowlist, and Playwright's browsers are fetched
+        # during provisioning with the network open. An agent that needs a
+        # browser later has the documented remedy — `agentbox firewall-check`,
+        # which rebuilds — and the retry above runs exactly that before giving
+        # up, so a WARN here means the remedy did not help either.
+        #
+        # api.anthropic.com and github.com stay hard: they are not behind a
+        # pool like this and the box does promise them.
+        adv "advisory: ${host} did not answer, even after a rebuild — see the address-pinning entry in docs/decisions.md"
     else
         bad "allowlisted but NOT reachable: ${host}"
     fi
@@ -3277,6 +3386,6 @@ fi
 
 # ===========================================================================
 hr
-printf 'RESULT: %s passed, %s failed\n' "$PASS" "$FAIL"
+printf 'RESULT: %s passed, %s failed, %s advisory\n' "$PASS" "$FAIL" "$WARN"
 hr
 [ "$FAIL" -eq 0 ]

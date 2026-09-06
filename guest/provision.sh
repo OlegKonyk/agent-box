@@ -643,11 +643,14 @@ systemctl enable --now agent-box-firewall.timer
 # for the case where it was not — a fresh install, or a table flush followed by
 # a restart.
 #
-# The leading `-` is deliberate and is finding C3. Without it, an ExecStartPost
-# that exits non-zero makes systemd stop the service it just started: a hook
-# that could not manage the ip6tables side would take Docker down entirely on a
-# box created to run Docker. The hook itself now treats the v6 arm as advisory,
-# so both halves of that failure are closed, independently.
+# There is deliberately NO leading `-`, and the first pass of this round briefly
+# added one. That was finding R5: the review offered two alternatives — guard
+# the ip6tables arm, OR mark the ExecStartPost advisory — and both were applied,
+# which is one too many. The v6 guard alone removes the failure it was for. The
+# `-` on top removed the only thing the hook can still refuse for, which is a v4
+# failure to place the jump, and a daemon that cannot be filtered is exactly the
+# daemon that should not start. Fail-closed is the whole point of the ordering
+# above; making the last step advisory undoes it.
 #
 # Written after the firewall units exist, because the drop-in names one of them.
 
@@ -660,7 +663,7 @@ After=${FIREWALL_UNIT}
 Wants=${FIREWALL_UNIT}
 
 [Service]
-ExecStartPost=-${BOX_DIR}/guest/init-firewall.sh --docker-hook
+ExecStartPost=${BOX_DIR}/guest/init-firewall.sh --docker-hook
 EOF
 
     # The socket, owned by the guest user by name.
