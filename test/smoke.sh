@@ -3278,11 +3278,23 @@ EMPTY_OUT="${TMP_ROOT}/empty-allowlist.out"
 # shellcheck disable=SC2016  # every expansion here is the guest, not this shell.
 run_bounded 300 "$EMPTY_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c '
 set -u
+# The 15-minute refresh timer is live for the whole smoke, and this step spends
+# twenty to forty seconds with the allowlist deliberately empty. A tick in that
+# window refills the set and rewrites the record, --verify-only then correctly
+# exits 0, and the step reports "verify passed on a box whose allowlist holds
+# nothing" — the precise opposite of what happened. Roughly one run in
+# twenty-five, on an assertion whose entire value is being trusted when it
+# fires. So the timer is suspended for the duration and started again below.
+sudo systemctl stop agent-box-firewall.timer
+echo "TIMER_STOPPED=$(systemctl is-active agent-box-firewall.timer || true)"
 echo "RECORDED_CRIT=$(sudo awk "/^api.anthropic.com /" /run/agent-box-firewall-resolved | wc -l | tr -d " ")"
 sudo ipset flush allowed-domains
 echo "SET_ENTRIES=$(sudo ipset save allowed-domains | grep -c "^add " || true)"
 sudo /opt/agent-box/guest/init-firewall.sh --verify-only > /tmp/abx-empty-verify.log 2>&1
 echo "VERIFY_RC=$?"
+# Sampled again at the verdict, not only before it: the guard has to hold over
+# the window it guards, not at one instant before it.
+echo "SET_ENTRIES_AFTER=$(sudo ipset save allowed-domains | grep -c "^add " || true)"
 grep -E "^(PASS|FAIL|WARN)  allowlist-holds" /tmp/abx-empty-verify.log || echo "NO-ALLOWLIST-HOLDS-LINE"
 echo "--- and the box is repaired before anything else runs ---"
 # Egress has to be opened by hand FIRST, and that is a real property rather
@@ -3304,6 +3316,8 @@ echo "REPAIR_RC=$?"
 sudo /opt/agent-box/guest/init-firewall.sh --verify-only > /tmp/abx-repair-verify.log 2>&1
 echo "REVERIFY_RC=$?"
 grep -E "^(PASS|FAIL)  allowlist-holds" /tmp/abx-repair-verify.log || true
+sudo systemctl start agent-box-firewall.timer
+echo "TIMER_RESTARTED=$(systemctl is-active agent-box-firewall.timer || true)"
 '
 cat "$EMPTY_OUT"
 
@@ -3312,10 +3326,15 @@ if grep -qE '^RECORDED_CRIT=[1-9]' "$EMPTY_OUT"; then
 else
     bad "no recorded resolution for api.anthropic.com; the new check has nothing to read"
 fi
-if grep -q '^SET_ENTRIES=0' "$EMPTY_OUT"; then
-    ok "the live set was really emptied, so the check below is not vacuous"
+if grep -q '^TIMER_STOPPED=inactive' "$EMPTY_OUT"; then
+    ok "the refresh timer was suspended, so no tick can refill the set mid-step"
 else
-    bad "the live set was not emptied"
+    bad "the refresh timer was not suspended; this step can report a false failure"
+fi
+if grep -q '^SET_ENTRIES=0' "$EMPTY_OUT" && grep -q '^SET_ENTRIES_AFTER=0' "$EMPTY_OUT"; then
+    ok "the live set was empty throughout the verify, so the check below is not vacuous"
+else
+    bad "the live set was not empty for the whole window"
 fi
 if grep -q '^VERIFY_RC=0' "$EMPTY_OUT"; then
     bad "verify passed on a box whose allowlist holds nothing"
@@ -3341,6 +3360,11 @@ if grep -q '^REVERIFY_RC=0' "$EMPTY_OUT" && grep -q '^PASS  allowlist-holds' "$E
     ok "and allowlist-holds passes again afterwards"
 else
     bad "allowlist-holds still fails after the repair"
+fi
+if grep -q '^TIMER_RESTARTED=active' "$EMPTY_OUT"; then
+    ok "the refresh timer is running again, so the box is left as it was found"
+else
+    bad "the refresh timer was left stopped; every later step now has no 15-minute rebuild"
 fi
 
 # ===========================================================================

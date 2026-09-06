@@ -653,7 +653,19 @@ docker_hook() {
         HOOK_FATAL=1
         [ "$ipt" = "iptables" ] || HOOK_FATAL=0
         if ! command -v "$ipt" >/dev/null 2>&1; then
-            log "WARN: docker-hook: ${ipt} is not installed; skipping"
+            # Split by arm, which makes the enumeration uniform: after this,
+            # every v4 outcome other than success sets HOOK_RC. A kernel with no
+            # v6 support is the case the advisory arm exists for. A guest with
+            # no `iptables` is not a degraded outcome — it is the total absence
+            # of the filtering this hook is the last step of, and returning 0
+            # there would let systemd start a daemon whose containers forward
+            # through DOCKER-FORWARD with nothing in front of them.
+            if [ "$HOOK_FATAL" -eq 1 ]; then
+                log "ERROR: docker-hook: ${ipt} is not installed; containers cannot be filtered" >&2
+                HOOK_RC=1
+            else
+                log "WARN: docker-hook: ${ipt} is not installed; skipping (v6 is advisory)"
+            fi
             continue
         fi
         if ! chain_exists "$ipt" "$CHAIN_FWD"; then
@@ -816,7 +828,38 @@ _close_and_exit() {
     ensure_jumps iptables  2>/dev/null || true
     ensure_jumps ip6tables 2>/dev/null || true
 
-    log "Egress is closed; SSH from the host still works." >&2
+    # The same two independently-gated claims as the provisioner's hard close.
+    # F1 was written against that copy; this one had the identical unconditional
+    # sentence, and it is the copy the smoke's first-run test exercises. Every
+    # command above is `|| true`, so "SSH still works" has to be read back
+    # rather than asserted — and the reachability of the rule matters, not just
+    # its placement: an AGENTBOX-IN full of accepts is worth nothing if INPUT
+    # does not jump to it.
+    local hc_policies=1 hc_ssh=1 hc_pol
+    for hc_pol in INPUT FORWARD OUTPUT; do
+        iptables -w "$IPT_WAIT" -S 2>/dev/null | grep -qx -- "-P ${hc_pol} DROP" || hc_policies=0
+    done
+    [ "$(first_rule iptables INPUT)" = "-A INPUT -j ${CHAIN_IN}" ] || hc_ssh=0
+    iptables -w "$IPT_WAIT" -S "$CHAIN_IN" 2>/dev/null | grep -q -- '--dport 22 -j ACCEPT' || hc_ssh=0
+    iptables -w "$IPT_WAIT" -S "$CHAIN_IN" 2>/dev/null | grep -q -- 'ctstate RELATED,ESTABLISHED -j ACCEPT' || hc_ssh=0
+
+    if [ "$hc_policies" -eq 1 ]; then
+        log "Egress is closed." >&2
+    else
+        log "ERROR: egress may be OPEN — the policies are not all DROP." >&2
+    fi
+    if [ "$hc_ssh" -eq 1 ]; then
+        log "SSH from the host still works." >&2
+    else
+        log "ERROR: you may be LOCKED OUT — INPUT does not reach ${CHAIN_IN}, or the ssh accept is missing." >&2
+        log "A shell will not help: fix it from the hypervisor console, or destroy and recreate the instance." >&2
+        log "From a console: 'iptables -P INPUT ACCEPT; iptables -I INPUT 1 -j ${CHAIN_IN}'." >&2
+    fi
+    # Unchanged, and deliberately so: in THIS state the OUTPUT policy is what
+    # blocks — the hard close leaves AGENTBOX-OUT holding only the loopback and
+    # established accepts, with no terminal REJECT — so the policy alone
+    # reopens egress. The chain flush that the emptied-allowlist recovery needs
+    # is a different state and a different remedy; see docs/decisions.md.
     log "Recovery: 'sudo iptables -P OUTPUT ACCEPT; sudo iptables -F', then 'sudo systemctl restart agent-box-firewall.service'." >&2
     log "If this instance runs Docker, add 'sudo systemctl restart docker' — flushing the table above empties Docker's own chains and only a daemon restart puts them back." >&2
     exit "$rc"
@@ -1043,7 +1086,24 @@ log "Address set holds $(ipset save "$IPSET_TMP" | grep -c '^add ' || true) entr
 ipset swap "$IPSET_TMP" "$IPSET_NAME"
 ipset destroy "$IPSET_TMP"
 # Only now: until the swap, the file would describe a set that is not live.
-mv -f "$RESOLVED_TMP" "$RESOLVED_STATE" 2>/dev/null || true
+#
+# Checked, not `|| true`. This was the last unchecked write in a mechanism built
+# to replace an unchecked assumption, and a silent failure here answers
+# allowlist-holds WRONGLY rather than leaving it unanswered: a surviving file
+# from a previous rebuild is judged against the set this rebuild just swapped
+# in, which passes while proving nothing and then fails spuriously the moment
+# the CDN rotates. The stale file goes first, so that if the move fails the next
+# verify says "no rebuild has recorded its resolutions" — true and actionable —
+# rather than comparing against yesterday.
+#
+# The swap has already happened, so the live set is this rebuild's; what fails
+# here is the record of it. die_fw keeps whatever ruleset is in force and exits
+# non-zero, so the unit fails visibly and the next tick retries, with the
+# journal naming the real fault instead of the allowlist.
+if ! mv -f "$RESOLVED_TMP" "$RESOLVED_STATE"; then
+    rm -f "$RESOLVED_STATE" 2>/dev/null || true
+    die_fw "could not record the resolutions at ${RESOLVED_STATE}"
+fi
 log "Address set swapped in"
 
 # ---------------------------------------------------------------------------

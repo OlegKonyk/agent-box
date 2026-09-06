@@ -179,22 +179,54 @@ close_network_on_exit() {
         ipt_try iptables  -w "$IPT_WAIT" -A AGENTBOX-FWD -j REJECT --reject-with icmp-admin-prohibited
         ipt_try ip6tables -w "$IPT_WAIT" -A AGENTBOX-FWD -j REJECT --reject-with icmp6-adm-prohibited
 
-        # Read back rather than assert. The old code printed "Egress is closed"
-        # unconditionally, so a hard close that had lost every xtables race
-        # reported the state it exists to produce while leaving the state it
-        # exists to prevent — ACCEPT policies and no rules — on a VM the
-        # operator's next move is to open a shell on.
-        local policies_ok=1
+        # Read back rather than assert, and read back TWO separate things.
+        #
+        # The old code printed "Egress is closed" unconditionally. The first fix
+        # gated it on the policies plus `ssh_rule_placed`, which is the rule
+        # having been appended INTO AGENTBOX-IN — and said nothing about whether
+        # INPUT still jumps there. The hard close flushes INPUT and reinstates
+        # the jump through ipt_try, whose whole contract is that a failure is
+        # tolerated and counted, so "policies took" and "the append took" are
+        # both satisfiable with the jump missing. INPUT is then empty with
+        # policy DROP: the ssh ACCEPT, the loopback ACCEPT and the
+        # ESTABLISHED/RELATED ACCEPT all sit in a chain no packet reaches, and
+        # both new and existing SSH connections die.
+        #
+        # That is the worse direction. An open box can be closed from a shell; a
+        # locked-out box cannot be fixed from one at all. So the two claims are
+        # gated independently and neither vouches for the other.
+        local policies_ok=1 pol
         for pol in INPUT FORWARD OUTPUT; do
             iptables -w "$IPT_WAIT" -S 2>/dev/null | grep -qx -- "-P ${pol} DROP" || policies_ok=0
         done
-        if [ "$policies_ok" -eq 1 ] && [ "$ssh_rule_placed" -eq 1 ]; then
-            log "Egress is closed; SSH from the host still works." >&2
+
+        # Reachability, not just placement: rule 1 of INPUT must be the jump,
+        # and AGENTBOX-IN must hold both the port 22 accept and the conntrack
+        # accept that keeps an already-open session alive.
+        local ssh_ok=1
+        [ "$(iptables -w "$IPT_WAIT" -S INPUT 2>/dev/null | sed -n '2p')" = "-A INPUT -j AGENTBOX-IN" ] || ssh_ok=0
+        iptables -w "$IPT_WAIT" -S AGENTBOX-IN 2>/dev/null | grep -q -- '--dport 22 -j ACCEPT' || ssh_ok=0
+        iptables -w "$IPT_WAIT" -S AGENTBOX-IN 2>/dev/null | grep -q -- 'ctstate RELATED,ESTABLISHED -j ACCEPT' || ssh_ok=0
+        [ "$ssh_rule_placed" -eq 1 ] || ssh_ok=0
+
+        if [ "$policies_ok" -eq 1 ]; then
+            log "Egress is closed." >&2
+        else
+            log "ERROR: egress may be OPEN — the policies are not all DROP." >&2
+        fi
+        if [ "$ssh_ok" -eq 1 ]; then
+            log "SSH from the host still works." >&2
+        else
+            log "ERROR: you may be LOCKED OUT of this VM — INPUT does not reach AGENTBOX-IN, or the ssh accept is missing." >&2
+            log "A shell will not help: fix it from the hypervisor console, or destroy and recreate the instance." >&2
+        fi
+        if [ "$policies_ok" -eq 1 ] && [ "$ssh_ok" -eq 1 ]; then
             [ "$FW_CLOSE_ERRORS" -eq 0 ] \
                 || log "NOTE: ${FW_CLOSE_ERRORS} firewall command(s) failed on the way there; see the WARN lines above." >&2
         else
-            log "ERROR: egress may be OPEN — the hard close did not complete (${FW_CLOSE_ERRORS} command(s) failed)." >&2
-            log "Recovery: 'sudo systemctl restart ${FIREWALL_UNIT}', and check 'sudo iptables -S' before using this box." >&2
+            log "The hard close did not complete (${FW_CLOSE_ERRORS} command(s) failed); see the WARN lines above." >&2
+            log "Recovery: 'sudo iptables -P INPUT ACCEPT; sudo iptables -I INPUT 1 -j AGENTBOX-IN', then 'sudo systemctl restart ${FIREWALL_UNIT}'." >&2
+            log "Check 'sudo iptables -S' before using this box." >&2
             log "If this instance runs Docker, add 'sudo systemctl restart docker'." >&2
         fi
     fi
