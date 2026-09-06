@@ -50,20 +50,41 @@ if [ -z "$CLAUDE_VERSION" ] && command -v claude >/dev/null 2>&1; then
     fi
 fi
 
-# --- the firewall ----------------------------------------------------------
+# --- the egress mode --------------------------------------------------------
 #
-# The OUTPUT policy, read from the live ruleset, not from whether a unit is
-# enabled: `systemctl is-active` says a oneshot ran, not that its rules are
-# still in force. `unknown` when the ruleset cannot be read at all, which is
-# honest — this command must never claim `drop` it did not see.
+# The `firewall` field is the MODE now: deny, observe, open or unknown. It used
+# to be drop/open/unknown, read from the OUTPUT policy. The policy is still what
+# is checked — a mode file saying `deny` on a box whose ruleset is not actually
+# denying would be the worst of both — but the answer is reported in the same
+# vocabulary the operator chose the box with.
+#
+# `unknown` whenever the two disagree or the ruleset cannot be read at all. This
+# command must never report a mode it did not see evidence for.
 FIREWALL="unknown"
 # `-w`: a rebuild can hold the xtables lock for a stretch, and iptables 1.8
 # without it exits non-zero rather than waiting — which would report `unknown`
 # on a perfectly healthy box every time `status --watch` landed on a rebuild.
+MODE_CLAIMED=""
+[ -r /etc/agent-box/egress-mode ] \
+    && MODE_CLAIMED=$(tr -d '[:space:]' < /etc/agent-box/egress-mode 2>/dev/null)
 if POLICY=$(sudo -n iptables -w 5 -S 2>/dev/null | grep -- '-P OUTPUT'); then
-    case "$POLICY" in
-        *DROP*) FIREWALL="drop" ;;
-        *)      FIREWALL="open" ;;
+    case "${MODE_CLAIMED}:${POLICY}" in
+        deny:*DROP*)
+            FIREWALL="deny" ;;
+        observe:*DROP*)
+            # Observe also runs OUTPUT DROP; what distinguishes it is that the
+            # chain ends in ACCEPT after a LOG rather than in REJECT. Check the
+            # thing that differs, not the thing that does not.
+            if sudo -n iptables -w 5 -S AGENTBOX-OUT 2>/dev/null | grep -q -- '-j LOG --log-prefix'; then
+                FIREWALL="observe"
+            fi ;;
+        open:*ACCEPT*)
+            FIREWALL="open" ;;
+        :*DROP*)
+            # No mode file: an older box, or one whose /etc was not written.
+            # The policy is denying, so say so in the old vocabulary rather
+            # than inventing a mode nobody set.
+            FIREWALL="deny" ;;
     esac
 fi
 

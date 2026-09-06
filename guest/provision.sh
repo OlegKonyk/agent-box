@@ -28,6 +28,12 @@ log() { printf '[agent-box provision] %s\n' "$*"; }
 WANT_DOCKER=false
 WANT_PLAYWRIGHT=false
 WANT_ROSETTA=false
+# The create-time mode. Written to the guest ONCE, below, and never overwritten:
+# `agentbox egress` changes the running box's mode, and Lima re-runs this script
+# on every start with the original create-time parameters, so overwriting here
+# would silently undo a deliberate change on the next restart.
+WANT_EGRESS=deny
+EGRESS_MODE_FILE=/etc/agent-box/egress-mode
 
 as_bool() {
     case "${1:-}" in
@@ -42,11 +48,17 @@ while [ $# -gt 0 ]; do
         --docker)     WANT_DOCKER=$(as_bool "${2:-}"); shift 2 ;;
         --playwright) WANT_PLAYWRIGHT=$(as_bool "${2:-}"); shift 2 ;;
         --rosetta)    WANT_ROSETTA=$(as_bool "${2:-}"); shift 2 ;;
+        --egress)
+            case "${2:-}" in
+                deny|observe|open) WANT_EGRESS="$2" ;;
+                *) log "ERROR: --egress expects deny, observe or open, got '${2:-}'" >&2; exit 1 ;;
+            esac
+            shift 2 ;;
         *) log "ERROR: unknown argument '$1'" >&2; exit 1 ;;
     esac
 done
 
-log "profile: docker=${WANT_DOCKER} playwright=${WANT_PLAYWRIGHT} rosetta=${WANT_ROSETTA}"
+log "profile: docker=${WANT_DOCKER} playwright=${WANT_PLAYWRIGHT} rosetta=${WANT_ROSETTA} egress=${WANT_EGRESS}"
 
 if [ "$(id -u)" -ne 0 ]; then
     log "ERROR: must run as root" >&2
@@ -245,7 +257,10 @@ trap close_network_on_exit EXIT
 # the pane's process tree with pgrep, and without it only the wrapper script is
 # signalled — the model never sees the interrupt, the wait runs its full course
 # and the session is killed mid-write.
-REQUIRED_PKGS=(iptables ipset dnsutils jq curl git ca-certificates tmux procps)
+# dnsmasq is on every box, not only ones with suffix lines. It is what makes the
+# address set follow what the guest actually resolves, which is the fix for a
+# rotating CDN as much as it is the mechanism for a domain suffix.
+REQUIRED_PKGS=(iptables ipset dnsutils jq curl git ca-certificates tmux procps dnsmasq)
 # gnupg is only needed to check the Docker repository key's fingerprint, and
 # xz-utils only to unpack the Node tarball, so neither is asked for on an
 # instance that wants neither.
@@ -526,6 +541,85 @@ if [ "$WANT_ROSETTA" = true ]; then
         log "WARN: --rosetta was requested but /proc/sys/fs/binfmt_misc/rosetta is absent; linux/amd64 images will not run"
     fi
 fi
+
+# ---------------------------------------------------------------------------
+# 1e. The egress mode, and the resolver that feeds the allowlist
+# ---------------------------------------------------------------------------
+
+# Written once. `agentbox egress` owns it afterwards, and Lima re-runs this
+# script with the create-time parameters on every start — so writing it
+# unconditionally would revert a deliberate change at the next restart.
+install -d -m 0755 /etc/agent-box
+if [ -f "$EGRESS_MODE_FILE" ]; then
+    log "egress mode already set to '$(tr -d "[:space:]" < "$EGRESS_MODE_FILE")'; leaving it"
+else
+    printf '%s\n' "$WANT_EGRESS" > "$EGRESS_MODE_FILE"
+    chmod 0644 "$EGRESS_MODE_FILE"
+    log "egress mode set to '${WANT_EGRESS}'"
+fi
+
+# dnsmasq answers on 127.0.0.1 and adds every address it resolves for an
+# allowlisted name or suffix to the address set. init-firewall.sh writes its
+# name list on every rebuild; what is set up here is the plumbing that puts it
+# in the path of every lookup.
+#
+# systemd-resolved stays in front rather than being removed, and that is the
+# whole design decision. /etc/resolv.conf on this image is a symlink to
+# resolved's stub, Lima and cloud-init both rewrite resolver state on boot, and
+# fighting them for that file is a fight this script would keep losing. Instead
+# resolved keeps the stub at 127.0.0.53, its upstream becomes dnsmasq, and its
+# own cache is turned OFF so that every lookup reaches dnsmasq and every answer
+# feeds the set. Nothing else in the guest has to know.
+#
+# Measured on this image: with Cache=no and Domains=~., `getent ahostsv4` on a
+# fresh name produced `ipset add allowed-domains <addr> <suffix>` in dnsmasq's
+# log and the address appeared in the set.
+install -d -m 0755 /etc/systemd/resolved.conf.d
+cat > /etc/systemd/resolved.conf.d/agent-box.conf <<'EOF'
+# Managed by agent-box provisioning. Do not edit.
+#
+# DNS=127.0.0.1 sends every lookup to dnsmasq, which feeds the egress
+# allowlist as it resolves. Domains=~. makes that the route for ALL names,
+# ahead of anything DHCP puts on the link. Cache=no is not an optimisation
+# choice: a cached answer here would never reach dnsmasq, so the address would
+# never be added to the set and the connection would be refused.
+[Resolve]
+DNS=127.0.0.1
+Domains=~.
+Cache=no
+DNSStubListener=yes
+EOF
+
+# A minimal file so dnsmasq can start before the firewall has ever written its
+# own; init-firewall.sh replaces this on the first rebuild.
+install -d -m 0755 /etc/dnsmasq.d
+if [ ! -f /etc/dnsmasq.d/agent-box.conf ]; then
+    _gw=$(ip route 2>/dev/null | awk '/^default/ && !seen { print $3; seen = 1 }')
+    {
+        printf '# Placeholder written by provisioning; init-firewall.sh owns this file.\n'
+        printf 'listen-address=127.0.0.1\n'
+        printf 'bind-interfaces\n'
+        printf 'no-resolv\n'
+        [ -n "$_gw" ] && printf 'server=%s\n' "$_gw"
+        printf 'cache-size=1000\n'
+    } > /etc/dnsmasq.d/agent-box.conf
+fi
+
+# dnsmasq ships a /etc/default/dnsmasq that reads /etc/resolv.conf for its
+# upstreams. Ours are named explicitly with `no-resolv`, and reading a
+# resolv.conf that points back at 127.0.0.53 would be a loop.
+if [ -f /etc/default/dnsmasq ]; then
+    if grep -q '^IGNORE_RESOLVCONF=' /etc/default/dnsmasq; then
+        sed -i 's/^IGNORE_RESOLVCONF=.*/IGNORE_RESOLVCONF=yes/' /etc/default/dnsmasq
+    else
+        printf 'IGNORE_RESOLVCONF=yes\n' >> /etc/default/dnsmasq
+    fi
+fi
+
+systemctl enable dnsmasq >/dev/null 2>&1 || true
+systemctl restart dnsmasq || log "WARN: dnsmasq did not start; name resolution will fail until it does"
+systemctl restart systemd-resolved || log "WARN: systemd-resolved did not restart"
+log "resolver: systemd-resolved (cache off) -> dnsmasq 127.0.0.1 -> the permitted upstreams"
 
 # ---------------------------------------------------------------------------
 # 2. Optional corporate CA

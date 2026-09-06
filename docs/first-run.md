@@ -121,13 +121,74 @@ into the VM**, at `/opt/agent-box-config`. Nothing is copied into the agent-box
 checkout, so none of these strings ever enters a git repository. It may be
 empty, and `agentbox create` creates it if it is missing.
 
+### Choosing an egress mode
+
+`create` will not run without `--egress`, and the refusal prints the three
+choices. That is deliberate: how far a box can reach is the single most
+consequential thing about it, and a default nobody chose is the one people
+forget they have.
+
+- **`deny`** — refuses anything not on the allowlist. Start here.
+- **`observe`** — allows everything and logs what was not on the allowlist.
+- **`open`** — no egress filtering.
+
+If you always want the same one, put it in `~/.config/agent-box/config`:
+
+```
+egress: deny
+```
+
+Create will then take it and say so, naming the file it came from.
+
 Then create the VM and give it the token:
 
 ```
 cd ~/dev/agent-box
-./bin/agentbox create ~/dev/my-e2e-tests
+./bin/agentbox create ~/dev/my-e2e-tests --egress deny
 ./bin/agentbox token  ~/dev/my-e2e-tests    # paste it; it is not echoed
 ```
+
+### Recipe: internal network open, internet curated
+
+The common shape for testing against a staging environment. The VPN ranges and
+the staging domain go in `~/.config/agent-box/guest/allowlist.local`, and the
+mode stays `deny`, so everything internal works and the internet is still the
+short list the box ships with:
+
+```
+# ~/.config/agent-box/guest/allowlist.local
+10.0.0.0/8            # the corporate range, reachable over the host's VPN
+100.64.0.0/10         # the VPN's own carrier-grade NAT range
+.staging.example      # the staging environment and every host under it
+```
+
+A suffix line needs no list of subdomains: the guest's resolver adds each
+address to the allowed set as it looks the name up. A CIDR needs no resolution
+at all. Then:
+
+```
+./bin/agentbox create ~/dev/my-e2e-tests --egress deny
+./bin/agentbox firewall-check ~/dev/my-e2e-tests   # rebuild and see it take
+```
+
+### Recipe: observe for a week, then write the allowlist
+
+When you do not yet know what a repository's tests reach for:
+
+```
+./bin/agentbox create ~/dev/unfamiliar --egress observe
+# ... let it run for a few days ...
+./bin/agentbox egress-log ~/dev/unfamiliar --since 7d
+./bin/agentbox egress-log ~/dev/unfamiliar --since 7d --as-allowlist \
+    >> ~/.config/agent-box/guest/allowlist.local
+$EDITOR ~/.config/agent-box/guest/allowlist.local   # read it before you keep it
+./bin/agentbox egress ~/dev/unfamiliar deny
+```
+
+`--as-allowlist` emits names where the guest resolved one and comments out bare
+addresses, because an address with no name is a judgement call and it is yours.
+Read the file before you keep it: observe mode records what the code DID reach,
+which is not the same as what it SHOULD.
 
 `create` takes a few minutes the first time, mostly downloading the Ubuntu
 image. Subsequent instances reuse the cached image.

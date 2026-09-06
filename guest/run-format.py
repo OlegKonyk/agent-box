@@ -1019,6 +1019,20 @@ def cmd_box_text(args):
     return 0
 
 
+def cmd_scrub_stdin(_args):
+    """Copy stdin to stdout, scrubbed.
+
+    The narrowest possible use of this file: some other guest script has
+    produced text that is about to cross to the host, and the rule is that the
+    redaction happens in the guest so the unredacted bytes never make the trip.
+    `agentbox egress-log` is the caller — the destinations an agent reached for
+    are the agent's output as much as anything it printed.
+    """
+    for line in sys.stdin:
+        sys.stdout.write(scrub(line.rstrip("\n")) + "\n")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="run-format.py", description="print an agent-box run, scrubbed"
@@ -1034,6 +1048,11 @@ def main(argv=None):
         action="store_true",
         help="print a leak-flagged run's output anyway",
     )
+    parser.add_argument(
+        "--scrub-stdin",
+        action="store_true",
+        help="copy stdin to stdout, scrubbed and control-stripped",
+    )
     parser.add_argument("--box-json", action="store_true", help="one JSON line per box")
     parser.add_argument("--box-text", action="store_true", help="one text line per box")
     parser.add_argument("--claude-version", default="")
@@ -1041,6 +1060,8 @@ def main(argv=None):
     parser.add_argument("--sessions", default="[]")
     args = parser.parse_args(argv)
 
+    if args.scrub_stdin:
+        return cmd_scrub_stdin(args)
     if args.box_text:
         return cmd_box_text(args)
     if args.box_json:
