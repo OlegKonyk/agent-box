@@ -27,6 +27,28 @@ sits in the middle: the agent can reach the model, GitHub, npm and PyPI, and
 nothing else, so a repository's contents cannot be posted somewhere by
 accident.
 
+How rigid that middle is, you choose per box and at creation time, with
+`--egress`:
+
+- **`deny`** refuses anything not on the allowlist. The default in spirit, and
+  the one to use unless you know otherwise.
+- **`observe`** allows it and writes it down. Point a box at an unfamiliar
+  repository for a week, then turn the log into an allowlist with
+  `agentbox egress-log --as-allowlist`.
+- **`open`** turns the packet filter off. Everything else — the VM boundary,
+  the single mount, the token handling, the no-push rule — is unchanged.
+
+There is no default: `create` refuses without `--egress` and prints the three
+options, because a box's reach is the one thing nobody should end up with by
+accident. Put `egress: deny` in `~/.config/agent-box/config` to make the choice
+once, and create will say which mode it took and where it got it.
+
+The allowlist takes address ranges (`10.0.0.0/8`) and domain suffixes
+(`.staging.example`) as well as exact names, so naming a staging environment
+does not mean listing every host in it. A local resolver adds each address to
+the allowed set as the guest resolves it, which is what makes a suffix possible
+and also what stops a rotating CDN breaking a download.
+
 ## Before you point it at code you do not own
 
 Get permission first, in writing, from whoever owns the repository and the
@@ -36,13 +58,17 @@ agent against someone else's code, and nothing below substitutes for asking.
 What to ask for, and a template, are in
 **[docs/first-run.md](docs/first-run.md)**.
 
+Tell them the egress mode too. "It can only reach these hosts" and "it can
+reach anything and I am keeping a log" are different undertakings, and the
+person granting permission is entitled to know which one they are agreeing to.
+
 ## Quick start
 
 ```
 brew install lima gitleaks
 git clone <this repo> ~/dev/agent-box
 cd ~/dev/agent-box
-./bin/agentbox create ~/dev/my-e2e-tests
+./bin/agentbox create ~/dev/my-e2e-tests --egress deny
 ./bin/agentbox token  ~/dev/my-e2e-tests        # paste a token from `claude setup-token`
 ./bin/agentbox verify-auth ~/dev/my-e2e-tests   # the only real proof it works
 ```
@@ -77,6 +103,8 @@ One instance per repository, named `agent-box-<repo basename>`.
 | `agentbox stop <repo\|name>` | Stop the VM. |
 | `agentbox destroy <repo\|name>` | Stop and delete the VM, and remind you to revoke the token. |
 | `agentbox status [repo] [--json] [--watch [SECS]]` | One line per box: current run, sessions, firewall. |
+| `agentbox egress <repo\|name> [MODE]` | Show, or change, the egress mode: `deny`, `observe` or `open`. A change rebuilds the firewall and prints the verification. |
+| `agentbox egress-log <repo\|name> [--since DUR] [--json] [--as-allowlist]` | What an `observe` box tried to reach, with the names it resolved. `--as-allowlist` emits lines to paste into `allowlist.local`. |
 | `agentbox firewall-check <repo\|name>` | Rebuild the egress allowlist and re-verify it, inside the VM. The container probes are advisory. |
 
 `run` takes `--model M`, `--max-turns N`, `--max-budget-usd X`, `--wait` and
@@ -104,6 +132,7 @@ decided when it is made, not adjusted while it runs.
 | `--docker` | Docker Engine, buildx and compose inside the guest. Containers are held to the same egress allowlist as the guest itself. |
 | `--playwright` | Node 22 from nodejs.org, plus the system libraries `playwright install-deps` installs. Browsers are not baked in: each repository's own Playwright downloads the builds it was pinned against, on first use. |
 | `--rosetta` | Run `linux/amd64` images on Apple silicon. Needs Rosetta 2 on the Mac; `softwareupdate --install-rosetta` if Lima stalls at "Installing rosetta". |
+| `--egress deny\|observe\|open` | **Required.** How rigid the network is. No default: create refuses without it, unless `egress: <mode>` is in `~/.config/agent-box/config`. |
 | `--forward PORT[,PORT...]` | Forward guest `127.0.0.1:PORT` to host `127.0.0.1:PORT`. Reaches a guest socket bound to `127.0.0.1` or `0.0.0.0`, not one bound only to the guest's own address. A widening — see Limits below. |
 | `--cpus N` | Default 4. |
 | `--memory SIZE` | Default `6GiB`, or `8GiB` with `--docker`. |
@@ -116,7 +145,7 @@ different memory profile from a shell and an editor. An explicit `--memory` or
 again in the summary.
 
 ```
-./bin/agentbox create ~/dev/my-app --docker --playwright --forward 3000,8080
+./bin/agentbox create ~/dev/my-app --egress deny --docker --playwright --forward 3000,8080
 ```
 
 ## Layout

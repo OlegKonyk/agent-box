@@ -1458,3 +1458,216 @@ obvious shape), and it makes the firewall depend on a daemon that can itself
 fail. Worth evaluating as its own piece of work, against the current behaviour,
 which is: correct, occasionally inconvenient for one host, and honest about it.
 
+### Superseded: this was built, and it works
+
+The limitation above is no longer the behaviour. dnsmasq now runs in every box
+and feeds the set as the guest resolves, which is what the paragraph proposed;
+what follows is what the building taught, because two of the three costs it
+predicted turned out differently.
+
+**The resolver everything must go through.** systemd-resolved was not removed.
+`/etc/resolv.conf` on this image is a symlink to its stub, and Lima and
+cloud-init both rewrite resolver state on boot, so a script that fights them
+for that file is a script that loses on some future boot. Instead resolved
+keeps the stub at `127.0.0.53`, its upstream becomes dnsmasq at `127.0.0.1`,
+and **its own cache is turned off**. Nothing else in the guest has to know, and
+there is no file to fight over.
+
+`Cache=no` is not a performance choice, it is the mechanism: an answer resolved
+by resolved from its own cache never reaches dnsmasq, so nothing would be added
+to the set and the connection would be refused.
+
+**Coexisting with the atomic swap.** The set is now `hash:net timeout 3600`.
+The rebuild adds everything it knows with `timeout 0`, which means permanent;
+dnsmasq's additions take the default and age out an hour later. That makes the
+two populations distinguishable with no bookkeeping, which is what the swap
+needs.
+
+The spec left the swap's behaviour open and preferred the cheap option — let a
+rebuild forget dnsmasq's entries and let the next lookup put them back, if
+lookups are cheap. **The measurement says do the other thing.** Lookups are
+cheap; the problem is that there is often no lookup at all:
+
+```
+query[A] api.github.com from 127.0.0.1
+cached api.github.com is 140.82.113.6      <- answered from dnsmasq's own cache
+entries in the set afterwards: 0            <- and NOT re-added
+```
+
+dnsmasq feeds the set when it FORWARDS an answer and not when it serves one
+from cache. Forgetting on every rebuild would therefore black-hole a
+suffix-matched host for the rest of its TTL, and longer if the application
+caches too. So the rebuild copies the live set's timed entries into the new set
+before the swap, with their remaining time. Measured after the change: `Carried
+67 resolver-added address(es) across the swap`, and the address that a
+suffix match had added was still there and still reachable.
+
+**The daemon that can itself fail.** It can, and the direction it fails in is
+the safe one. With dnsmasq stopped, nothing resolves at all, so the box is
+closed to everything reachable by name rather than open to anything. Measured:
+`www.iana.org no longer resolves`, `curl http=000`, and verification says
+`FAIL resolver-up  dnsmasq is NOT running: nothing will resolve, so the box is
+closed to everything by name`. A fatal check rather than a warning, because a
+stopped daemon is a local fact and not a remote absence.
+
+What has not changed: the rebuild still pre-resolves every exact name, so a box
+works from the moment it boots rather than from its first lookup.
+
+## Why an egress mode per box, chosen at create
+
+Three modes, one per box, and the choice is made once when the box is made.
+Three alternatives were available and each is worse in a specific way.
+
+**A global setting** would be a single value on the host that every box reads.
+It is the least work and the most dangerous: the reason to open a box is always
+a particular repository on a particular afternoon, and a global that was
+loosened for that repository stays loosened for the next one, which nobody
+re-reads the config before creating.
+
+**A runtime flag** — `agentbox run --egress open` for one task — is worse
+still. It puts the decision at the moment of most impatience, when something
+has just failed and the flag is the quickest way past it. A box's reach should
+not be a thing you can change by pressing up-arrow and editing the line.
+
+**No modes at all**, which is where this started, is not tenable once the box
+is aimed at ordinary test automation against environments the operator names.
+Deny with exact hostnames is right for an unattended agent on someone else's
+code and wrong for an engineer who knows exactly which staging environment they
+mean; refusing them the choice just means they stop using the box.
+
+So: per box, at create, recorded in two places — `/etc/agent-box/egress-mode`
+in the guest and `~/.config/agent-box/instances/<name>` on the host, so
+`status` can answer for a box that is not running. `agentbox egress` changes
+it, which is a deliberate act on a named box, and it rebuilds and re-verifies
+on the spot so that the change is either true or reported as failed.
+
+**And there is no default.** `create` refuses without `--egress` and prints the
+three options. A default nobody chose is the one people forget they have, and
+the failure is silent in the direction that matters. An operator who wants one
+writes `egress: deny` in their own config, and then create tells them which
+mode it took and which file it came from — a default you can see is a different
+thing from one you inherited.
+
+Provisioning writes the guest's copy exactly once. Lima re-runs the provision
+script on every start with the parameters the box was CREATED with, so writing
+it unconditionally would silently revert a deliberate `agentbox egress` at the
+next restart.
+
+## Why observe logs and allows, rather than logs and denies
+
+An "observe" mode that logged and then denied would be a deny mode with better
+diagnostics. That is a useful thing, but it is not the thing that is needed:
+the question observe exists to answer is *what does this repository's test
+suite actually reach for*, and you cannot answer it by watching the first
+request fail. A suite that cannot reach its staging API does not go on to tell
+you about the font CDN and the telemetry endpoint behind it; it stops.
+
+So observe allows. The cost is real and is stated plainly at create, when the
+mode is changed, and on the first line of every `run` and `session`: while a
+box is in observe mode it can reach anything, and the only thing standing
+between a repository's contents and the internet is the VM boundary and the
+fact that someone is going to read the log.
+
+The log is `-j LOG` with a fixed prefix rather than NFLOG. Both load on this
+image and NFLOG is the more modern target, but reading it needs a userspace
+collector — another package, another daemon, another thing to fail — while LOG
+lands in the kernel ring buffer and therefore in the journal, where
+`journalctl -k` already reaches it. It is rate-limited to 60 lines a minute
+with a burst of 30, and the limit is on the LOG rule only: the ACCEPT after it
+is unconditional, so a busy agent loses log lines and never loses packets.
+
+Two things make the log worth more than a list of addresses. dnsmasq runs with
+`log-queries` in observe mode only, so `egress-log` can say which name resolved
+to each address — the packet filter never sees a name, and this is the only
+place it exists. And `--as-allowlist` emits the names directly while commenting
+out the bare addresses, because an address the guest never resolved is a
+judgement the operator has to make rather than one the tool should make for
+them.
+
+### The rules the feed has to obey, and why each is a rule
+
+Four constraints came out of building this, and each is the kind that reads as
+a detail and is actually the whole mechanism.
+
+**Cache TTL strictly below entry TTL, always.** dnsmasq feeds the set when it
+FORWARDS an answer and not when it serves one from its own cache. So if the
+cache outlived the set entry there would be a window — up to the difference
+between them — in which the name still resolves, nothing is re-added, and the
+host has silently gone dark on a box that looks healthy. `max-cache-ttl=900`
+against an entry lifetime of 3600 leaves three-quarters of the entry's life as
+margin. Change one and you must change the other.
+
+**Exact names are never fed.** `ipset=/example.com/set` matches `example.com`
+and every subdomain of it, so feeding exact names turned every line in
+`allowlist.base` into a wildcard for its subtree: `api.anthropic.com` would
+have admitted `anything.anthropic.com` the moment something resolved it. Only
+suffix lines are fed. A host that genuinely needs the feed says so by being
+written with a leading dot, and pays the subtree cost knowingly —
+`.cdn.playwright.dev` and `.storage.googleapis.com` are the two, and both
+comments say why.
+
+**The resolver's addresses live in a set of their own.** One set with two
+populations distinguished by their timeout was the first design. It made
+removal impossible — a rebuild carried the old addresses forward for ever, so
+deleting a suffix from the allowlist did not delete the reach it had granted —
+and the read-then-swap that preserved them had a window in which an address
+added between the read and the swap was lost. Two sets referenced by the same
+accept rule have neither problem: the rebuild owns one and replaces it, dnsmasq
+owns the other, and removing a suffix flushes it. The cost is one re-lookup for
+the suffixes that remain, which is the cheaper mistake.
+
+**The resolver's configuration is part of the allowlist, so it is verified.**
+dnsmasq decides which addresses enter the set; a dropped `ipset=` line silently
+stops a suffix working and an added one silently admits a subtree. So the file
+is written by the rebuild, is the only configuration source dnsmasq reads
+(`conf-file`, and the file is checked for `conf-dir` and friends), and
+`verify()` compares a hash of its feed rules against one the rebuild recorded,
+checks the daemon is actually reading that file, and runs `dnsmasq --test`.
+
+### What the feed cannot protect against
+
+`stop-dns-rebind` refuses an upstream answer that names a private or loopback
+address, which closes the obvious version: an allowlisted suffix answering
+`10.0.0.1` and thereby making the hypervisor gateway reachable.
+
+What it does not close is a poisoned or hostile answer that names an ordinary
+public address. The guest resolves through the host's resolver over a path with
+no DNSSEC validation, so an answer that arrives is believed, and believing it
+now writes a durable allowlist entry rather than only misdirecting one
+connection. The blast radius is bounded and worth stating exactly: one address,
+for one hour, reachable from a VM that has no credential on it but the token.
+It is accepted rather than fixed because fixing it means validating DNSSEC in
+the guest, which is a resolver project rather than a firewall one.
+
+## Why `open` does not touch the FORWARD policy
+
+`open` sets the OUTPUT policy to ACCEPT and makes `AGENTBOX-OUT` and the egress
+leg of `AGENTBOX-FWD` accept. It leaves `FORWARD` at DROP, and the distinction
+is not pedantry.
+
+The first version set `FORWARD` to ACCEPT too, which reads like the same idea
+and undoes a different one. `AGENTBOX-FWD` deliberately RETURNs anything not
+leaving by the uplink, so that Docker's own chains — including the isolation
+between its networks — remain the last word on container-to-container traffic.
+With the policy at ACCEPT, a packet that falls off the end of those chains is
+accepted by the policy instead of dropped, and that isolation stops being
+enforced. Open means this box stops judging EGRESS. It does not mean the kernel
+stops applying what Docker asked for.
+
+## Why the failure path has to know the mode
+
+`fail_closed` had one behaviour, and it was right for one mode out of three.
+
+In `open`, a rebuild that failed — a GitHub meta fetch on a bad afternoon —
+slammed the box shut to loopback and ssh. That is not a safer version of what
+the operator asked for; it is a different box, silently, because something
+unrelated to their choice went wrong. The open ruleset is now left as it is and
+the failure is logged.
+
+In `observe`, the check for a standing ruleset reads the OUTPUT policy, which
+observe also sets to DROP — so the failure path took the "the previous deny
+ruleset is left in place" branch and said *deny* about a box that logs and
+permits everything. The ruleset was correct and the sentence was false, which
+is worse than either, because the sentence is what somebody acts on. It now
+names the observe ruleset for what it is.
+

@@ -164,7 +164,7 @@ filter at when the model's output is being drawn on your screen.
 ```
 BOX                            STATE     RUN / SESSIONS / FIREWALL
 (one line per box; wrapped here to fit)
-agent-box-my-e2e-tests         running   fw=drop  claude=2.1.261  runs=4  tmux=2
+agent-box-my-e2e-tests         running   fw=deny  claude=2.1.261  runs=4  tmux=2
                                          run 20260905-120001 running 38s turns=3
                                          cost=$0.0412  last: Edit tests/test_orders.py
 ```
@@ -181,6 +181,117 @@ a small background process **on the host** that polls the run every ten seconds
 and shows a desktop notification when it ends. One watcher per run, tracked by
 a pid file under `~/.config/agent-box/watchers/`. The guest has no way to reach
 your desktop and is not given one.
+
+## Egress modes
+
+Every box has one, chosen at create and shown by `agentbox egress`:
+
+```
+./bin/agentbox egress ~/dev/my-app             # show it
+./bin/agentbox egress ~/dev/my-app observe     # change it, rebuild, verify
+```
+
+| mode | non-allowlisted traffic | logged | `firewall-check` asserts |
+|---|---|---|---|
+| `deny` | refused | no | the allowlist refuses what it should |
+| `observe` | **allowed** | yes | the log rule is in place and the chain ends in ACCEPT, never a silent deny |
+| `open` | allowed, unfiltered | no | INPUT is intact and OUTPUT is unfiltered |
+
+One thing `observe` does **not** relax: DNS to a server other than the guest's
+own resolver stays refused, in every mode except `open`. Port 53 to an
+arbitrary host is a channel whose payload is the query name, so "allowed and
+logged" there would carry data out while recording only that something went.
+
+The mode every reporter shows is read from the **live ruleset**, not from the
+file that records what was asked for. When the two disagree the answer is
+`unknown`, with a `firewall_detail` saying what each of them said — which is
+the honest answer to "which of these should I believe".
+
+`firewall_detail` is **present only when there is something to say**: the mode
+is `unknown`, or the file and the ruleset disagree. On a healthy box the key is
+absent, not null. Every other nullable key in that object means "this was asked
+for and is unavailable", so a null here would read as a fourth unknown rather
+than as nothing to report.
+
+Changing the mode rebuilds the firewall immediately and prints the
+verification, so the answer to "did that take" is on the screen. `open` prints
+a warning naming what it gives up. The mode appears in the create summary, in
+`agentbox status`, and as the first line of `run` and `session` when it is not
+`deny` — the quiet default stays quiet.
+
+INPUT never changes. `open` is about what the guest may reach, not about what
+may reach the guest: ssh from the hypervisor gateway remains the only way in,
+and IPv6 egress stays closed in every mode.
+
+### What an observe box tried to reach
+
+```
+./bin/agentbox egress-log ~/dev/my-app --since 24h
+./bin/agentbox egress-log ~/dev/my-app --since 24h --json
+./bin/agentbox egress-log ~/dev/my-app --since 24h --as-allowlist
+```
+
+Unique destinations, newest last, with the count, the times, and the name the
+guest resolved for that address when the resolver's log still remembers it. A
+dash means it does not — the agent connected to a literal address, or resolved
+it before the window. `--as-allowlist` gives you lines to paste into
+`allowlist.local`, with bare addresses commented out because an address without
+a name is a judgement call.
+
+## What goes in an allowlist
+
+`allowlist.base` in the repository and `allowlist.local` on the host take three
+line forms:
+
+```
+api.example.com       an exact name. Resolved on every rebuild, so it works
+                      before anything looks it up, and also fed live.
+10.0.0.0/8            an address range. No resolution, no expiry.
+.staging.example      a suffix: the domain and everything under it.
+*.staging.example     the same thing, if you prefer the glob.
+```
+
+**A dot line is a subtree and follows the resolver. A bare name is one host,
+pinned at rebuild.** They are different mechanisms, not two spellings:
+
+- `api.example.com` is resolved on every rebuild and its addresses are pinned
+  until the next one. Nothing else under `example.com` is admitted.
+- `.example.com` is not resolved in advance at all. It becomes a rule in the
+  guest's resolver, which adds each address to a second set as the guest looks
+  a name up — so `anything.example.com` is admitted the moment something
+  resolves it.
+
+So a dot line is how you say "this whole environment", and it is also how you
+say "this host rotates its addresses faster than a rebuild can pin them" — the
+two entries in `allowlist.base` written with a dot, `.cdn.playwright.dev` and
+`.storage.googleapis.com`, are there for the second reason and carry the cost
+of the first. Write a bare name unless you mean the subtree.
+
+The two sets are kept apart on purpose. The rebuild owns the pinned one and
+replaces it wholesale; the resolver owns the other and its entries expire after
+an hour. That is what makes removing a line take effect: delete a suffix, and
+the next rebuild flushes the resolver's set rather than carrying its addresses
+forward for ever.
+
+Three consequences worth knowing. **If the resolver is down, nothing resolves
+and the box is closed to everything by name** — it fails closed, not open, and
+`firewall-check` says `FAIL resolver-up` in as many words. **An IPv6 range is
+accepted and reported as inert**, because v6 egress is closed entirely; the
+line is remembered for the day that changes. And **a malformed line is a
+warning, not a failure** — it is named in the log and skipped, so a typo in
+`allowlist.local` cannot take the box down.
+
+### Observe's log is a record, not a control
+
+Worth being plain about, because the word "log" invites the opposite reading.
+In observe mode the traffic is **allowed first and recorded second**, and the
+recording is rate-limited per destination so that one chatty host cannot crowd
+the others out of the journal. When the limit bites, packets still pass and log
+lines are dropped — never the other way round. An agent that wanted to hide a
+destination could bury it under its own noise, and the per-destination limit
+raises the price of that without removing it. Observe tells you what a
+repository reaches for when it is not trying to deceive you; it is not a
+control, and a box you do not trust belongs in `deny`.
 
 ### The JSON is the contract
 
@@ -217,7 +328,7 @@ place. `status --json` looks like this:
 {"generated_at": "2026-09-05T16:00:00Z",
  "boxes": [{"name": "my-e2e-tests", "instance": "agent-box-my-e2e-tests",
             "repo": "/Users/you/dev/my-e2e-tests", "state": "running",
-            "claude_version": "2.1.261 (Claude Code)", "firewall": "drop",
+            "claude_version": "2.1.261 (Claude Code)", "firewall": "deny",
             "run": {"id": "20260905-120001", "state": "running", "exit": null,
                     "model": "sonnet", "branch": "agent/my-task-20260905-120001",
                     "started_at": "2026-09-05T12:00:01Z", "elapsed_s": 38,
@@ -254,7 +365,8 @@ Everything site-specific lives here and nothing of it is ever committed:
 ~/.config/agent-box/
   blocklist.txt              read on the host only, NEVER mounted
   guest/                     mounted read-only at /opt/agent-box-config
-    allowlist.local          extra egress domains, one per line
+    allowlist.local          extra egress entries, one per line: a name,
+                             a CIDR range, or a .suffix
     ca.pem                   corporate TLS-intercept root, if any
     plugins.txt              marketplaces to register, plugins to install
     plugin-dir/<name>/       plugin roots loaded per session, not installed
@@ -404,7 +516,7 @@ Only on an instance created with `--docker`. On any other, `docker` is simply
 not installed — the profile is fixed when the VM is made.
 
 ```
-./bin/agentbox create ~/dev/my-app --docker --forward 3000
+./bin/agentbox create ~/dev/my-app --egress deny --docker --forward 3000
 ./bin/agentbox shell  ~/dev/my-app
 ```
 
@@ -430,7 +542,7 @@ ports:
 ```
 
 ```
-./bin/agentbox create ~/dev/my-app --docker --forward 3000
+./bin/agentbox create ~/dev/my-app --egress deny --docker --forward 3000
 ```
 
 `--forward` is fixed at create time on purpose, and it is the one widening in

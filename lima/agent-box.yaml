@@ -118,6 +118,11 @@ param:
   docker: "false"
   playwright: "false"
   rosetta: "false"
+  # The egress mode this box is created with: deny, observe or open. Written to
+  # /etc/agent-box/egress-mode by provisioning, ONCE — `agentbox egress` owns it
+  # afterwards, and this parameter is fixed at create time, so re-running
+  # provisioning on a later start must not undo a deliberate change.
+  egress: "deny"
 
 mounts:
 - location: "{{.Param.repo}}"
@@ -195,4 +200,5 @@ provision:
     exec /opt/agent-box/guest/provision.sh "{{.User}}" "{{.Home}}" \
       --docker "{{.Param.docker}}" \
       --playwright "{{.Param.playwright}}" \
-      --rosetta "{{.Param.rosetta}}"
+      --rosetta "{{.Param.rosetta}}" \
+      --egress "{{.Param.egress}}"

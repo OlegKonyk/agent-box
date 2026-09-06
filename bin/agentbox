@@ -64,6 +64,9 @@ usage: ${PROG} <command> [args]
   status [repo] [--json] [--watch [SECS]]
                                     one line per box: run, sessions, firewall
                                     (--watch needs a named box)
+  egress <repo|name> [MODE]         show, or change, the egress mode (deny|observe|open)
+  egress-log <repo|name> [--since DUR] [--json] [--as-allowlist]
+                                    what an observe-mode box tried to reach
   firewall-check <repo|name>        rebuild the allowlist and re-verify, in the VM
   help                              this message
 
@@ -281,6 +284,62 @@ read_run_state() {
     printf 'unknown'
 }
 
+# The three modes, in one place, so the CLI and its help cannot drift apart.
+EGRESS_MODES="deny observe open"
+valid_egress_mode() {
+    case " ${EGRESS_MODES} " in *" ${1:-} "*) return 0 ;; *) return 1 ;; esac
+}
+
+# `egress: <mode>` in the host config file is the operator's standing default.
+# Without it, create refuses rather than guessing, because which of these a box
+# gets is the single most consequential thing about it and a default nobody
+# chose is the one people forget they have.
+# Prints whatever the file says, valid or not, and returns 1 only when nothing
+# is set. Validation belongs to the caller: `die` inside a command substitution
+# kills the subshell and nothing else, so a check here would print its message
+# and then let the caller carry on into the "no default" path — two messages
+# for one problem, the second one wrong.
+config_egress_default() {
+    [ -f "$HOST_CONFIG_FILE" ] || return 1
+    local m
+    m=$(sed -n 's/^[[:space:]]*egress[[:space:]]*:[[:space:]]*\([A-Za-z]*\)[[:space:]]*$/\1/p' \
+        "$HOST_CONFIG_FILE" | tail -1)
+    [ -n "$m" ] || return 1
+    printf '%s' "$m"
+}
+
+egress_modes_help() {
+    cat >&2 <<EOF
+${PROG}: choose an egress mode with --egress; there is no default.
+
+  deny     non-allowlisted traffic is refused. The safe choice, and the one to
+           use unless you know you need otherwise.
+  observe  non-allowlisted traffic is ALLOWED and logged. Use it to learn what
+           a repository needs, then turn the log into an allowlist.
+  open     no egress filtering at all. The VM boundary and the single mount
+           still hold; the packet filter does not.
+
+Set 'egress: deny' in ${HOST_CONFIG_FILE} to make one of them your default.
+EOF
+}
+
+# Where the host remembers each box's mode. The guest has its own copy at
+# /etc/agent-box/egress-mode and is authoritative for a running box; this is
+# what lets `status` answer for a box that is not running.
+INSTANCE_META_DIR="${HOST_CONFIG_DIR}/instances"
+instance_meta_file() { printf '%s/%s' "$INSTANCE_META_DIR" "${1:?}"; }
+write_instance_egress() {
+    local inst="${1:?}" mode="${2:?}"
+    mkdir -p "$INSTANCE_META_DIR" 2>/dev/null || return 0
+    printf 'egress=%s\n' "$mode" > "$(instance_meta_file "$inst")" 2>/dev/null || true
+}
+read_instance_egress() {
+    local f
+    f=$(instance_meta_file "${1:?}")
+    [ -r "$f" ] || return 1
+    sed -n 's/^egress=\([a-z]*\)$/\1/p' "$f" | tail -1
+}
+
 # `notify: true` in the host config file, or nothing.
 config_notify_default() {
     [ -f "$HOST_CONFIG_FILE" ] || return 1
@@ -378,9 +437,24 @@ exclude_from_backup() {
 # Every guest invocation passes an explicit --workdir. Without it limactl tries
 # to cd into the host's current directory inside the guest, which fails noisily
 # and tells the guest a host path it has no business knowing.
+# `</dev/null` is not defensive tidiness, it is a bug fix, and it belongs here
+# rather than at one call site.
+#
+# `limactl shell` is ssh, and ssh reads its own stdin. Called inside a loop that
+# is itself reading from stdin — `while read ... done <<EOF $(list_boxes) EOF`
+# in render_status — it consumes the rest of the here-document, so the loop sees
+# one line and every box after the first vanishes from `agentbox status`. That
+# is a box disappearing from the one command whose job is to say which boxes
+# exist, and it has been true since the status work landed.
+#
+# Fixing the loop would fix today's instance. Fixing the helper fixes the class:
+# no call through guest_shell can eat a caller's input, now or later. The three
+# places that genuinely need to send stdin into the guest — the token pipe, the
+# brief copy, and the interactive sessions — call `$LIMACTL shell` directly, and
+# that difference is now the documented signal that they mean it.
 guest_shell() {
     local inst="$1"; shift
-    "$LIMACTL" shell --workdir /work "$inst" -- "$@"
+    "$LIMACTL" shell --workdir /work "$inst" -- "$@" < /dev/null
 }
 
 # Carry the allowlisted personal config files across and mark /work trusted.
@@ -428,14 +502,14 @@ valid_port() {
 
 cmd_create() {
     local repo inst
-    split_args "--forward --cpus --memory --disk" "$@"
+    split_args "--forward --cpus --memory --disk --egress" "$@"
     check_operands 1 1 "create <repo> [options]"
     repo=$(abs_repo "${ABX_POSV[0]}")
     inst=$(instance_name "$repo")
     require_limactl
 
     local docker=false playwright=false rosetta=false
-    local forward="" cpus="" memory="" disk=""
+    local forward="" cpus="" memory="" disk="" egress="" egress_from=""
     # The operands are already out of the way; what is left is options, and
     # split_args has kept each valued option next to its value.
     #
@@ -467,9 +541,28 @@ cmd_create() {
             --disk)
                 [ -n "${2:-}" ] || die "--disk needs a value"
                 disk="$2"; shift 2 ;;
+            --egress)
+                [ -n "${2:-}" ] || die "--egress needs one of: ${EGRESS_MODES}"
+                valid_egress_mode "$2" || die "--egress must be one of: ${EGRESS_MODES}, got '${2}'"
+                egress="$2"; egress_from="the command line"; shift 2 ;;
             *) die "unknown option: $1" ;;
         esac
     done
+
+    # No mode, no box. The one exception is a standing default the operator
+    # wrote down themselves, and even then create says which mode it took and
+    # where the default came from — so the answer to "what is this box allowed
+    # to reach" is never something nobody chose.
+    if [ -z "$egress" ]; then
+        if egress=$(config_egress_default); then
+            valid_egress_mode "$egress" \
+                || die "${HOST_CONFIG_FILE} sets 'egress: ${egress}', which is not one of: ${EGRESS_MODES}"
+            egress_from="${HOST_CONFIG_FILE}"
+        else
+            egress_modes_help
+            exit 2
+        fi
+    fi
 
     # Docker needs more of both than a bare agent does: images, layers and a
     # build cache all land on the guest disk, and a compose stack plus a browser
@@ -523,6 +616,7 @@ cmd_create() {
         --param "docker=${docker}"
         --param "playwright=${playwright}"
         --param "rosetta=${rosetta}"
+        --param "egress=${egress}"
         --set ".cpus = ${cpus} | .memory = \"${memory}\" | .disk = \"${disk}\""
     )
 
@@ -548,6 +642,11 @@ cmd_create() {
     info "creating ${inst}"
     info "sizing: ${cpus} cpus, ${memory} memory, ${disk} disk"
     info "profile: docker=${docker} playwright=${playwright} rosetta=${rosetta}"
+    info "egress mode: ${egress} (from ${egress_from})"
+    [ "$egress" != "open" ] \
+        || info "WARNING: egress mode 'open' means no egress filtering. Anything the agent does can reach any host."
+    [ "$egress" != "observe" ] \
+        || info "NOTE: egress mode 'observe' ALLOWS non-allowlisted traffic and logs it. Read it back with '${PROG} egress-log'."
     if [ "${#forward_ports[@]}" -gt 0 ]; then
         info "WARNING: --forward ${forward_ports[*]} opens a hole in the other direction. Every one of those guest ports becomes reachable from any process on this Mac at 127.0.0.1, for as long as the VM runs. The default is that nothing the guest listens on is reachable from the host at all."
         # Measured, because the answer is not the obvious one and the failure is
@@ -557,6 +656,7 @@ cmd_create() {
     fi
 
     "$LIMACTL" create --tty=false "${create_args[@]}" "$LIMA_TEMPLATE"
+    write_instance_egress "$inst" "$egress"
 
     # After create, not before: on a machine that has never run Lima, ~/.lima
     # does not exist yet and the exclusion would fail for no reason.
@@ -570,6 +670,7 @@ cmd_create() {
 ${inst} is up.
 
   sizing      ${cpus} cpus, ${memory} memory, ${disk} disk
+  egress      ${egress}
   docker      ${docker}
   playwright  ${playwright}
   rosetta     ${rosetta}
@@ -917,6 +1018,7 @@ cmd_run() {
     guest_shell "$inst" "${GUEST_BIN}/run-ctl.sh" "${start_args[@]}" >/dev/null \
         || die "could not start the run in ${inst}"
 
+    announce_egress_mode "$inst"
     info "run ${runid} started in ${inst} on model ${model}"
 
     if [ "$notify" -eq 1 ]; then
@@ -1102,6 +1204,7 @@ cmd_session() {
     fi
     [ -n "$model" ] && session_args+=(--model "$model")
 
+    announce_egress_mode "$inst"
     cat <<EOF
 ${PROG}: interactive output is NOT scrubbed — what the model prints goes
 ${PROG}: straight to this terminal. Detach with the tmux prefix then d
@@ -1166,6 +1269,11 @@ cmd_destroy() {
     require_instance "$inst"
     "$LIMACTL" stop --force "$inst" >/dev/null 2>&1 || true
     "$LIMACTL" delete --force "$inst"
+    # The host's per-instance record goes with the instance. Left behind, it
+    # outlives the box and is then read by the NEXT box of the same name — a
+    # repository recreated with a different mode would be described by the old
+    # record until something wrote over it.
+    rm -f "$(instance_meta_file "$inst")" 2>/dev/null || true
     cat <<EOF
 
 ${inst} deleted.
@@ -1278,8 +1386,16 @@ render_status() {
         if [ "$state" = "Running" ]; then
             if [ "$as_json" -eq 1 ]; then
                 guest=$(guest_shell "$name" "${GUEST_BIN}/box-status.sh" 2>/dev/null) || guest=""
+                # A box built from a checkout older than the egress work reports
+                # the OUTPUT policy in the old vocabulary. Normalise it here so
+                # the documented contract holds for every box in the listing
+                # rather than only for the ones built from this checkout: a
+                # consumer should not have to know which commit made a VM.
+                guest=${guest//\"firewall\":\"drop\"/\"firewall\":\"deny\"}
+                guest=${guest//\"firewall\": \"drop\"/\"firewall\": \"deny\"}
             else
                 guest=$(guest_shell "$name" "${GUEST_BIN}/box-status.sh" --text 2>/dev/null) || guest=""
+                guest=${guest//fw=drop/fw=deny}
             fi
         fi
 
@@ -1291,7 +1407,12 @@ render_status() {
                 # Not running, or the guest could not answer. Say so with the
                 # same keys rather than omitting them: a consumer that has to
                 # branch on missing keys is a consumer that will get it wrong.
-                *) guest='{"claude_version":null,"firewall":"unknown","run":null,"runs_total":0,"sessions":[]}' ;;
+                # `firewall_detail` is present here for the same reason it is
+                # present on a disagreeing box: the contract carries it whenever
+                # `firewall` is "unknown", and this is the case where a reader
+                # most needs to know that the unknown means "nobody answered"
+                # rather than "the box is in a strange state".
+                *) guest='{"claude_version":null,"firewall":"unknown","firewall_detail":"the guest status script did not answer","run":null,"runs_total":0,"sessions":[]}' ;;
             esac
             printf '{"name":%s,"instance":%s,"repo":%s,"state":%s,%s' \
                 "$(json_str "${name#agent-box-}")" \
@@ -1300,7 +1421,18 @@ render_status() {
                 "$(json_str "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')")" \
                 "${guest#\{}"
         else
-            [ -n "$guest" ] || guest='(not running)'
+            # A running box whose guest script could not answer is NOT "(not
+            # running)" — that is a false statement about a box, and the two
+            # cases need different words because they need different actions.
+            # Either way the box is printed: a box must never disappear from
+            # status just because the thing that describes it failed.
+            if [ -z "$guest" ]; then
+                if [ "$state" = "Running" ]; then
+                    guest='fw=unknown  (the guest status script did not answer)'
+                else
+                    guest='(not running)'
+                fi
+            fi
             printf '%-30s %-9s %s\n' \
                 "$name" "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')" "$guest"
         fi
@@ -1371,6 +1503,172 @@ cmd_watch_run() {
         -e 'end run' \
         -- "$(basename "$repo") ${runid}: ${state}" \
         >/dev/null 2>&1 || true
+}
+
+# Show or change a box's egress mode.
+# One line about the mode, printed where an operator is about to set an agent
+# going. Silent for `deny`, which is the quiet default and the thing they would
+# expect; loud for the two that are not, because "this box is open" is exactly
+# what someone forgets between creating a box on Monday and using it on Friday.
+# What the box is ACTUALLY in, read from its ruleset rather than from the file
+# that says what it was asked for. Sets ABX_LIVE_MODE and ABX_MODE_DETAIL.
+#
+# Everything this returns came out of a guest and is printed to a terminal, so
+# it goes through the same scrub as every other guest-sourced string: the detail
+# is assembled from a ruleset an agent inside that guest can write to.
+read_live_egress() {
+    local inst="${1:?}" line=""
+    ABX_LIVE_MODE="unknown"
+    ABX_MODE_AGREE="no"
+    ABX_MODE_DETAIL=""
+    # ONE call. The obvious shape — read in the guest, pipe through the guest's
+    # scrubber — cannot work here: guest_shell redirects stdin from /dev/null so
+    # that ssh cannot eat a caller's input, which silently empties the pipe
+    # between two of them. The reader scrubs its own output instead.
+    line=$(guest_shell "$inst" "${GUEST_BIN}/egress-mode.sh" 2>/dev/null | head -1) || line=""
+    [ -n "$line" ] || return 1
+    ABX_LIVE_MODE=$(printf '%s' "$line" | sed -n 's/.*live=\([a-z]*\).*/\1/p')
+    ABX_MODE_AGREE=$(printf '%s' "$line" | sed -n 's/.*agree=\([a-z]*\).*/\1/p')
+    ABX_MODE_DETAIL=$(printf '%s' "$line" | sed -n 's/.*detail=//p')
+    [ -n "$ABX_LIVE_MODE" ] || ABX_LIVE_MODE="unknown"
+    [ -n "$ABX_MODE_AGREE" ] || ABX_MODE_AGREE="no"
+    return 0
+}
+
+announce_egress_mode() {
+    local inst="${1:?}"
+    read_live_egress "$inst" || return 0
+    # A disagreement between the file and the ruleset is louder than either
+    # mode on its own: it means nobody can say what this box will do, and it is
+    # said here because `run` and `session` are where somebody is about to set
+    # an agent going.
+    if [ "$ABX_MODE_AGREE" != "yes" ]; then
+        info "egress mode: UNKNOWN — ${ABX_MODE_DETAIL}. Run '${PROG} firewall-check' before trusting this box." >&2
+        return 0
+    fi
+    case "$ABX_LIVE_MODE" in
+        open)
+            info "egress mode: OPEN — this box has no egress filtering; anything it runs can reach any host" ;;
+        observe)
+            info "egress mode: OBSERVE — non-allowlisted traffic is allowed and logged ('${PROG} egress-log')" ;;
+    esac
+}
+
+cmd_egress() {
+    local inst mode current
+    split_args "" "$@"
+    check_operands 1 2 "egress <repo|name> [${EGRESS_MODES// /|}]"
+    inst=$(instance_name "${ABX_POSV[0]}")
+    mode=$(operand 1)
+    require_limactl
+    require_instance "$inst"
+
+    if [ -z "$mode" ]; then
+        # Show what the box IS doing, from its ruleset. The host's record is the
+        # fallback for a box that is not running, and it is labelled as such
+        # rather than passed off as a reading.
+        if [ "$(instance_state "$inst")" = "Running" ]; then
+            if read_live_egress "$inst"; then
+                if [ "$ABX_MODE_AGREE" != "yes" ]; then
+                    printf 'unknown\n'
+                    printf '%s\n' "$ABX_MODE_DETAIL" >&2
+                else
+                    printf '%s\n' "$ABX_LIVE_MODE"
+                    # Informational rather than a problem: a box with no mode
+                    # file is still plainly in a mode.
+                    [ -z "$ABX_MODE_DETAIL" ] || printf '%s\n' "$ABX_MODE_DETAIL" >&2
+                fi
+                return 0
+            fi
+        fi
+        current=$(read_instance_egress "$inst" || printf 'unknown')
+        printf '%s\n' "$current"
+        [ "$current" = "unknown" ] \
+            || printf '(not running; this is the host'"'"'s record, not a reading)\n' >&2
+        return 0
+    fi
+
+    valid_egress_mode "$mode" || die "egress mode must be one of: ${EGRESS_MODES}, got '${mode}'"
+    require_running "$inst"
+
+    if [ "$mode" = "open" ]; then
+        info "WARNING: 'open' turns egress filtering OFF for this box. Anything the agent runs can reach any host on the internet, and nothing will be logged. The VM boundary, the single mount and the token handling are unchanged."
+    elif [ "$mode" = "observe" ]; then
+        info "NOTE: 'observe' ALLOWS non-allowlisted traffic and records it. Read it back with '${PROG} egress-log'."
+    fi
+
+    # Transactional, and the ordering is the whole of it.
+    #
+    # Writing the mode file first and rebuilding second was wrong twice over. A
+    # rebuild that failed left the REQUESTED mode armed in the file, so the CLI
+    # said nothing had happened and the 15-minute timer applied the change a
+    # quarter of an hour later. And a verification failure left the box in the
+    # new mode with the host's record on the old one, while the message claimed
+    # nothing had been recorded.
+    #
+    # So: apply the new mode WITHOUT writing it, verify, and only then record it
+    # on both sides. On any failure, rebuild again on the previous mode so that
+    # nothing is left armed, and say which mode the box is actually on.
+    local previous
+    previous=$(guest_shell "$inst" cat /etc/agent-box/egress-mode 2>/dev/null | tr -d '[:space:]')
+    valid_egress_mode "${previous:-}" || previous="deny"
+
+    revert_egress() {
+        info "reverting ${inst} to '${previous}'" >&2
+        if guest_shell "$inst" sudo /opt/agent-box/guest/init-firewall.sh --mode "$previous" >/dev/null 2>&1; then
+            info "the box is on '${previous}', which is where it started" >&2
+        else
+            info "WARNING: the revert also failed. The box may be on neither mode cleanly; run '${PROG} firewall-check ${inst}' and read the output before using it." >&2
+        fi
+    }
+
+    # ONE call, which rebuilds and then verifies against the mode it was given.
+    # A separate `--verify-only` afterwards was wrong and the box said so: that
+    # second run re-reads the mode FILE, which the transaction has deliberately
+    # not written yet, so it verified the new ruleset against the old mode and
+    # failed every check the two modes disagree about.
+    info "applying egress mode '${mode}' to ${inst} (not recorded until it verifies)"
+    if ! guest_shell "$inst" sudo /opt/agent-box/guest/init-firewall.sh --mode "$mode"; then
+        revert_egress
+        die "the rebuild or verification for '${mode}' failed; nothing was recorded and the box is on '${previous}'"
+    fi
+
+    # Held. Now it is a fact, and now it is written down — the guest first,
+    # because that is what the next rebuild and the timer will read.
+    guest_shell "$inst" sudo /opt/agent-box/guest/set-egress-mode.sh "$mode" \
+        || die "the ruleset is '${mode}' but the mode file could not be written; run '${PROG} egress ${inst} ${mode}' again"
+    write_instance_egress "$inst" "$mode"
+    info "egress mode is now '${mode}'"
+}
+
+# What a box in observe mode tried to reach.
+cmd_egress_log() {
+    local inst since=1h fmt=text
+    split_args "--since" "$@"
+    check_operands 1 1 "egress-log <repo|name> [--since DUR] [--json] [--as-allowlist]"
+    inst=$(instance_name "${ABX_POSV[0]}")
+    set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --since)
+                [ -n "${2:-}" ] || die "--since needs a duration, e.g. 2h"
+                # journalctl accepts a great deal and silently treats what it
+                # cannot parse as "the beginning of time" or as now — either of
+                # which reads to the caller as an empty window rather than as a
+                # typo. A strict grammar here turns it into a usage error.
+                printf '%s' "$2" | grep -qE '^[0-9]+(s|m|h|d|w)$' \
+                    || die "--since takes a number and one of s m h d w, e.g. 90m or 7d; got '${2}'"
+                since="$2"; shift 2 ;;
+            --json)          fmt=json; shift ;;
+            --as-allowlist)  fmt=allowlist; shift ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    require_limactl
+    require_running "$inst"
+    # In the guest, like every other reader: the output carries hostnames the
+    # agent reached for, and it is scrubbed there rather than here.
+    guest_shell "$inst" sudo /opt/agent-box/guest/egress-log.sh --since "$since" --format "$fmt"
 }
 
 cmd_firewall_check() {
@@ -1450,6 +1748,8 @@ case "${1:-}" in
     stop)           shift; cmd_stop "$@" ;;
     destroy)        shift; cmd_destroy "$@" ;;
     status)         shift; cmd_status "$@" ;;
+    egress)         shift; cmd_egress "$@" ;;
+    egress-log)     shift; cmd_egress_log "$@" ;;
     firewall-check) shift; cmd_firewall_check "$@" ;;
     help|-h|--help) usage ;;
     *)              usage >&2; exit 2 ;;

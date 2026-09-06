@@ -50,21 +50,37 @@ if [ -z "$CLAUDE_VERSION" ] && command -v claude >/dev/null 2>&1; then
     fi
 fi
 
-# --- the firewall ----------------------------------------------------------
+# --- the egress mode --------------------------------------------------------
 #
-# The OUTPUT policy, read from the live ruleset, not from whether a unit is
-# enabled: `systemctl is-active` says a oneshot ran, not that its rules are
-# still in force. `unknown` when the ruleset cannot be read at all, which is
-# honest — this command must never claim `drop` it did not see.
+# The `firewall` field is the MODE now: deny, observe, open or unknown. It is
+# derived from the LIVE RULESET by guest/egress-mode.sh, never from the mode
+# file — a file is what somebody asked for, and reporting it as fact is how a
+# box that permits everything comes to be described as denying.
+#
+# When the file and the ruleset disagree, the answer is `unknown` and
+# `firewall_detail` says what both of them said. Unknown is the honest answer
+# to "which of these two do you believe", and picking one silently is not.
 FIREWALL="unknown"
-# `-w`: a rebuild can hold the xtables lock for a stretch, and iptables 1.8
-# without it exits non-zero rather than waiting — which would report `unknown`
-# on a perfectly healthy box every time `status --watch` landed on a rebuild.
-if POLICY=$(sudo -n iptables -w 5 -S 2>/dev/null | grep -- '-P OUTPUT'); then
-    case "$POLICY" in
-        *DROP*) FIREWALL="drop" ;;
-        *)      FIREWALL="open" ;;
-    esac
+FIREWALL_DETAIL=""
+if MODE_LINE=$("${ABX_LIB_DIR}/egress-mode.sh" 2>/dev/null); then
+    _live=$(printf '%s' "$MODE_LINE" | sed -n 's/.*live=\([a-z]*\).*/\1/p')
+    _agree=$(printf '%s' "$MODE_LINE" | sed -n 's/.*agree=\([a-z]*\).*/\1/p')
+    FIREWALL_DETAIL=$(printf '%s' "$MODE_LINE" | sed -n 's/.*detail=//p')
+    # A DISAGREEMENT is unknown. A detail on its own is not: a box with no mode
+    # file has an unambiguous ruleset and something worth mentioning, and
+    # reporting `unknown` about it would be less true rather than more careful.
+    if [ "${_agree:-no}" = "yes" ]; then
+        FIREWALL="${_live:-unknown}"
+        # And the JSON carries no detail in this case, even when the reader had
+        # something to say. The contract is that `firewall_detail` appears only
+        # when the mode is unknown or the two sources conflict; a note about a
+        # missing mode file is information for a person, and it is printed by
+        # `agentbox egress` where a person is reading. Putting it in the
+        # contract would make a healthy box look like it had a problem.
+        FIREWALL_DETAIL=""
+    else
+        FIREWALL="unknown"
+    fi
 fi
 
 # --- orphaned runs --------------------------------------------------------
@@ -90,4 +106,5 @@ fi
 exec python3 "${ABX_LIB_DIR}/run-format.py" "$MODE" \
     --claude-version "$CLAUDE_VERSION" \
     --firewall "$FIREWALL" \
+    --firewall-detail "$FIREWALL_DETAIL" \
     --sessions "$SESSIONS"

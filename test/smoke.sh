@@ -45,6 +45,10 @@ INSTANCE="agent-box-${SMOKE_ID}"
 # is fixed at create time and the point is to prove both shapes work.
 DOCKER_REPO="${TMP_ROOT}/dk-${SMOKE_ID}"
 DOCKER_INSTANCE="agent-box-dk-${SMOKE_ID}"
+# A third, short-lived box: `status` listing more than one box is the only way
+# to see a box go missing from it, and one box can never show that.
+SECOND_REPO="${TMP_ROOT}/second-${SMOKE_ID}"
+SECOND_INSTANCE="agent-box-second-${SMOKE_ID}"
 FORWARD_PORT=3999
 # A SECOND forwarded port, carrying a container published the ordinary way
 # (`-p N:80`, which binds 0.0.0.0), and one port deliberately left out of
@@ -52,6 +56,10 @@ FORWARD_PORT=3999
 # rests on: what --forward reaches, and what nothing reaches.
 FORWARD_PORT2=3998
 UNFORWARDED_PORT=3997
+
+# The host's python, for parsing JSON the guest produced. Named once so the
+# assertions below read as assertions rather than as plumbing.
+PY="${PY:-python3}"
 
 PASS=0
 FAIL=0
@@ -81,7 +89,7 @@ cleanup() {
             >/dev/null 2>&1 || true
         STANDIN_INSTALLED=0
     fi
-    for inst in "$INSTANCE" "$DOCKER_INSTANCE"; do
+    for inst in "$INSTANCE" "$DOCKER_INSTANCE" "$SECOND_INSTANCE"; do
         if "$LIMACTL" list --quiet 2>/dev/null | grep -qxF "$inst"; then
             printf 'destroying %s\n' "$inst"
             "$AGENTBOX" destroy "$inst" || "$LIMACTL" delete --force "$inst" || true
@@ -282,6 +290,33 @@ mkdir -p "${GUEST_CFG}/claude/rules" \
          "${GUEST_CFG}/plugin-dir/demo/.claude-plugin" \
          "${GUEST_CFG}/plugin-dir/demo/commands"
 
+# The two allowlist forms that cannot be exercised by the base file: a range,
+# and a suffix. TEST-NET-1 is reserved and routed nowhere, which is what makes
+# it a good range to assert on — in range it is allowed and times out, out of
+# range it is refused immediately, and the difference is measurable. iana.org
+# is a real, stable name that nothing else in the allowlist covers.
+ALLOWED_CIDR="192.0.2.0/24"
+CIDR_IN="192.0.2.7"
+CIDR_OUT="198.51.100.7"
+ALLOWED_SUFFIX=".iana.org"
+# The resolver's own set, kept apart from the rebuild's. Named here so the
+# assertions can say which set they mean.
+IPSET_RESOLVED_NAME="allowed-resolved"
+# An exact name that is NOT otherwise allowlisted, to prove a bare line is fed
+# to nothing and pinned by the rebuild instead.
+EXACT_HOST="www.rfc-editor.org"
+SUFFIX_HOST="www.iana.org"
+cat > "${GUEST_CFG}/allowlist.local" <<EOF
+# staged by test/smoke.sh
+${ALLOWED_CIDR}
+${ALLOWED_SUFFIX}
+${EXACT_HOST}
+2001:db8::/32
+this is not a valid line!!
+999.1.2.3/24
+10.0.0.0/99
+EOF
+
 cat > "${GUEST_CFG}/plugins.txt" <<EOF
 # agent-box smoke test
 marketplace ${MARKETPLACE_REPO}
@@ -342,12 +377,75 @@ else
 fi
 
 # ===========================================================================
+step "3e. create refuses without an egress mode, and honours a standing default"
+# ===========================================================================
+#
+# The mode has no default on purpose: a box's reach is the one thing nobody
+# should end up with by accident. The only way to skip the flag is to have
+# written the default down yourself, and even then create says so.
+
+NOEG_OUT="${TMP_ROOT}/no-egress.out"
+run_bounded 60 "$NOEG_OUT" "$AGENTBOX" create "$CLEAN_REPO"
+noeg_rc=$BOUNDED_RC
+cat "$NOEG_OUT"
+if [ "$noeg_rc" -ne 0 ]; then
+    ok "create without --egress refuses (exit ${noeg_rc})"
+else
+    bad "create without --egress went ahead"
+fi
+for word in deny observe open; do
+    if grep -q "^  ${word} " "$NOEG_OUT"; then
+        ok "the refusal explains '${word}'"
+    else
+        bad "the refusal does not explain '${word}'"
+    fi
+done
+if [ ! -d "${CLEAN_REPO}/.agent-box" ] && ! "$LIMACTL" list --quiet 2>/dev/null | grep -qxF "$INSTANCE"; then
+    ok "and it created nothing before refusing"
+else
+    bad "create left state behind after refusing"
+fi
+
+BADEG_OUT="${TMP_ROOT}/bad-egress.out"
+run_bounded 60 "$BADEG_OUT" "$AGENTBOX" create "$CLEAN_REPO" --egress sideways
+cat "$BADEG_OUT"
+if grep -q 'must be one of' "$BADEG_OUT"; then
+    ok "an unknown mode is named and refused"
+else
+    bad "an unknown mode was not refused clearly"
+fi
+
+# The standing default. It is read from the host config, and create has to say
+# which mode it took AND where it came from — a default you can see is a
+# different thing from one you inherited.
+printf 'egress: observe\n' > "${AGENT_BOX_CONFIG_DIR}/config"
+DEFEG_OUT="${TMP_ROOT}/default-egress.out"
+# --cpus 0 stops it after the mode is resolved and before anything is built.
+run_bounded 60 "$DEFEG_OUT" "$AGENTBOX" create "$CLEAN_REPO" --cpus 0
+cat "$DEFEG_OUT"
+if grep -q 'must be a whole number of CPUs' "$DEFEG_OUT"; then
+    ok "the host default was accepted, so create got as far as the sizing check"
+else
+    bad "create did not accept the host config default"
+fi
+printf 'egress: sideways\n' > "${AGENT_BOX_CONFIG_DIR}/config"
+BADDEF_OUT="${TMP_ROOT}/bad-default.out"
+run_bounded 60 "$BADDEF_OUT" "$AGENTBOX" create "$CLEAN_REPO"
+cat "$BADDEF_OUT"
+if grep -q "sets 'egress: sideways'" "$BADDEF_OUT"; then
+    ok "an invalid standing default is named as the problem, once"
+else
+    bad "an invalid standing default was not reported clearly"
+fi
+rm -f "${AGENT_BOX_CONFIG_DIR}/config"
+
+# ===========================================================================
 step "4. create a real instance from the clean repository"
 # ===========================================================================
 
 printf 'This downloads an Ubuntu image on a cold cache and then provisions.\n'
 START_TS=$(date +%s)
-"$AGENTBOX" create "$CLEAN_REPO"
+"$AGENTBOX" create "$CLEAN_REPO" --egress deny
 rc=$?
 printf 'create took %s seconds\n' "$(( $(date +%s) - START_TS ))"
 if [ "$rc" -eq 0 ]; then ok "agentbox create succeeded"; else bad "agentbox create exited ${rc}"; fi
@@ -489,7 +587,9 @@ FW_OUT="${TMP_ROOT}/firewall.out"
 rc=$?
 cat "$FW_OUT"
 if [ "$rc" -eq 0 ]; then ok "firewall-check exited 0"; else bad "firewall-check exited ${rc}"; fi
-for check in policy-drop policy-drop-v6 allowlist-rule allowlist-holds literal-ip-denied foreign-dns-denied egress-denied anthropic-allowed github-allowed uplink-not-bridge; do
+for check in policy-drop policy-drop-v6 allowlist-rule allowlist-holds literal-ip-denied \
+             foreign-dns-denied egress-denied anthropic-allowed github-allowed \
+             uplink-not-bridge inbound-intact resolver-up resolver-conf; do
     if grep -q "^PASS  ${check}" "$FW_OUT"; then
         ok "firewall check ${check}"
     else
@@ -1511,10 +1611,12 @@ step "8h. status: the JSON contract, and --watch leaving on Ctrl-C"
 STATUS_OUT="${TMP_ROOT}/status.out"
 "$AGENTBOX" status "$CLEAN_REPO" > "$STATUS_OUT" 2>&1
 cat "$STATUS_OUT"
-if grep -q "$INSTANCE" "$STATUS_OUT" && grep -q 'fw=drop' "$STATUS_OUT"; then
+# `fw=` is the egress MODE now, not the OUTPUT policy: deny, observe, open or
+# unknown. This box is deny.
+if grep -q "$INSTANCE" "$STATUS_OUT" && grep -q 'fw=deny' "$STATUS_OUT"; then
     ok "status names the box and reports the firewall as drop"
 else
-    bad "status does not name the box with fw=drop"
+    bad "status does not name the box with fw=deny"
 fi
 
 STATUSJ="${TMP_ROOT}/status.json"
@@ -1530,10 +1632,18 @@ if jq -e '.generated_at and (.boxes | length == 1)' "$STATUSJ" >/dev/null 2>&1; 
 else
     bad "status --json is not shaped as documented"
 fi
-if jq -e '.boxes[0] | .firewall == "drop"' "$STATUSJ" >/dev/null 2>&1; then
-    ok "status --json reports firewall drop"
+if jq -e '.boxes[0] | .firewall == "deny"' "$STATUSJ" >/dev/null 2>&1; then
+    ok "status --json reports the egress mode as deny"
 else
-    bad "status --json does not report firewall drop"
+    bad "status --json does not report the egress mode as deny"
+fi
+# Present only when there is something to say. `null` on a healthy box would
+# read as a fourth unknown rather than as nothing to report, because every
+# other nullable key in this object means "asked for and unavailable".
+if jq -e '.boxes[0] | has("firewall_detail") | not' "$STATUSJ" >/dev/null 2>&1; then
+    ok "and firewall_detail is absent on a healthy box, not null"
+else
+    bad "firewall_detail is present on a healthy box: $(jq -c '.boxes[0].firewall_detail' "$STATUSJ" 2>/dev/null)"
 fi
 if jq -e '.boxes[0] | has("name") and has("instance") and has("repo") and has("state") and has("claude_version") and has("run") and has("runs_total") and has("sessions")' "$STATUSJ" >/dev/null 2>&1; then
     ok "status --json carries every documented key"
@@ -1562,6 +1672,73 @@ if jq -e '.boxes[0].runs_total >= 1' "$STATUSJ" >/dev/null 2>&1; then
     ok "status --json counts the runs"
 else
     bad "status --json does not count the runs"
+fi
+
+printf -- '\n--- a box whose guest status script fails is still LISTED ---\n'
+# A box must never disappear from status. The thing that describes a box
+# failing is not the box being absent, and the two need different words:
+# reporting a running box as "(not running)" is a false statement about it,
+# and dropping it from the JSON is worse — a consumer cannot notice a box that
+# is not there.
+#
+# The script is broken by bind-mounting a failing one over it, because
+# /opt/agent-box is a read-only mount and this is the only way to make the real
+# code path fail without editing the code under test.
+BREAK_OUT="${TMP_ROOT}/status-broken.out"
+guest sudo bash -c '
+printf "#!/bin/sh\nexit 1\n" > /tmp/abx-false-status
+chmod 0755 /tmp/abx-false-status
+mount --bind /tmp/abx-false-status /opt/agent-box/guest/box-status.sh && echo BIND_OK
+/opt/agent-box/guest/box-status.sh; echo "SCRIPT_RC=$?"' > "$BREAK_OUT" 2>&1
+cat "$BREAK_OUT"
+if grep -q '^BIND_OK' "$BREAK_OUT" && grep -q '^SCRIPT_RC=1' "$BREAK_OUT"; then
+    ok "the guest status script was really broken, so the checks below are not vacuous"
+else
+    bad "could not break the guest status script; the checks below would prove nothing"
+fi
+
+BROKENJ="${TMP_ROOT}/status-broken.json"
+"$AGENTBOX" status "$CLEAN_REPO" --json > "$BROKENJ" 2>/dev/null || true
+cat "$BROKENJ"
+if jq -e --arg n "$INSTANCE" '[.boxes[] | select(.instance == $n)] | length == 1' "$BROKENJ" >/dev/null 2>&1; then
+    ok "the box is still listed when its guest script fails"
+else
+    bad "the box disappeared from status --json when its guest script failed"
+fi
+if jq -e --arg n "$INSTANCE" '.boxes[] | select(.instance == $n) | .state == "running" and .firewall == "unknown"' "$BROKENJ" >/dev/null 2>&1; then
+    ok "and it is reported as running with firewall unknown"
+else
+    bad "a running box with a broken status script is not reported as running/unknown"
+fi
+# The other half of the presence rule: whenever the mode is unknown, the key is
+# there and says why. An unexplained unknown is the thing this avoids.
+if jq -e --arg n "$INSTANCE" '.boxes[] | select(.instance == $n) | (.firewall_detail // "") | length > 0' "$BROKENJ" >/dev/null 2>&1; then
+    ok "and firewall_detail says why it is unknown"
+else
+    bad "firewall is unknown with no firewall_detail to explain it"
+fi
+
+BROKENT="${TMP_ROOT}/status-broken.txt"
+"$AGENTBOX" status "$CLEAN_REPO" > "$BROKENT" 2>/dev/null || true
+cat "$BROKENT"
+if grep -q "$INSTANCE" "$BROKENT"; then
+    ok "the text listing shows it too"
+else
+    bad "the text listing dropped the box"
+fi
+if grep -q 'not running' "$BROKENT"; then
+    bad "a RUNNING box with a broken status script was reported as '(not running)'"
+else
+    ok "and does not call a running box 'not running'"
+fi
+
+guest sudo umount /opt/agent-box/guest/box-status.sh >/dev/null 2>&1 || true
+UNBROKE="${TMP_ROOT}/status-unbroken.json"
+"$AGENTBOX" status "$CLEAN_REPO" --json > "$UNBROKE" 2>/dev/null || true
+if jq -e '.boxes[0].firewall == "deny"' "$UNBROKE" >/dev/null 2>&1; then
+    ok "and the box is back to reporting its real mode afterwards"
+else
+    bad "the box did not recover after the status script was restored"
 fi
 
 printf -- '\n--- status --watch 30 leaves within three seconds of SIGINT ---\n'
@@ -2584,6 +2761,769 @@ else
 fi
 
 # ===========================================================================
+step "9c. the allowlist's new line forms: a range and a suffix"
+# ===========================================================================
+#
+# A CIDR needs no resolution and never expires. A suffix cannot be pre-resolved
+# at all — that is the point of it — so it works only through the guest's own
+# resolver, which adds each address as the guest looks it up. The distinction
+# that proves which mechanism did the work is the ipset TIMEOUT: everything the
+# rebuild adds is `timeout 0`, everything dnsmasq adds carries the set default.
+
+ALLOW_OUT="${TMP_ROOT}/allowforms.out"
+# shellcheck disable=SC2016  # every expansion here is the guest's, not this shell.
+run_bounded 300 "$ALLOW_OUT" "$LIMACTL" shell --workdir /work "$INSTANCE" -- bash -c "
+set -u
+echo \"CIDR_IN_SET=\$(sudo ipset test allowed-domains ${CIDR_IN} >/dev/null 2>&1 && echo yes || echo no)\"
+echo \"CIDR_OUT_SET=\$(sudo ipset test allowed-domains ${CIDR_OUT} >/dev/null 2>&1 && echo yes || echo no)\"
+# In range: allowed by the filter, so the connection is attempted and times out
+# against an address nothing answers on. Out of range: REJECTed at once. curl
+# tells them apart — 28 is a timeout, 7 is a refused connection.
+curl -sS -m 4 -o /dev/null https://${CIDR_IN}/ 2>/dev/null; echo \"CIDR_IN_CURL=\$?\"
+curl -sS -m 4 -o /dev/null https://${CIDR_OUT}/ 2>/dev/null; echo \"CIDR_OUT_CURL=\$?\"
+echo \"V6_INERT=\$(sudo journalctl -u agent-box-firewall.service -b --no-pager | grep -c 'INERT' || true)\"
+echo \"BAD_LINE_WARNED=\$(sudo journalctl -u agent-box-firewall.service -b --no-pager | grep -c 'no recognised form' || true)\"
+# The suffix. It is never pre-resolved by the rebuild — that is what makes it a
+# suffix — so anything the set holds for it came from the resolver.
+getent ahostsv4 ${SUFFIX_HOST} >/dev/null 2>&1 || true
+sleep 2
+SA=\$(getent ahostsv4 ${SUFFIX_HOST} | awk '{print \$1; exit}')
+echo \"SUFFIX_ADDR=\$SA\"
+# An empty address would make the grep below match the FIRST line of the set
+# and report it as this host's entry — the assertion would pass hardest
+# exactly when the name did not resolve at all.
+if [ -z \"\$SA\" ]; then
+    echo \"SUFFIX_ENTRY=RESOLUTION-FAILED\"
+else
+    echo \"SUFFIX_ENTRY=\$(sudo ipset save ${IPSET_RESOLVED_NAME} | grep -F \"\$SA\" | head -1)\"
+fi
+curl -sS -m 10 -o /dev/null -w 'SUFFIX_HTTP=%{http_code}\n' https://${SUFFIX_HOST}/ 2>/dev/null || echo 'SUFFIX_HTTP=000'
+"
+cat "$ALLOW_OUT"
+
+if grep -q '^CIDR_IN_SET=yes' "$ALLOW_OUT"; then
+    ok "an address inside an allowlisted range is in the set"
+else
+    bad "an address inside an allowlisted range is not in the set"
+fi
+if grep -q '^CIDR_OUT_SET=no' "$ALLOW_OUT"; then
+    ok "an address outside it is not"
+else
+    bad "an address outside the allowlisted range is in the set"
+fi
+if grep -q '^CIDR_IN_CURL=28' "$ALLOW_OUT"; then
+    ok "the in-range address is permitted by the filter (it times out, not refused)"
+else
+    bad "the in-range address was not permitted: $(sed -n 's/^CIDR_IN_CURL=//p' "$ALLOW_OUT")"
+fi
+if grep -q '^CIDR_OUT_CURL=7' "$ALLOW_OUT"; then
+    ok "the out-of-range address is refused immediately"
+else
+    bad "the out-of-range address was not refused: $(sed -n 's/^CIDR_OUT_CURL=//p' "$ALLOW_OUT")"
+fi
+if grep -qE '^V6_INERT=[1-9]' "$ALLOW_OUT"; then
+    ok "an IPv6 range is accepted and reported as inert"
+else
+    bad "the IPv6 range was not reported as inert"
+fi
+if grep -qE '^BAD_LINE_WARNED=[1-9]' "$ALLOW_OUT"; then
+    ok "a line in no recognised form is warned about, not silently dropped"
+else
+    bad "a malformed allowlist line was dropped silently"
+fi
+SUFFIX_ENTRY=$(sed -n 's/^SUFFIX_ENTRY=//p' "$ALLOW_OUT" | head -1)
+printf 'the suffix host resolved to: %s\n' "$(sed -n 's/^SUFFIX_ADDR=//p' "$ALLOW_OUT" | head -1)"
+printf 'its set entry: %s\n' "${SUFFIX_ENTRY:-<none>}"
+# `timeout <non-zero>` is the proof it came from dnsmasq: the rebuild adds
+# everything with `timeout 0`, so a live timeout cannot have come from there.
+if printf '%s' "$SUFFIX_ENTRY" | grep -qE 'timeout [1-9]'; then
+    ok "the suffix host's address entered the set via the resolver, not the rebuild"
+else
+    bad "the suffix host's address is absent, or was added by the rebuild rather than the resolver"
+fi
+if grep -q '^SUFFIX_HTTP=200' "$ALLOW_OUT"; then
+    ok "a host under an allowlisted suffix is reachable"
+else
+    bad "a host under an allowlisted suffix is not reachable"
+fi
+
+printf -- '\n--- a rebuild keeps what the resolver added ---\n'
+# The measurement that decided this: dnsmasq feeds the set when it FORWARDS an
+# answer and not when it serves one from its own cache, so "the next lookup
+# will re-add it" is not true, and a rebuild that forgot would black-hole the
+# host for the rest of its TTL.
+PRESERVE_OUT="${TMP_ROOT}/preserve.out"
+# shellcheck disable=SC2016  # guest expansions.
+run_bounded 300 "$PRESERVE_OUT" "$LIMACTL" shell --workdir /work "$INSTANCE" -- bash -c "
+set -u
+SA=\$(getent ahostsv4 ${SUFFIX_HOST} | awk '{print \$1; exit}')
+sudo systemctl restart agent-box-firewall.service
+if [ -z \"\$SA\" ]; then
+    echo \"AFTER_REBUILD=RESOLUTION-FAILED\"
+else
+    echo \"AFTER_REBUILD=\$(sudo ipset save ${IPSET_RESOLVED_NAME} | grep -F \"\$SA\" | head -1)\"
+fi
+sudo journalctl -u agent-box-firewall.service -b --no-pager | grep 'Carried' | tail -1
+curl -sS -m 10 -o /dev/null -w 'STILL_HTTP=%{http_code}\n' https://${SUFFIX_HOST}/ 2>/dev/null || echo 'STILL_HTTP=000'
+"
+cat "$PRESERVE_OUT"
+if grep -qE '^AFTER_REBUILD=add .*timeout [1-9]' "$PRESERVE_OUT"; then
+    ok "the resolver-added address survived the rebuild, with its remaining time"
+else
+    bad "the rebuild forgot the resolver-added address"
+fi
+# Nothing is "carried" any more, and that is the fix rather than a regression:
+# the resolver's addresses live in a set the rebuild does not touch, so they
+# survive because they were never in the set being replaced. The assertion that
+# matters is the one above — the entry is still there, with its timeout still
+# running — plus the one below, that the host is still reachable.
+if grep -qE '^AFTER_REBUILD=add .*timeout' "$PRESERVE_OUT"; then
+    ok "the entry kept its timeout, so it is the resolver's and not a fresh pin"
+else
+    bad "the surviving entry is not a resolver entry"
+fi
+if grep -q '^STILL_HTTP=200' "$PRESERVE_OUT"; then
+    ok "and the suffix host is still reachable after the rebuild"
+else
+    bad "the suffix host became unreachable after a rebuild"
+fi
+
+# ===========================================================================
+step "9c2. exact means exact; a dot line means the subtree"
+# ===========================================================================
+#
+# The distinction the whole feed rests on. An exact name is pre-resolved and
+# pinned; feeding it to the resolver as well would have made every line in
+# allowlist.base a wildcard for its subtree. Only dot lines are fed.
+
+EXACT_OUT="${TMP_ROOT}/exact-vs-suffix.out"
+# shellcheck disable=SC2016  # guest expansions.
+run_bounded 300 "$EXACT_OUT" "$LIMACTL" shell --workdir /work "$INSTANCE" -- bash -c "
+set -u
+echo \"FEED_LINES=\$(grep -c '^ipset=' /etc/dnsmasq.d/agent-box.conf || true)\"
+echo \"FEED_HAS_SUFFIX=\$(grep -c '^ipset=/iana.org/' /etc/dnsmasq.d/agent-box.conf || true)\"
+echo \"FEED_HAS_EXACT=\$(grep -c '^ipset=/${EXACT_HOST}/' /etc/dnsmasq.d/agent-box.conf || true)\"
+echo \"FEED_HAS_ANTHROPIC=\$(grep -c '^ipset=/api.anthropic.com/' /etc/dnsmasq.d/agent-box.conf || true)\"
+echo \"CONF_FILE_ARG=\$(tr '\\0' '\\n' < /proc/\$(pgrep -x dnsmasq | head -1)/cmdline | grep -c -- '--conf-file=/etc/dnsmasq.d/agent-box.conf' || true)\"
+echo \"REBIND=\$(grep -c '^stop-dns-rebind' /etc/dnsmasq.d/agent-box.conf || true)\"
+echo \"CACHETTL=\$(sed -n 's/^max-cache-ttl=//p' /etc/dnsmasq.d/agent-box.conf | head -1)\"
+"
+cat "$EXACT_OUT"
+if grep -qE '^FEED_HAS_SUFFIX=[1-9]' "$EXACT_OUT"; then
+    ok "the dot line is fed to the resolver"
+else
+    bad "the dot line is not fed to the resolver"
+fi
+if grep -q '^FEED_HAS_EXACT=0' "$EXACT_OUT" && grep -q '^FEED_HAS_ANTHROPIC=0' "$EXACT_OUT"; then
+    ok "exact names are NOT fed, so a bare line cannot admit its subtree"
+else
+    bad "an exact name was fed to the resolver; every bare line is a wildcard"
+fi
+if grep -qE '^FEED_LINES=[1-9]' "$EXACT_OUT"; then
+    ok "the feed has rules at all, so the two checks above are not vacuous"
+else
+    bad "the resolver config has no feed rules"
+fi
+if grep -qE '^CONF_FILE_ARG=[1-9]' "$EXACT_OUT"; then
+    ok "dnsmasq is running with our config as its only conf-file"
+else
+    bad "dnsmasq is not reading our configuration"
+fi
+if grep -qE '^REBIND=[1-9]' "$EXACT_OUT"; then
+    ok "stop-dns-rebind is set, so an answer cannot name a private address"
+else
+    bad "stop-dns-rebind is missing"
+fi
+CACHE_TTL=$(sed -n 's/^CACHETTL=//p' "$EXACT_OUT" | head -1)
+printf 'max-cache-ttl=%s against an entry lifetime of 3600\n' "${CACHE_TTL:-<unset>}"
+if [ -n "$CACHE_TTL" ] && [ "$CACHE_TTL" -lt 3600 ]; then
+    ok "the resolver cache expires before the set entry does"
+else
+    bad "max-cache-ttl is not below the entry lifetime; a host can go dark silently"
+fi
+
+printf -- '\n--- tampering with the feed is caught ---\n'
+# The resolver's config IS the allowlist. A line added to it by anything other
+# than the rebuild must be reported, not obeyed.
+TAMPER_OUT="${TMP_ROOT}/feed-tamper.out"
+run_bounded 300 "$TAMPER_OUT" "$LIMACTL" shell --workdir /work "$INSTANCE" -- bash -c '
+set -u
+sudo cp /etc/dnsmasq.d/agent-box.conf /tmp/abx-conf.bak
+printf "ipset=/evil.example/allowed-resolved\n" | sudo tee -a /etc/dnsmasq.d/agent-box.conf >/dev/null
+sudo /opt/agent-box/guest/init-firewall.sh --verify-only 2>&1 | grep -E "resolver-conf" || true
+echo "--- restored ---"
+sudo cp /tmp/abx-conf.bak /etc/dnsmasq.d/agent-box.conf
+sudo /opt/agent-box/guest/init-firewall.sh --verify-only 2>&1 | grep -E "resolver-conf" || true'
+cat "$TAMPER_OUT"
+if grep -q 'FAIL  resolver-conf' "$TAMPER_OUT"; then
+    ok "a feed rule the allowlist did not generate is reported as a failure"
+else
+    bad "the resolver config can be edited without verification noticing"
+fi
+if grep -q 'PASS  resolver-conf' "$TAMPER_OUT"; then
+    ok "and it passes again once the file is put back"
+else
+    bad "resolver-conf did not pass after the file was restored"
+fi
+
+printf -- '\n--- removing a suffix removes the reach it granted ---\n'
+# The reason the resolver's addresses live in a set of their own: with one set
+# and a preserve loop, deleting a line left its addresses in place for ever.
+REMOVE_OUT="${TMP_ROOT}/suffix-remove.out"
+cp "${GUEST_CFG}/allowlist.local" "${TMP_ROOT}/allowlist.local.bak"
+grep -v '^\.iana\.org$' "${TMP_ROOT}/allowlist.local.bak" > "${GUEST_CFG}/allowlist.local"
+# shellcheck disable=SC2016  # guest expansions.
+run_bounded 300 "$REMOVE_OUT" "$LIMACTL" shell --workdir /work "$INSTANCE" -- bash -c "
+set -u
+echo \"BEFORE=\$(sudo ipset save ${IPSET_RESOLVED_NAME} | grep -c '^add ' || true)\"
+sudo systemctl restart agent-box-firewall.service
+echo \"AFTER=\$(sudo ipset save ${IPSET_RESOLVED_NAME} | grep -c '^add ' || true)\"
+echo \"FEED_STILL=\$(grep -c '^ipset=/iana.org/' /etc/dnsmasq.d/agent-box.conf || true)\"
+curl -sS -m 8 -o /dev/null -w 'GONE_HTTP=%{http_code}\n' https://${SUFFIX_HOST}/ 2>/dev/null || echo 'GONE_HTTP=000'
+"
+cat "$REMOVE_OUT"
+if grep -q '^FEED_STILL=0' "$REMOVE_OUT"; then
+    ok "the removed suffix is gone from the resolver's rules"
+else
+    bad "the removed suffix is still fed"
+fi
+if grep -q '^AFTER=0' "$REMOVE_OUT"; then
+    ok "and the addresses it had granted were flushed, not carried forward"
+else
+    bad "removing a suffix left its addresses in the set"
+fi
+if grep -q '^GONE_HTTP=000' "$REMOVE_OUT"; then
+    ok "the host it admitted is no longer reachable"
+else
+    bad "the host is still reachable after its suffix was removed"
+fi
+cp "${TMP_ROOT}/allowlist.local.bak" "${GUEST_CFG}/allowlist.local"
+guest sudo systemctl restart agent-box-firewall.service >/dev/null 2>&1 || true
+
+printf -- '\n--- a malformed line is a warning, not a dead box ---\n'
+# Two bad CIDRs are staged in allowlist.local from the start: 999.1.2.3/24 and
+# 10.0.0.0/99. The box came up, which is most of the assertion.
+BADLINE_OUT="${TMP_ROOT}/badline.out"
+guest sudo journalctl -u agent-box-firewall.service -b --no-pager > "$BADLINE_OUT" 2>&1 || true
+if grep -q 'no recognised form' "$BADLINE_OUT"; then
+    ok "the malformed lines are named in the log"
+else
+    bad "a malformed allowlist line was not reported"
+fi
+if grep -q '999.1.2.3/24' "$BADLINE_OUT" && grep -q '10.0.0.0/99' "$BADLINE_OUT"; then
+    ok "and each one is named individually, ranges checked and not just shape"
+else
+    bad "an out-of-range CIDR was accepted as valid"
+fi
+if guest sudo systemctl is-active --quiet agent-box-firewall.service; then
+    ok "and the firewall is active despite them"
+else
+    bad "a malformed allowlist line took the firewall down"
+fi
+
+# ===========================================================================
+step "9d. no resolver means no resolution: the box fails CLOSED"
+# ===========================================================================
+#
+# The whole allowlist now depends on a daemon. The question is which way it
+# fails when that daemon is not there, and the answer has to be closed.
+
+CLOSED_OUT="${TMP_ROOT}/failclosed.out"
+# shellcheck disable=SC2016  # guest expansions.
+run_bounded 300 "$CLOSED_OUT" "$LIMACTL" shell --workdir /work "$INSTANCE" -- bash -c "
+set -u
+sudo systemctl stop dnsmasq
+echo \"DNSMASQ=\$(systemctl is-active dnsmasq || true)\"
+getent ahostsv4 ${SUFFIX_HOST} >/dev/null 2>&1 && echo 'RESOLVES=yes' || echo 'RESOLVES=no'
+curl -sS -m 8 -o /dev/null https://api.anthropic.com/ 2>/dev/null; echo \"ANTHROPIC_RC=\$?\"
+sudo /opt/agent-box/guest/init-firewall.sh --verify-only 2>&1 | grep -E 'resolver-up' || true
+echo '--- and back ---'
+sudo systemctl start dnsmasq
+sleep 2
+echo \"DNSMASQ_AGAIN=\$(systemctl is-active dnsmasq || true)\"
+sudo /opt/agent-box/guest/init-firewall.sh --verify-only 2>&1 | grep -E 'resolver-up' || true
+"
+cat "$CLOSED_OUT"
+if grep -q '^DNSMASQ=inactive' "$CLOSED_OUT"; then
+    ok "dnsmasq was really stopped, so the checks below are not vacuous"
+else
+    bad "dnsmasq did not stop"
+fi
+if grep -q '^RESOLVES=no' "$CLOSED_OUT"; then
+    ok "with the resolver down, a name no longer resolves"
+else
+    bad "a name still resolved with the resolver down"
+fi
+if grep -q '^ANTHROPIC_RC=0' "$CLOSED_OUT"; then
+    bad "the box was still reaching hosts with its resolver down"
+else
+    ok "the box is closed, not open, with its resolver down"
+fi
+if grep -q 'FAIL  resolver-up' "$CLOSED_OUT"; then
+    ok "and verification says exactly why"
+else
+    bad "verification did not name the resolver"
+fi
+if grep -q 'PASS  resolver-up' "$CLOSED_OUT"; then
+    ok "starting it again clears the check"
+else
+    bad "the resolver check did not clear after a restart"
+fi
+
+# ===========================================================================
+step "9e. the three egress modes, switched on a live box"
+# ===========================================================================
+#
+# deny -> observe -> open -> deny, with a verification after each, and the
+# things each mode promises asserted while it is in force. `status --json`
+# is read in every state, because the mode is what the `firewall` field means
+# now and a stale value there would be worse than none.
+
+mode_of_status() {
+    "$AGENTBOX" status "$CLEAN_REPO" --json 2>/dev/null \
+        | "$PY" -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+    print(d["boxes"][0].get("firewall", "?"))
+except Exception:
+    print("?")' 2>/dev/null || printf '?'
+}
+
+printf -- '--- deny, where we start ---\n'
+DENY_MODE=$(mode_of_status); printf 'status --json firewall=%s\n' "$DENY_MODE"
+if [ "$DENY_MODE" = "deny" ]; then
+    ok "status --json reports the mode as deny"
+else
+    bad "status --json reports '${DENY_MODE}' on a deny box"
+fi
+if [ "$("$AGENTBOX" egress "$CLEAN_REPO" 2>/dev/null)" = "deny" ]; then
+    ok "agentbox egress shows deny"
+else
+    bad "agentbox egress does not show deny"
+fi
+
+printf -- '\n--- deny -> observe ---\n'
+OBS_OUT="${TMP_ROOT}/egress-observe.out"
+run_bounded 300 "$OBS_OUT" "$AGENTBOX" egress "$CLEAN_REPO" observe
+obs_rc=$BOUNDED_RC
+cat "$OBS_OUT"
+if [ "$obs_rc" -eq 0 ]; then ok "agentbox egress observe exited 0"; else bad "agentbox egress observe exited ${obs_rc}"; fi
+if grep -q 'NOTE:' "$OBS_OUT"; then
+    ok "it said what observe does"
+else
+    bad "it did not explain observe"
+fi
+if grep -q '^PASS  mode-observe-log' "$OBS_OUT"; then
+    ok "verification: the log rule is in place"
+else
+    bad "no log rule in observe mode"
+fi
+if grep -q '^PASS  mode-observe-pass' "$OBS_OUT"; then
+    ok "verification: the chain ends in ACCEPT, never a silent deny"
+else
+    bad "observe mode could be silently denying"
+fi
+OBS_MODE=$(mode_of_status)
+if [ "$OBS_MODE" = "observe" ]; then ok "status --json reports observe"; else bad "status --json reports '${OBS_MODE}' on an observe box"; fi
+
+printf -- '\n--- and it allows, and records, a non-allowlisted host ---\n'
+OBSCONN_OUT="${TMP_ROOT}/observe-conn.out"
+run_bounded 120 "$OBSCONN_OUT" "$LIMACTL" shell --workdir /work "$INSTANCE" -- bash -c '
+curl -sS -m 10 -o /dev/null -w "OBS_HTTP=%{http_code}\n" https://example.com/ 2>/dev/null || echo "OBS_HTTP=000"'
+cat "$OBSCONN_OUT"
+if grep -q '^OBS_HTTP=200' "$OBSCONN_OUT"; then
+    ok "observe mode let a non-allowlisted host through"
+else
+    bad "observe mode did not let a non-allowlisted host through"
+fi
+sleep 3
+
+EGLOG_OUT="${TMP_ROOT}/egress-log.out"
+"$AGENTBOX" egress-log "$CLEAN_REPO" --since 10m > "$EGLOG_OUT" 2>&1 || true
+cat "$EGLOG_OUT"
+if grep -q 'example.com' "$EGLOG_OUT"; then
+    ok "egress-log shows the connection with the name the guest resolved"
+else
+    bad "egress-log did not show the connection, or could not name it"
+fi
+EGJSON_OUT="${TMP_ROOT}/egress-log.json"
+"$AGENTBOX" egress-log "$CLEAN_REPO" --since 10m --json > "$EGJSON_OUT" 2>&1 || true
+if "$PY" -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["mode"]=="observe"; assert any(r.get("name")=="example.com" for r in d["destinations"])' "$EGJSON_OUT" 2>/dev/null; then
+    ok "egress-log --json parses and carries the mode and the name"
+else
+    bad "egress-log --json is not the documented shape"
+    cat "$EGJSON_OUT"
+fi
+EGAL_OUT="${TMP_ROOT}/egress-log.allowlist"
+"$AGENTBOX" egress-log "$CLEAN_REPO" --since 10m --as-allowlist > "$EGAL_OUT" 2>&1 || true
+cat "$EGAL_OUT"
+if grep -qx 'example.com' "$EGAL_OUT"; then
+    ok "--as-allowlist emits the name as an allowlist line"
+else
+    bad "--as-allowlist did not emit the name"
+fi
+if grep -q 'judgement call' "$EGAL_OUT" || ! grep -q '^#.*port ' "$EGAL_OUT"; then
+    ok "--as-allowlist says that unnamed addresses are a judgement call, or had none"
+else
+    bad "--as-allowlist emitted bare addresses without saying they are a judgement"
+fi
+
+printf -- '\n--- observe -> open ---\n'
+OPEN_OUT="${TMP_ROOT}/egress-open.out"
+run_bounded 300 "$OPEN_OUT" "$AGENTBOX" egress "$CLEAN_REPO" open
+open_rc=$BOUNDED_RC
+cat "$OPEN_OUT"
+if [ "$open_rc" -eq 0 ]; then ok "agentbox egress open exited 0"; else bad "agentbox egress open exited ${open_rc}"; fi
+if grep -q 'WARNING' "$OPEN_OUT"; then
+    ok "it warned about what open gives up"
+else
+    bad "switching to open printed no warning"
+fi
+if grep -q '^PASS  mode-open' "$OPEN_OUT"; then
+    ok "verification: OUTPUT is unfiltered"
+else
+    bad "open mode did not verify as unfiltered"
+fi
+if grep -q '^PASS  inbound-intact' "$OPEN_OUT"; then
+    ok "verification: the inbound path is still intact in open mode"
+else
+    bad "the INPUT chain was not asserted in open mode"
+fi
+OPEN_MODE=$(mode_of_status)
+if [ "$OPEN_MODE" = "open" ]; then ok "status --json reports open"; else bad "status --json reports '${OPEN_MODE}' on an open box"; fi
+
+OPENCONN_OUT="${TMP_ROOT}/open-conn.out"
+run_bounded 120 "$OPENCONN_OUT" "$LIMACTL" shell --workdir /work "$INSTANCE" -- bash -c '
+curl -sS -m 10 -o /dev/null -w "OPEN_HTTP=%{http_code}\n" https://1.1.1.1/ 2>/dev/null || echo "OPEN_HTTP=000"
+sudo iptables -S | grep -E "^-P (INPUT|OUTPUT)" | sed "s/^/POLICY /"'
+cat "$OPENCONN_OUT"
+if grep -qE '^OPEN_HTTP=(2|3)[0-9][0-9]' "$OPENCONN_OUT"; then
+    ok "open mode reached an address on no list at all"
+else
+    bad "open mode did not reach an off-list address"
+fi
+if grep -qx 'POLICY -P INPUT DROP' "$OPENCONN_OUT"; then
+    ok "INPUT is still DROP with egress open"
+else
+    bad "open mode changed the INPUT policy"
+fi
+
+printf -- '\n--- open -> deny, back where we started ---\n'
+BACK_OUT="${TMP_ROOT}/egress-deny.out"
+run_bounded 300 "$BACK_OUT" "$AGENTBOX" egress "$CLEAN_REPO" deny
+back_rc=$BOUNDED_RC
+cat "$BACK_OUT"
+if [ "$back_rc" -eq 0 ]; then ok "agentbox egress deny exited 0"; else bad "agentbox egress deny exited ${back_rc}"; fi
+if grep -q '^PASS  egress-denied' "$BACK_OUT"; then
+    ok "verification: the allowlist refuses again"
+else
+    bad "deny mode did not refuse again"
+fi
+if grep -q '^PASS  literal-ip-denied' "$BACK_OUT"; then
+    ok "verification: a literal address is refused again"
+else
+    bad "a literal address was not refused after returning to deny"
+fi
+BACK_MODE=$(mode_of_status)
+if [ "$BACK_MODE" = "deny" ]; then ok "status --json reports deny again"; else bad "status --json reports '${BACK_MODE}' after returning to deny"; fi
+
+# A stopped box still has to answer, from the host's own record.
+printf -- '\n--- and the mode is known even when the box is not running ---\n'
+if [ "$("$AGENTBOX" egress "$CLEAN_REPO" 2>/dev/null)" = "deny" ]; then
+    ok "agentbox egress shows the mode of a running box from the guest"
+else
+    bad "agentbox egress does not show the mode"
+fi
+if grep -qx 'egress=deny' "${AGENT_BOX_CONFIG_DIR}/instances/${INSTANCE}" 2>/dev/null; then
+    ok "the host recorded the mode too, so a stopped box can still be asked"
+else
+    bad "the host has no record of this box's mode"
+fi
+
+# ===========================================================================
+step "9f. two boxes at once: status lists BOTH"
+# ===========================================================================
+#
+# The regression test for a box vanishing from status. `limactl shell` is ssh
+# and ssh reads its own stdin; called inside the loop that reads the box list
+# from a here-document, it consumed the remaining lines, so the loop saw one
+# entry and every box after the first disappeared from the one command whose
+# job is to say which boxes exist. One box could never show it.
+
+mkdir -p "$SECOND_REPO"
+git init -q "$SECOND_REPO"
+printf 'a second throwaway repository, for the two-box status check\n' > "${SECOND_REPO}/hello.txt"
+
+SEC_CREATE="${TMP_ROOT}/second-create.out"
+run_bounded 1200 "$SEC_CREATE" "$AGENTBOX" create "$SECOND_REPO" --egress deny
+sec_rc=$BOUNDED_RC
+tail -3 "$SEC_CREATE"
+if [ "$sec_rc" -eq 0 ]; then
+    ok "a second box was created"
+else
+    bad "the second box could not be created (exit ${sec_rc})"
+fi
+
+if [ "$sec_rc" -eq 0 ]; then
+    TWOJ="${TMP_ROOT}/two-boxes.json"
+    # No repo argument: this is the all-boxes path, which is the one that broke.
+    # It lists every agent-box instance on the machine, so it is filtered to the
+    # two this test made before anything is judged.
+    "$AGENTBOX" status --json > "$TWOJ" 2>/dev/null || true
+    "$PY" -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+want = {sys.argv[2], sys.argv[3]}
+got = {b["instance"] for b in d["boxes"]}
+print("listed:", " ".join(sorted(got)))
+missing = want - got
+print("MISSING=" + (",".join(sorted(missing)) if missing else "none"))
+for b in d["boxes"]:
+    if b["instance"] in want:
+        print("BOX %s state=%s firewall=%s claude=%s" % (
+            b["instance"], b["state"], b["firewall"],
+            "yes" if b.get("claude_version") else "no"))
+' "$TWOJ" "$INSTANCE" "$SECOND_INSTANCE" > "${TMP_ROOT}/two-boxes.txt" 2>&1 || true
+    cat "${TMP_ROOT}/two-boxes.txt"
+
+    if grep -q '^MISSING=none' "${TMP_ROOT}/two-boxes.txt"; then
+        ok "status --json lists both running boxes"
+    else
+        bad "status --json dropped a box: $(sed -n 's/^MISSING=//p' "${TMP_ROOT}/two-boxes.txt")"
+    fi
+    # The second box's guest fields must be POPULATED, not merely present: the
+    # bug's signature was a box appearing with everything unknown because its
+    # guest was never asked.
+    if grep -qE "^BOX ${SECOND_INSTANCE} state=running firewall=deny claude=yes" "${TMP_ROOT}/two-boxes.txt"; then
+        ok "and the second box's guest fields are populated, not defaulted"
+    else
+        bad "the second box is listed but its guest was never asked"
+    fi
+
+    TWOT="${TMP_ROOT}/two-boxes.txt.out"
+    "$AGENTBOX" status > "$TWOT" 2>/dev/null || true
+    cat "$TWOT"
+    if grep -q "$INSTANCE" "$TWOT" && grep -q "$SECOND_INSTANCE" "$TWOT"; then
+        ok "the text listing shows both too"
+    else
+        bad "the text listing dropped a box"
+    fi
+
+    # C16: the host's record goes with the instance.
+    if [ -f "${AGENT_BOX_CONFIG_DIR}/instances/${SECOND_INSTANCE}" ]; then
+        ok "the second box has a host-side mode record"
+    else
+        bad "no host-side mode record for the second box"
+    fi
+    "$AGENTBOX" destroy "$SECOND_INSTANCE" >/dev/null 2>&1 || true
+    if [ -f "${AGENT_BOX_CONFIG_DIR}/instances/${SECOND_INSTANCE}" ]; then
+        bad "destroy left the host-side mode record behind"
+    else
+        ok "destroy removed the host-side mode record"
+    fi
+fi
+
+# ===========================================================================
+step "9g. the resolver keeps feeding: cache expiry, mode survival, bad input"
+# ===========================================================================
+
+printf -- '--- an expired entry is re-fed by the next lookup ---\n'
+# dnsmasq feeds the set only when it FORWARDS an answer, so the relationship
+# that has to hold is cache TTL < entry TTL. Deleting the entry by hand is the
+# same situation as the entry expiring, without waiting an hour for it.
+REFEED_OUT="${TMP_ROOT}/refeed.out"
+# shellcheck disable=SC2016  # guest expansions.
+run_bounded 300 "$REFEED_OUT" "$LIMACTL" shell --workdir /work "$INSTANCE" -- bash -c "
+set -u
+getent ahostsv4 ${SUFFIX_HOST} >/dev/null 2>&1 || true
+sleep 1
+SA=\$(getent ahostsv4 ${SUFFIX_HOST} | awk '{print \$1; exit}')
+echo \"ADDR=\$SA\"
+if [ -z \"\$SA\" ]; then echo 'REFED=RESOLUTION-FAILED'; exit 0; fi
+sudo ipset del ${IPSET_RESOLVED_NAME} \"\$SA\" 2>/dev/null || true
+echo \"AFTER_DEL=\$(sudo ipset test ${IPSET_RESOLVED_NAME} \"\$SA\" >/dev/null 2>&1 && echo present || echo gone)\"
+# Past the cache bound, so the next lookup is forwarded and therefore feeds.
+sudo systemctl restart dnsmasq
+sleep 2
+getent ahostsv4 ${SUFFIX_HOST} >/dev/null 2>&1 || true
+sleep 2
+echo \"REFED=\$(sudo ipset save ${IPSET_RESOLVED_NAME} | grep -c . || true)\"
+curl -sS -m 10 -o /dev/null -w 'REFED_HTTP=%{http_code}\n' https://${SUFFIX_HOST}/ 2>/dev/null || echo 'REFED_HTTP=000'
+"
+cat "$REFEED_OUT"
+if grep -q '^AFTER_DEL=gone' "$REFEED_OUT"; then
+    ok "the entry was really removed, so the re-feed check is not vacuous"
+else
+    bad "could not remove the entry"
+fi
+if grep -q '^REFED_HTTP=200' "$REFEED_OUT"; then
+    ok "the next lookup re-fed the set and the host is reachable again"
+else
+    bad "an expired entry was not re-fed by the next lookup"
+fi
+
+printf -- '\n--- egress-log --since rejects a duration it cannot mean ---\n'
+SINCE_OUT="${TMP_ROOT}/since-bad.out"
+run_bounded 60 "$SINCE_OUT" "$AGENTBOX" egress-log "$CLEAN_REPO" --since "last tuesday"
+since_rc=$BOUNDED_RC
+cat "$SINCE_OUT"
+if [ "$since_rc" -ne 0 ] && grep -q 'takes a number and one of' "$SINCE_OUT"; then
+    ok "a malformed --since is a usage error, not an empty window"
+else
+    bad "a malformed --since was accepted"
+fi
+
+printf -- '\n--- a mode survives a stop and a start ---\n'
+# Provisioning re-runs on every start with the CREATE-time parameters, so its
+# write-once guard is the only thing stopping a restart reverting a deliberate
+# change. Nothing tested it.
+"$AGENTBOX" egress "$CLEAN_REPO" observe >/dev/null 2>&1 || true
+MODE_BEFORE=$("$AGENTBOX" egress "$CLEAN_REPO" 2>/dev/null)
+printf 'mode before the restart: %s\n' "$MODE_BEFORE"
+SURV_OUT="${TMP_ROOT}/mode-survive.out"
+run_bounded 300 "$SURV_OUT" "$AGENTBOX" stop "$INSTANCE"
+run_bounded 900 "$SURV_OUT" "$AGENTBOX" start "$CLEAN_REPO"
+surv_rc=$BOUNDED_RC
+tail -2 "$SURV_OUT"
+if [ "$surv_rc" -ne 0 ]; then
+    bad "agentbox start exited ${surv_rc} after a mode change"
+else
+    ok "the box restarted after a mode change"
+fi
+if wait_for_guest 240; then
+    MODE_AFTER=$("$AGENTBOX" egress "$CLEAN_REPO" 2>/dev/null)
+    printf 'mode after the restart: %s\n' "$MODE_AFTER"
+    if [ "$MODE_AFTER" = "observe" ]; then
+        ok "the mode survived the restart; provisioning did not revert it"
+    else
+        bad "the mode reverted to '${MODE_AFTER}' on restart; the write-once guard failed"
+    fi
+else
+    bad "the box did not come back after the restart"
+fi
+"$AGENTBOX" egress "$CLEAN_REPO" deny >/dev/null 2>&1 || true
+
+# ===========================================================================
+step "9h. the live reading, and a mode change that has to be all or nothing"
+# ===========================================================================
+#
+# Two things one box can prove and the host's own record cannot.
+#
+# The mode every reporter shows must come from the RULESET. Planting a
+# disagreement — the file saying one thing, the kernel doing another — is the
+# only way to tell a reader that reads the ruleset from one that reads the file
+# and is right by luck. The host's record cannot know the difference.
+
+printf -- '--- a planted disagreement is reported, not believed ---\n'
+DISAGREE_OUT="${TMP_ROOT}/disagree.out"
+# shellcheck disable=SC2016  # the expansion is the guest's, not this shell's.
+guest sudo bash -c '
+cp /etc/agent-box/egress-mode /tmp/abx-mode.bak
+printf "open\n" > /etc/agent-box/egress-mode
+echo "FILE_NOW=$(cat /etc/agent-box/egress-mode)"' > "$DISAGREE_OUT" 2>&1
+cat "$DISAGREE_OUT"
+
+DIS_CLI="${TMP_ROOT}/disagree-cli.out"
+"$AGENTBOX" egress "$CLEAN_REPO" > "$DIS_CLI" 2>&1 || true
+cat "$DIS_CLI"
+if grep -qx 'unknown' "$DIS_CLI"; then
+    ok "agentbox egress reports unknown when the file and the ruleset disagree"
+else
+    bad "agentbox egress believed one of the two: $(head -1 "$DIS_CLI")"
+fi
+if grep -q "mode file says 'open'" "$DIS_CLI" && grep -q "ruleset is 'deny'" "$DIS_CLI"; then
+    ok "and it names both, so the reader can tell which to fix"
+else
+    bad "the disagreement was not explained"
+fi
+
+DIS_JSON="${TMP_ROOT}/disagree.json"
+"$AGENTBOX" status "$CLEAN_REPO" --json > "$DIS_JSON" 2>/dev/null || true
+if jq -e '.boxes[0].firewall == "unknown"' "$DIS_JSON" >/dev/null 2>&1 \
+    && jq -e '.boxes[0] | has("firewall_detail")' "$DIS_JSON" >/dev/null 2>&1; then
+    ok "status --json reports unknown with a detail on a disagreeing box"
+else
+    bad "status --json did not report the disagreement"
+    cat "$DIS_JSON"
+fi
+
+# The banner, in the place an operator is about to set an agent going. `run`
+# without a token stops at the token check, which is after the banner.
+DIS_RUN="${TMP_ROOT}/disagree-run.out"
+printf 'Do nothing.\n' > "${TMP_ROOT}/dis-brief.md"
+run_bounded 240 "$DIS_RUN" "$AGENTBOX" run "$CLEAN_REPO" "${TMP_ROOT}/dis-brief.md" --wait
+cat "$DIS_RUN"
+if grep -q 'egress mode: UNKNOWN' "$DIS_RUN"; then
+    ok "run says so on its first line, where somebody is about to start an agent"
+else
+    bad "run did not warn about the disagreement"
+fi
+
+guest sudo cp /tmp/abx-mode.bak /etc/agent-box/egress-mode
+if [ "$("$AGENTBOX" egress "$CLEAN_REPO" 2>/dev/null)" = "deny" ]; then
+    ok "and the reading is right again once the file is put back"
+else
+    bad "the mode did not read correctly after the file was restored"
+fi
+
+printf -- '\n--- a mode change that fails leaves nothing armed ---\n'
+# Writing the mode file first and rebuilding second left a failed change armed:
+# the CLI said nothing had happened and the 15-minute timer applied it a
+# quarter of an hour later.
+#
+# The rebuild is made to fail through /etc/hosts rather than through the unit's
+# environment, and the difference matters: `agentbox egress` now runs the script
+# directly with `--mode`, so a systemd drop-in on the unit would not be read and
+# the "failure" would quietly succeed. glibc consults /etc/hosts before DNS, so
+# this reaches the curl the rebuild actually makes.
+ARMED_OUT="${TMP_ROOT}/armed.out"
+guest sudo bash -c '
+cp /etc/hosts /tmp/abx-hosts.bak
+printf "127.0.0.1 api.github.com\n" >> /etc/hosts
+echo BREAK_OK' > "$ARMED_OUT" 2>&1
+cat "$ARMED_OUT"
+if grep -q '^BREAK_OK' "$ARMED_OUT"; then
+    ok "the rebuild was really made to fail, so the checks below are not vacuous"
+else
+    bad "could not break the rebuild; the checks below would prove nothing"
+fi
+
+FAILCHANGE="${TMP_ROOT}/failchange.out"
+run_bounded 300 "$FAILCHANGE" "$AGENTBOX" egress "$CLEAN_REPO" observe
+fc_rc=$BOUNDED_RC
+cat "$FAILCHANGE"
+if [ "$fc_rc" -ne 0 ]; then
+    ok "a mode change whose rebuild fails exits non-zero"
+else
+    bad "a failing mode change reported success"
+fi
+ARMED_STATE="${TMP_ROOT}/armed-state.out"
+# shellcheck disable=SC2016  # the expansion is the guest's, not this shell's.
+guest sudo bash -c '
+echo "MODE_FILE=$(cat /etc/agent-box/egress-mode)"
+echo "LIVE=$(/opt/agent-box/guest/egress-mode.sh)"
+cp /tmp/abx-hosts.bak /etc/hosts' > "$ARMED_STATE" 2>&1
+cat "$ARMED_STATE"
+if grep -qx 'MODE_FILE=deny' "$ARMED_STATE"; then
+    ok "the guest mode file was NOT left holding the mode that failed"
+else
+    bad "a failed change left '$(sed -n 's/^MODE_FILE=//p' "$ARMED_STATE")' armed for the timer to apply"
+fi
+if grep -qx 'egress=deny' "${AGENT_BOX_CONFIG_DIR}/instances/${INSTANCE}" 2>/dev/null; then
+    ok "and the host record still says the mode the box is actually on"
+else
+    bad "the host record and the box disagree after a failed change"
+fi
+# The ruleset too, not just the two records: a revert that wrote the files and
+# left the kernel on the new mode would satisfy everything above.
+if grep -q '^LIVE=live=deny' "$ARMED_STATE"; then
+    ok "and the live ruleset is back on the previous mode"
+else
+    bad "the live ruleset was left on the mode that failed: $(sed -n 's/^LIVE=//p' "$ARMED_STATE")"
+fi
+guest sudo systemctl restart agent-box-firewall.service >/dev/null 2>&1 || true
+
+# ===========================================================================
 step "10. destroy the instance, by bare name"
 # ===========================================================================
 #
@@ -2629,7 +3569,7 @@ DK_TS=$(date +%s)
 # two identical portForwards entries and printing `forwarded 3999 3999 3998`.
 # The summary assertion below is what proves it.
 run_bounded 2400 "$DK_CREATE_OUT" "$AGENTBOX" create "$DOCKER_REPO" \
-    --docker --playwright --rosetta \
+    --egress deny --docker --playwright --rosetta \
     --forward "${FORWARD_PORT},${FORWARD_PORT}" --forward "${FORWARD_PORT2}"
 dk_rc=$BOUNDED_RC
 cat "$DK_CREATE_OUT"
@@ -3028,7 +3968,8 @@ if [ "$dfw_rc" -eq 0 ]; then ok "firewall-check exited 0 on the Docker instance"
 for check in policy-drop policy-drop-v6 forward-drop out-chain-first allowlist-rule \
              allowlist-holds literal-ip-denied foreign-dns-denied egress-denied \
              anthropic-allowed github-allowed \
-             uplink-not-bridge docker-user-jump docker-egress docker-allowed; do
+             uplink-not-bridge inbound-intact resolver-up resolver-conf \
+             docker-user-jump docker-egress docker-allowed; do
     if grep -q "^PASS  ${check}" "$DFW_OUT"; then
         ok "firewall check ${check} (docker instance)"
     else
@@ -3093,6 +4034,47 @@ else
     bad "libnss3 is not installed"
 fi
 
+printf -- '\n--- and a real browser download, through the allowlist, in deny mode ---\n'
+# Installing the system libraries proves apt reached the archive. It does not
+# prove the browser can be fetched, and those are different hosts: Playwright
+# 1.63 asks cdn.playwright.dev and is answered 307 to storage.googleapis.com,
+# which was off-list until a real download found it. Only a real download
+# finds a redirect, so the suite now does one.
+#
+# `--with-deps` is deliberately NOT used: the deps are already installed and it
+# would turn this into an apt test as well.
+BROWSER_OUT="${TMP_ROOT}/browser-download.out"
+run_bounded 900 "$BROWSER_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- \
+    bash -lc "rm -rf ~/.cache/ms-playwright && npx --yes playwright@${PLAYWRIGHT_PIN} install chromium 2>&1 | tail -20; echo \"INSTALL_RC=\${PIPESTATUS[0]}\""
+browser_rc=$BOUNDED_RC
+cat "$BROWSER_OUT"
+if [ "$browser_rc" -eq 0 ] && grep -q '^INSTALL_RC=0' "$BROWSER_OUT"; then
+    ok "playwright install chromium succeeded under the standing deny"
+else
+    bad "playwright install chromium failed under the standing deny (exit ${browser_rc})"
+fi
+# The binary, not just a zero exit: a cached or skipped install would also
+# exit 0, and the point is that the bytes crossed the allowlist.
+BROWSER_BIN_OUT="${TMP_ROOT}/browser-bin.out"
+dguest bash -lc 'find ~/.cache/ms-playwright -maxdepth 3 -type f -name headless_shell -o -maxdepth 3 -type f -name chrome 2>/dev/null | head -3; du -sh ~/.cache/ms-playwright 2>/dev/null | tail -1' > "$BROWSER_BIN_OUT" 2>&1
+cat "$BROWSER_BIN_OUT"
+if grep -qE 'chrome|headless_shell' "$BROWSER_BIN_OUT"; then
+    ok "a Chromium binary is on disk, so the download really crossed the allowlist"
+else
+    bad "no Chromium binary after the install"
+fi
+# And it runs. A downloaded browser that cannot start is a download, not a
+# browser, and this is the one thing the Playwright half never proved.
+BROWSER_RUN_OUT="${TMP_ROOT}/browser-run.out"
+run_bounded 300 "$BROWSER_RUN_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- \
+    bash -lc "cd /tmp && npx --yes playwright@${PLAYWRIGHT_PIN} screenshot --browser chromium about:blank /tmp/abx-shot.png 2>&1 | tail -5; ls -l /tmp/abx-shot.png 2>&1 | tail -1"
+cat "$BROWSER_RUN_OUT"
+if grep -q '/tmp/abx-shot.png' "$BROWSER_RUN_OUT" && ! grep -qi 'no such file' "$BROWSER_RUN_OUT"; then
+    ok "the downloaded Chromium actually launches and renders"
+else
+    bad "the downloaded Chromium did not launch"
+fi
+
 printf -- '\n--- python3-venv and pip, for pytest-playwright ---\n'
 PY3_OUT="${TMP_ROOT}/py3.out"
 dguest bash -c 'python3 -m venv --help >/dev/null 2>&1 && echo VENV_OK; python3 -m pip --version 2>&1 | head -1' > "$PY3_OUT" 2>&1
@@ -3140,6 +4122,7 @@ for u in http://ports.ubuntu.com/ \
          https://download.docker.com/linux/ubuntu/gpg \
          https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt \
          https://cdn.playwright.dev/ \
+         https://storage.googleapis.com/ \
          https://ghcr.io/v2/ \
          https://pkg-containers.githubusercontent.com/ \
          https://production.cloudflare.docker.com/ \
@@ -3196,7 +4179,8 @@ fi
 # Hub blob CDNs (one of which was added only after a real pull was redirected to
 # it and refused) and the ghcr blob host, whose entry the allowlist's own comment
 # flags as community-sourced.
-for host in ports.ubuntu.com download.docker.com nodejs.org cdn.playwright.dev ghcr.io \
+for host in ports.ubuntu.com download.docker.com nodejs.org cdn.playwright.dev \
+            storage.googleapis.com ghcr.io \
             auth.docker.io registry-1.docker.io pkg-containers.githubusercontent.com \
             production.cloudflare.docker.com production.cloudfront.docker.com; do
     if grep -E "^REACH [1-5][0-9][0-9] " "$AL_OUT" | grep -q -- "${host}"; then
@@ -3226,6 +4210,74 @@ for host in ports.ubuntu.com download.docker.com nodejs.org cdn.playwright.dev g
         bad "allowlisted but NOT reachable: ${host}"
     fi
 done
+
+printf -- '\n--- a container resolves through the guest resolver, and feeds it ---\n'
+# Before this, a container inherited the daemon's resolver and went straight to
+# the upstream, so its lookups never passed through dnsmasq: a suffix line
+# worked in the guest and silently did not work inside a container, which is
+# the thing the guest exists to run. daemon.json points containers at the
+# bridge address and the forward chain permits DNS to that address only.
+CDNS_OUT="${TMP_ROOT}/container-dns.out"
+# shellcheck disable=SC2016  # guest expansions.
+run_bounded 300 "$CDNS_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c "
+set -u
+echo \"DAEMON_DNS=\$(sudo sed -n 's/.*\"dns\".*\\[\"\\([0-9.]*\\)\".*/\\1/p' /etc/docker/daemon.json | head -1)\"
+echo \"CONTAINER_RESOLV=\$(docker run --rm alpine:3 cat /etc/resolv.conf 2>/dev/null | awk '/^nameserver/ {print \$2; exit}')\"
+sudo ipset flush ${IPSET_RESOLVED_NAME}
+echo \"SET_BEFORE=\$(sudo ipset save ${IPSET_RESOLVED_NAME} | grep -c '^add ' || true)\"
+docker run --rm alpine:3 nslookup ${SUFFIX_HOST} >/dev/null 2>&1 || true
+sleep 2
+echo \"SET_AFTER=\$(sudo ipset save ${IPSET_RESOLVED_NAME} | grep -c '^add ' || true)\"
+# The status of the wget, not of the tail that was reading its output. A bare
+# dollar-question after a pipeline is the LAST command status, so the old form
+# read tail exit status, which is 0 whatever the container did: the assertion
+# could not fail.
+out=\$(docker run --rm alpine:3 wget -T 8 -q -O /dev/null https://${SUFFIX_HOST}/ 2>&1); rc=\$?
+printf '%s\\n' \"\$out\" | tail -1
+echo \"CONTAINER_FETCH=\$rc\"
+
+# And an OFF-list host must fail for the firewall's reason, not because DNS
+# broke. busybox says 'bad address' when it could not resolve and
+# 'can't connect' or 'Connection refused' when the packet was refused; only the
+# second proves the allowlist did the work, and reading them as the same thing
+# would let a total DNS outage pass as containment.
+oout=\$(docker run --rm alpine:3 wget -T 8 -q -O /dev/null https://example.com/ 2>&1); orc=\$?
+echo \"OFFLIST_RC=\$orc\"
+if printf '%s' \"\$oout\" | grep -qi 'bad address'; then
+    echo 'OFFLIST_REASON=dns'
+elif printf '%s' \"\$oout\" | grep -qiE \"can't connect|refused|unreachable|prohibited\"; then
+    echo 'OFFLIST_REASON=refused'
+elif [ \"\$orc\" -eq 0 ]; then
+    echo 'OFFLIST_REASON=reached'
+else
+    echo \"OFFLIST_REASON=other: \$(printf '%s' \"\$oout\" | tr '\\n' ' ')\"
+fi
+"
+cat "$CDNS_OUT"
+if grep -qE '^CONTAINER_RESOLV=172\.' "$CDNS_OUT"; then
+    ok "a container resolves through the guest's own resolver, not the upstream"
+else
+    bad "a container is not pointed at the guest resolver"
+fi
+if grep -q '^SET_BEFORE=0' "$CDNS_OUT" && grep -qE '^SET_AFTER=[1-9]' "$CDNS_OUT"; then
+    ok "a container's lookup feeds the resolved set, so suffix lines work inside containers"
+else
+    bad "a container's lookup did not feed the set"
+fi
+if grep -q '^CONTAINER_FETCH=0' "$CDNS_OUT"; then
+    ok "and the container then reaches the suffix-matched host"
+else
+    bad "the container could not reach the suffix-matched host"
+fi
+if grep -q '^OFFLIST_REASON=refused' "$CDNS_OUT"; then
+    ok "an off-list host is refused for the firewall's reason, not a DNS failure"
+elif grep -q '^OFFLIST_REASON=dns' "$CDNS_OUT"; then
+    bad "the off-list host failed to RESOLVE; that is not containment, it is broken DNS"
+elif grep -q '^OFFLIST_REASON=reached' "$CDNS_OUT"; then
+    bad "a container reached an off-list host"
+else
+    bad "the off-list probe was inconclusive: $(sed -n 's/^OFFLIST_REASON=//p' "$CDNS_OUT")"
+fi
 
 printf -- '\n--- a real pull from ghcr.io, not just a reachable /v2/ ---\n'
 # `https://ghcr.io/v2/` answering 401 proves the registry API is reachable; it
@@ -3331,11 +4383,19 @@ if grep -q '^TIMER_STOPPED=inactive' "$EMPTY_OUT"; then
 else
     bad "the refresh timer was not suspended; this step can report a false failure"
 fi
-if grep -q '^SET_ENTRIES=0' "$EMPTY_OUT" && grep -q '^SET_ENTRIES_AFTER=0' "$EMPTY_OUT"; then
-    ok "the live set was empty throughout the verify, so the check below is not vacuous"
+if grep -q '^SET_ENTRIES=0' "$EMPTY_OUT"; then
+    ok "the live set was really emptied, so the check below is not vacuous"
 else
-    bad "the live set was not empty for the whole window"
+    bad "the live set was not emptied"
 fi
+# NOT asserted as still empty at the end, and the reason is the resolver: every
+# name verify() itself looks up is fed straight back into the set by dnsmasq, so
+# the set legitimately refills DURING the verification. What makes the check
+# below deterministic is ordering rather than emptiness — allowlist-holds runs
+# before any of verify's own outbound probes, so it reads the set while it is
+# still empty. The count here is reported for the reader, not judged.
+printf 'entries in the set after the verify: %s (refilled by the resolver; expected)\n' \
+    "$(sed -n 's/^SET_ENTRIES_AFTER=//p' "$EMPTY_OUT" | head -1)"
 if grep -q '^VERIFY_RC=0' "$EMPTY_OUT"; then
     bad "verify passed on a box whose allowlist holds nothing"
 else
