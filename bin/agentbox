@@ -437,9 +437,24 @@ exclude_from_backup() {
 # Every guest invocation passes an explicit --workdir. Without it limactl tries
 # to cd into the host's current directory inside the guest, which fails noisily
 # and tells the guest a host path it has no business knowing.
+# `</dev/null` is not defensive tidiness, it is a bug fix, and it belongs here
+# rather than at one call site.
+#
+# `limactl shell` is ssh, and ssh reads its own stdin. Called inside a loop that
+# is itself reading from stdin — `while read ... done <<EOF $(list_boxes) EOF`
+# in render_status — it consumes the rest of the here-document, so the loop sees
+# one line and every box after the first vanishes from `agentbox status`. That
+# is a box disappearing from the one command whose job is to say which boxes
+# exist, and it has been true since the status work landed.
+#
+# Fixing the loop would fix today's instance. Fixing the helper fixes the class:
+# no call through guest_shell can eat a caller's input, now or later. The three
+# places that genuinely need to send stdin into the guest — the token pipe, the
+# brief copy, and the interactive sessions — call `$LIMACTL shell` directly, and
+# that difference is now the documented signal that they mean it.
 guest_shell() {
     local inst="$1"; shift
-    "$LIMACTL" shell --workdir /work "$inst" -- "$@"
+    "$LIMACTL" shell --workdir /work "$inst" -- "$@" < /dev/null
 }
 
 # Carry the allowlisted personal config files across and mark /work trusted.
@@ -1254,6 +1269,11 @@ cmd_destroy() {
     require_instance "$inst"
     "$LIMACTL" stop --force "$inst" >/dev/null 2>&1 || true
     "$LIMACTL" delete --force "$inst"
+    # The host's per-instance record goes with the instance. Left behind, it
+    # outlives the box and is then read by the NEXT box of the same name — a
+    # repository recreated with a different mode would be described by the old
+    # record until something wrote over it.
+    rm -f "$(instance_meta_file "$inst")" 2>/dev/null || true
     cat <<EOF
 
 ${inst} deleted.
@@ -1366,8 +1386,16 @@ render_status() {
         if [ "$state" = "Running" ]; then
             if [ "$as_json" -eq 1 ]; then
                 guest=$(guest_shell "$name" "${GUEST_BIN}/box-status.sh" 2>/dev/null) || guest=""
+                # A box built from a checkout older than the egress work reports
+                # the OUTPUT policy in the old vocabulary. Normalise it here so
+                # the documented contract holds for every box in the listing
+                # rather than only for the ones built from this checkout: a
+                # consumer should not have to know which commit made a VM.
+                guest=${guest//\"firewall\":\"drop\"/\"firewall\":\"deny\"}
+                guest=${guest//\"firewall\": \"drop\"/\"firewall\": \"deny\"}
             else
                 guest=$(guest_shell "$name" "${GUEST_BIN}/box-status.sh" --text 2>/dev/null) || guest=""
+                guest=${guest//fw=drop/fw=deny}
             fi
         fi
 
@@ -1388,7 +1416,18 @@ render_status() {
                 "$(json_str "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')")" \
                 "${guest#\{}"
         else
-            [ -n "$guest" ] || guest='(not running)'
+            # A running box whose guest script could not answer is NOT "(not
+            # running)" — that is a false statement about a box, and the two
+            # cases need different words because they need different actions.
+            # Either way the box is printed: a box must never disappear from
+            # status just because the thing that describes it failed.
+            if [ -z "$guest" ]; then
+                if [ "$state" = "Running" ]; then
+                    guest='fw=unknown  (the guest status script did not answer)'
+                else
+                    guest='(not running)'
+                fi
+            fi
             printf '%-30s %-9s %s\n' \
                 "$name" "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')" "$guest"
         fi
@@ -1466,11 +1505,38 @@ cmd_watch_run() {
 # going. Silent for `deny`, which is the quiet default and the thing they would
 # expect; loud for the two that are not, because "this box is open" is exactly
 # what someone forgets between creating a box on Monday and using it on Friday.
+# What the box is ACTUALLY in, read from its ruleset rather than from the file
+# that says what it was asked for. Sets ABX_LIVE_MODE and ABX_MODE_DETAIL.
+#
+# Everything this returns came out of a guest and is printed to a terminal, so
+# it goes through the same scrub as every other guest-sourced string: the detail
+# is assembled from a ruleset an agent inside that guest can write to.
+read_live_egress() {
+    local inst="${1:?}" line=""
+    ABX_LIVE_MODE="unknown"
+    ABX_MODE_DETAIL=""
+    line=$(guest_shell "$inst" "${GUEST_BIN}/egress-mode.sh" 2>/dev/null \
+           | guest_shell "$inst" python3 "${GUEST_BIN}/run-format.py" --scrub-stdin 2>/dev/null \
+           | head -1) || line=""
+    [ -n "$line" ] || return 1
+    ABX_LIVE_MODE=$(printf '%s' "$line" | sed -n 's/.*live=\([a-z]*\).*/\1/p')
+    ABX_MODE_DETAIL=$(printf '%s' "$line" | sed -n 's/.*detail=//p')
+    [ -n "$ABX_LIVE_MODE" ] || ABX_LIVE_MODE="unknown"
+    return 0
+}
+
 announce_egress_mode() {
-    local inst="${1:?}" mode=""
-    mode=$(guest_shell "$inst" cat /etc/agent-box/egress-mode 2>/dev/null | tr -d '[:space:]') || mode=""
-    [ -n "$mode" ] || mode=$(read_instance_egress "$inst" 2>/dev/null || printf '')
-    case "$mode" in
+    local inst="${1:?}"
+    read_live_egress "$inst" || return 0
+    # A disagreement between the file and the ruleset is louder than either
+    # mode on its own: it means nobody can say what this box will do, and it is
+    # said here because `run` and `session` are where somebody is about to set
+    # an agent going.
+    if [ -n "$ABX_MODE_DETAIL" ]; then
+        info "egress mode: UNKNOWN — ${ABX_MODE_DETAIL}. Run '${PROG} firewall-check' before trusting this box." >&2
+        return 0
+    fi
+    case "$ABX_LIVE_MODE" in
         open)
             info "egress mode: OPEN — this box has no egress filtering; anything it runs can reach any host" ;;
         observe)
@@ -1488,13 +1554,24 @@ cmd_egress() {
     require_instance "$inst"
 
     if [ -z "$mode" ]; then
-        # Show. The guest is authoritative for a running box; the host's own
-        # record answers for one that is stopped.
+        # Show what the box IS doing, from its ruleset. The host's record is the
+        # fallback for a box that is not running, and it is labelled as such
+        # rather than passed off as a reading.
         if [ "$(instance_state "$inst")" = "Running" ]; then
-            current=$(guest_shell "$inst" cat /etc/agent-box/egress-mode 2>/dev/null | tr -d '[:space:]')
+            if read_live_egress "$inst"; then
+                if [ -n "$ABX_MODE_DETAIL" ]; then
+                    printf 'unknown\n'
+                    printf '%s\n' "$ABX_MODE_DETAIL" >&2
+                else
+                    printf '%s\n' "$ABX_LIVE_MODE"
+                fi
+                return 0
+            fi
         fi
-        [ -n "${current:-}" ] || current=$(read_instance_egress "$inst" || printf 'unknown')
+        current=$(read_instance_egress "$inst" || printf 'unknown')
         printf '%s\n' "$current"
+        [ "$current" = "unknown" ] \
+            || printf '(not running; this is the host'"'"'s record, not a reading)\n' >&2
         return 0
     fi
 
@@ -1507,17 +1584,23 @@ cmd_egress() {
         info "NOTE: 'observe' ALLOWS non-allowlisted traffic and records it. Read it back with '${PROG} egress-log'."
     fi
 
+    # Order matters, and the old order was wrong: it recorded the new mode on
+    # both sides FIRST and then rebuilt, so a rebuild that failed left two
+    # records claiming a mode the box was not in — and the next reader believed
+    # them. Nothing is recorded until the rebuild has happened and verified.
     info "setting the egress mode of ${inst} to ${mode}"
     guest_shell "$inst" sudo /opt/agent-box/guest/set-egress-mode.sh "$mode" \
-        || die "could not set the egress mode"
-    write_instance_egress "$inst" "$mode"
+        || die "could not set the egress mode; the box is unchanged"
 
-    # A mode that is only written down has changed nothing. The rebuild is what
-    # makes it true, and the verification is what proves it did.
     info "rebuilding the firewall"
-    guest_shell "$inst" sudo systemctl restart agent-box-firewall.service \
-        || die "the firewall rebuild failed; the box is on its previous ruleset"
-    guest_shell "$inst" sudo /opt/agent-box/guest/init-firewall.sh --verify-only
+    if ! guest_shell "$inst" sudo systemctl restart agent-box-firewall.service; then
+        die "the firewall rebuild failed; the box is still on its previous mode and nothing has been recorded"
+    fi
+    if ! guest_shell "$inst" sudo /opt/agent-box/guest/init-firewall.sh --verify-only; then
+        die "the new ruleset did not verify; nothing has been recorded on the host"
+    fi
+    # Only now.
+    write_instance_egress "$inst" "$mode"
 }
 
 # What a box in observe mode tried to reach.
@@ -1529,8 +1612,15 @@ cmd_egress_log() {
     set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
     while [ $# -gt 0 ]; do
         case "$1" in
-            --since)         [ -n "${2:-}" ] || die "--since needs a duration, e.g. 2h"
-                             since="$2"; shift 2 ;;
+            --since)
+                [ -n "${2:-}" ] || die "--since needs a duration, e.g. 2h"
+                # journalctl accepts a great deal and silently treats what it
+                # cannot parse as "the beginning of time" or as now — either of
+                # which reads to the caller as an empty window rather than as a
+                # typo. A strict grammar here turns it into a usage error.
+                printf '%s' "$2" | grep -qE '^[0-9]+(s|m|h|d|w)$' \
+                    || die "--since takes a number and one of s m h d w, e.g. 90m or 7d; got '${2}'"
+                since="$2"; shift 2 ;;
             --json)          fmt=json; shift ;;
             --as-allowlist)  fmt=allowlist; shift ;;
             *) die "unknown option: $1" ;;

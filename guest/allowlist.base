@@ -87,7 +87,35 @@ nodejs.org
 # was not in the set; retry, or re-run `agentbox firewall-check`. See "Why the
 # allowlist resolves through two paths, and more than once" in
 # docs/decisions.md.
-cdn.playwright.dev
+#
+# Written with a LEADING DOT deliberately, and it is the only reason this host
+# works. A bare name is pre-resolved at rebuild and pinned to whatever it
+# answered with then; a dot line is a subtree that follows the resolver, so the
+# address the guest is about to connect to is the one that gets allowed. For a
+# Front Door endpoint on a near-zero TTL that is the difference between working
+# and not. The cost is that every subdomain of it is admitted too, which is
+# what a dot line means and why it is not the default form.
+.cdn.playwright.dev
+# And where cdn.playwright.dev SENDS you. Playwright 1.63's
+# `playwright install chromium` fetches Chrome for Testing, and
+# cdn.playwright.dev answers 307 to
+# https://storage.googleapis.com/chrome-for-testing-public/... — a different
+# host, so every address of it is off-list and the download dies with
+# EHOSTUNREACH in deny mode with nothing naming the redirect. Measured on
+# 2026-09-06 by running a real `playwright install chromium` in a --playwright
+# box under the standing deny.
+#
+# This is the third redirect of its kind in this file, after Docker Hub's two
+# blob CDNs. The pattern is worth stating: an allowlist of names is an
+# allowlist of the names a client is SENT to, not the ones it asks for, and
+# only a real download finds the difference. The smoke now downloads a browser
+# rather than only installing its system libraries, for exactly that reason.
+# Also a dot line, for the same reason and with a wider cost: this is Google's
+# object store, so the subtree is every bucket anyone has ever published there.
+# It is admitted because Chrome for Testing lives in one of them and the 307
+# cannot be followed otherwise. Narrow it to the bucket's own host if that ever
+# becomes possible.
+.storage.googleapis.com
 
 # Deliberately NOT allowed, and disabled by DISABLE_TELEMETRY=1 and
 # DISABLE_ERROR_REPORTING=1 in the guest environment instead:

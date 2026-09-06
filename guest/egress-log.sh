@@ -118,9 +118,26 @@ if fmt == "allowlist":
     for r in rows:
         (named if r["name"] else bare).append(r)
     if named:
-        print("# Names. These are what the guest resolved before connecting.")
+        print("# Names, exact. Each is one host: the allowlist pre-resolves it and")
+        print("# pins the addresses. A leading dot would mean the whole subtree and")
+        print("# is never emitted here - if you want a subtree, write it yourself.")
+        # The parser reads a leading dot or a `*.` as a suffix, which admits
+        # every subdomain. A query log can contain either, because the name a
+        # client asked for is not something this tool chooses, so anything that
+        # is not an exact name by the parser's own grammar is commented out
+        # rather than emitted as a line somebody will paste unread.
+        exact = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
+        good, odd = [], []
         for n in sorted({r["name"] for r in named}):
+            (good if exact.match(n) else odd).append(n)
+        for n in good:
             print(n)
+        if odd:
+            print("#")
+            print("# Not emitted as lines: these came back from the query log in a form")
+            print("# the allowlist parser would read as something other than one host.")
+            for n in odd:
+                print("# %s" % n)
     if bare:
         print("#")
         print("# Addresses with no name: the agent connected to these without")

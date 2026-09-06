@@ -55,6 +55,25 @@ GH_META_URL="${AGENT_BOX_GH_META_URL:-https://api.github.com/meta}"
 
 IPSET_NAME="allowed-domains"
 IPSET_TMP="allowed-domains-new"
+# What the resolver feeds, kept apart from what the rebuild builds.
+#
+# One set with two populations distinguished by their timeout was the first
+# design and it was wrong in two ways that only show up later. Removing a
+# suffix from the allowlist did not remove reach, because the preserve loop
+# carried its addresses forward for ever; and the read-then-swap had a window
+# in which an address added between the two was dropped. Two sets, referenced
+# by the same accept rule, have neither problem: the rebuild owns one and
+# never touches the other, and "stop allowing this" is a flush.
+IPSET_RESOLVED="allowed-resolved"
+# Entries live an hour. Nothing renews them on a cache hit, which is why
+# dnsmasq's own cache must expire first — see DNS_CACHE_TTL below.
+RESOLVED_TTL=3600
+# A quarter of the entry lifetime. The rule this enforces is worth stating on
+# its own: dnsmasq feeds the set only when it FORWARDS an answer, so if its
+# cache outlived the set entry there would be a window in which the name
+# resolves from cache, nothing is re-added, and the host has silently gone
+# dark. Cache TTL strictly less than entry TTL, always.
+DNS_CACHE_TTL=900
 
 # --- the egress mode ----------------------------------------------------------
 #
@@ -82,11 +101,15 @@ EGRESS_MODE=$(read_egress_mode)
 # dnsmasq answers on loopback and feeds the set as it resolves. See the
 # resolver section below and docs/decisions.md.
 DNSMASQ_CONF="${AGENT_BOX_DNSMASQ_CONF:-/etc/dnsmasq.d/agent-box.conf}"
+# Where the rebuild records a hash of the feed rules it generated, so that
+# verify() can tell whether the file on disk is still the one the allowlist
+# implies. Declared HERE, with the other constants, and not beside the function
+# that writes it: verify() runs in two paths and `--verify-only` never reaches
+# the rebuild body, so a variable defined there is unbound under `set -u` and
+# kills the verification partway through. That has now happened twice.
+DNSMASQ_FEED_HASH=""
+DNSMASQ_HASH_FILE="${AGENT_BOX_DNSMASQ_HASH:-/run/agent-box-dnsmasq-feed.sha256}"
 DNSMASQ_ADDR="127.0.0.1"
-# What dnsmasq-added entries are worth. Long enough that an ordinary session
-# does not lose an address it just resolved, short enough that an address the
-# CDN has moved on from ages out rather than accumulating.
-DNS_ENTRY_TTL=3600
 # The prefix observe mode stamps on a logged connection. `agentbox egress-log`
 # greps the kernel journal for exactly this.
 LOG_PREFIX="agent-box-egress: "
@@ -250,6 +273,33 @@ fwd_leading_rules() {
     printf -- '! -o %s -j RETURN\n' "$uplink"
 }
 
+# Docker's default bridge address. Docker uses 172.17.0.1 unless it is told
+# otherwise, and guest/provision.sh writes that same address into daemon.json's
+# `dns`, so the two are consistent by construction rather than by coincidence.
+DOCKER_BRIDGE_DEFAULT="172.17.0.1"
+
+# The bridge address, or nothing.
+#
+# `|| true` is load-bearing: on a box without Docker `ip addr show dev docker0`
+# exits non-zero, and under `set -e` with the ERR trap installed that is not
+# "no bridge", it is a rebuild failure that hard-closes the guest.
+#
+# And the fallback matters as much. This unit is ordered BEFORE docker.service,
+# so at boot docker0 does not exist yet and deriving the address gives nothing —
+# dnsmasq would then never listen where containers are told to look, and every
+# container on the box would be unable to resolve anything. When Docker is
+# installed, its default address is used whether or not the interface has
+# appeared, and `bind-dynamic` (see the config) binds to it when it does.
+docker_bridge_addr() {
+    local a
+    a=$(ip -4 -o addr show dev docker0 2>/dev/null \
+        | awk 'NR == 1 { print $4 }' | cut -d/ -f1 || true)
+    if [ -z "$a" ] && docker_installed; then
+        a="$DOCKER_BRIDGE_DEFAULT"
+    fi
+    printf '%s' "$a"
+}
+
 ensure_chain() {
     local ipt="$1" chain="$2"
     chain_exists "$ipt" "$chain" || "$ipt" -w "$IPT_WAIT" -N "$chain"
@@ -400,6 +450,25 @@ verify() {
                 log "FAIL  mode-observe-pass  the mode is 'observe' but ${CHAIN_OUT} does not end in ACCEPT"
                 failures=$((failures + 1))
             fi
+            # Per destination, not one bucket for the chain: with a single
+            # global limit a chatty host exhausts the budget and every other
+            # destination goes unrecorded, which is the one thing observe is
+            # for. The shape is checked, not just the presence of a limit.
+            if iptables -w "$IPT_WAIT" -S "$CHAIN_OUT" 2>/dev/null \
+                | grep -q -- '--hashlimit-mode dstip,dstport'; then
+                log "PASS  mode-observe-rate  the log is rate-limited per destination"
+            else
+                log "FAIL  mode-observe-rate  the log limit is not per destination; one host can hide the others"
+                failures=$((failures + 1))
+            fi
+            # observe relaxes the allowlist and keeps the resolver restriction.
+            if iptables -w "$IPT_WAIT" -S "$CHAIN_OUT" 2>/dev/null \
+                | grep -q -- '--dport 53 -j REJECT'; then
+                log "PASS  mode-observe-dns   DNS to a non-permitted server is still refused"
+            else
+                log "FAIL  mode-observe-dns   observe is not holding the resolver restriction"
+                failures=$((failures + 1))
+            fi
             if iptables -w "$IPT_WAIT" -S 2>/dev/null | grep -qx -- '-P OUTPUT DROP'; then
                 log "PASS  policy-drop        iptables OUTPUT policy is DROP"
             else
@@ -424,9 +493,9 @@ verify() {
         failures=$((failures + 1))
     fi
 
-    if [ "$EGRESS_MODE" = "open" ]; then
-        log "SKIP  forward-drop       the mode is 'open'; FORWARD is deliberately not DROP"
-    elif iptables -w "$IPT_WAIT" -S 2>/dev/null | grep -qx -- '-P FORWARD DROP'; then
+    # In every mode, including open: the policy is what catches anything that
+    # falls off the end of Docker's chains, and open does not change that.
+    if iptables -w "$IPT_WAIT" -S 2>/dev/null | grep -qx -- '-P FORWARD DROP'; then
         log "PASS  forward-drop       iptables FORWARD policy is DROP"
     else
         log "FAIL  forward-drop       iptables FORWARD policy is not DROP"
@@ -435,12 +504,37 @@ verify() {
 
     # In every mode, and named as its own check because `open` is exactly when
     # someone will want to know it is still true: the way in is unchanged.
-    if [ "$(first_rule iptables INPUT)" = "-A INPUT -j ${CHAIN_IN}" ] \
-        && iptables -w "$IPT_WAIT" -S "$CHAIN_IN" 2>/dev/null | grep -q -- '--dport 22 -j ACCEPT' \
-        && iptables -w "$IPT_WAIT" -S 2>/dev/null | grep -qx -- '-P INPUT DROP'; then
-        log "PASS  inbound-intact     INPUT is DROP and reaches ${CHAIN_IN}, which accepts ssh from the gateway"
+    # The exact shape, not a substring. `--dport 22 -j ACCEPT` also matches a
+    # rule accepting ssh from ANY source, which is a materially different box —
+    # under vz the subnet is the host plus every other VM on it. The source and
+    # the conntrack rule are both named.
+    # The gateway is derived HERE rather than read from HOST_IP. verify() runs
+    # in two paths — at the end of a rebuild, where HOST_IP is set, and under
+    # `--verify-only`, where nothing has set it — and reading it under `set -u`
+    # killed the whole function on the second path with `unbound variable`. A
+    # check that aborts verification is worse than the check it replaced.
+    local vgw want_ssh want_ct in_ok=1
+    vgw=$(ip route 2>/dev/null | awk '/^default/ && !seen { print $3; seen = 1 }')
+    want_ct="-A ${CHAIN_IN} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+    [ "$(first_rule iptables INPUT)" = "-A INPUT -j ${CHAIN_IN}" ] || in_ok=0
+    iptables -w "$IPT_WAIT" -S "$CHAIN_IN" 2>/dev/null | grep -qxF -- "$want_ct" || in_ok=0
+    iptables -w "$IPT_WAIT" -S 2>/dev/null | grep -qx -- '-P INPUT DROP' || in_ok=0
+    if [ -n "$vgw" ]; then
+        # The source matters: `--dport 22 -j ACCEPT` on its own also matches a
+        # rule accepting ssh from ANY source, and under vz the subnet is the
+        # host plus every other VM on it.
+        want_ssh="-A ${CHAIN_IN} -s ${vgw}/32 -p tcp -m tcp --dport 22 -j ACCEPT"
+        iptables -w "$IPT_WAIT" -S "$CHAIN_IN" 2>/dev/null | grep -qxF -- "$want_ssh" || in_ok=0
     else
-        log "FAIL  inbound-intact     the inbound path is not intact"
+        # No default route: the hard close's any-source fallback is the only
+        # shape available, and saying so is better than failing a box whose
+        # routing is gone for an unrelated reason.
+        iptables -w "$IPT_WAIT" -S "$CHAIN_IN" 2>/dev/null | grep -q -- '--dport 22 -j ACCEPT' || in_ok=0
+    fi
+    if [ "$in_ok" -eq 1 ]; then
+        log "PASS  inbound-intact     INPUT is DROP, reaches ${CHAIN_IN}, and ssh is accepted from ${vgw:-any source} only"
+    else
+        log "FAIL  inbound-intact     the inbound path is not intact in the exact shape expected"
         failures=$((failures + 1))
     fi
 
@@ -493,7 +587,20 @@ verify() {
     # The three checks below assert that something is REFUSED, which is only
     # what the box promises in deny mode. In observe and open it is reachable
     # on purpose, so asserting otherwise would report a working box as broken.
-    if [ "$EGRESS_MODE" != "deny" ]; then
+    # foreign-dns-denied is checked in observe too, and that is the point of
+    # the exception: observe relaxes the allowlist and keeps the resolver
+    # restriction, so the check that proves it must not be skipped with the
+    # others.
+    if [ "$EGRESS_MODE" = "observe" ]; then
+        log "SKIP  literal-ip-denied  the mode is 'observe'; non-allowlisted traffic is allowed by design"
+        log "SKIP  egress-denied      the mode is 'observe'"
+        if dig +time=2 +tries=1 "@${FOREIGN_RESOLVER}" example.com >/dev/null 2>&1; then
+            log "FAIL  foreign-dns-denied DNS to ${FOREIGN_RESOLVER} succeeded in observe mode; the resolver restriction is not held"
+            failures=$((failures + 1))
+        else
+            log "PASS  foreign-dns-denied DNS to ${FOREIGN_RESOLVER} refused, as observe still promises"
+        fi
+    elif [ "$EGRESS_MODE" != "deny" ]; then
         log "SKIP  literal-ip-denied  the mode is '${EGRESS_MODE}'; non-allowlisted traffic is allowed by design"
         log "SKIP  foreign-dns-denied the mode is '${EGRESS_MODE}'"
         log "SKIP  egress-denied      the mode is '${EGRESS_MODE}'"
@@ -542,6 +649,58 @@ verify() {
         fi
     else
         log "SKIP  resolver-up        dnsmasq is not installed on this instance"
+    fi
+
+    # --- the resolver's configuration IS part of the allowlist -------------
+    #
+    # dnsmasq decides which addresses enter the allowed set, so its config file
+    # is as much the allowlist as allowlist.base is, and nothing checked it. A
+    # dropped `ipset=` line silently stops a suffix working; an added one
+    # silently admits a subtree; a second config source could add either
+    # without touching this file at all. Three checks, all local.
+    if ! command -v dnsmasq >/dev/null 2>&1; then
+        log "SKIP  resolver-conf      dnsmasq is not installed on this instance"
+    else
+        local conf_ok=1 running_conf feed_now feed_then
+        # (a) the running daemon is reading OUR file, and only our file.
+        running_conf=$(tr '\0' '\n' < /proc/"$(pgrep -x dnsmasq | head -1)"/cmdline 2>/dev/null \
+                       | sed -n 's/^--conf-file=//p' | awk 'NR == 1' || true)
+        if [ "$running_conf" != "$DNSMASQ_CONF" ]; then
+            log "FAIL  resolver-conf      dnsmasq is running with conf-file '${running_conf:-<none>}', not ${DNSMASQ_CONF}"
+            conf_ok=0
+        elif grep -qE '^[[:space:]]*(conf-dir|conf-file|addn-hosts)=' "$DNSMASQ_CONF" 2>/dev/null; then
+            log "FAIL  resolver-conf      ${DNSMASQ_CONF} pulls in another configuration source"
+            conf_ok=0
+        fi
+        # (b) the feed rules on disk are the ones this allowlist implies.
+        feed_now=$(grep '^ipset=' "$DNSMASQ_CONF" 2>/dev/null | sort | sha256sum | awk '{print $1}')
+        feed_then=$(cat "$DNSMASQ_HASH_FILE" 2>/dev/null || printf '')
+        if [ -z "$feed_then" ]; then
+            log "FAIL  resolver-conf      no recorded feed hash; the rebuild did not write ${DNSMASQ_HASH_FILE}"
+            conf_ok=0
+        elif [ "$feed_now" != "$feed_then" ]; then
+            log "FAIL  resolver-conf      the ipset rules in ${DNSMASQ_CONF} are not the ones the allowlist generated"
+            conf_ok=0
+        fi
+        # (c) and it parses, because a file dnsmasq rejects is a resolver that
+        # will not come back after the next restart.
+        if ! dnsmasq --test --conf-file="$DNSMASQ_CONF" >/dev/null 2>&1; then
+            log "FAIL  resolver-conf      dnsmasq --test rejects ${DNSMASQ_CONF}"
+            conf_ok=0
+        fi
+        # The two protections that decide what an answer may put in the set.
+        for opt in stop-dns-rebind max-cache-ttl; do
+            if ! grep -qE "^${opt}(=|\$)" "$DNSMASQ_CONF" 2>/dev/null; then
+                log "FAIL  resolver-conf      ${DNSMASQ_CONF} is missing ${opt}"
+                conf_ok=0
+            fi
+        done
+        if [ "$conf_ok" -eq 1 ]; then
+            log "PASS  resolver-conf      dnsmasq reads only our file, its feed matches the allowlist, and it parses"
+            failures=$((failures + 0))
+        else
+            failures=$((failures + 1))
+        fi
     fi
 
     # The allowlist PERMITS something, asserted without the network. This is
@@ -896,6 +1055,35 @@ _close_and_exit() {
     local rc="$1" reason="$2"
     trap - ERR
     ipset destroy "$IPSET_TMP" 2>/dev/null || true
+
+    # The failure path has to know the mode, because "fail closed" means
+    # different things in each and meant the wrong one in two of the three.
+    #
+    # In `open` the operator has said this box has no egress filtering. A
+    # rebuild that fails — a GitHub meta fetch on a bad afternoon — would have
+    # slammed it shut to loopback and ssh, which is not a safer version of what
+    # they asked for, it is a different box. The open ruleset stays and the
+    # failure is logged.
+    #
+    # In `observe` the standing ruleset is log-and-permit, and
+    # `standing_deny_in_place` reads the OUTPUT policy, which observe also sets
+    # to DROP — so the old code took the "previous deny ruleset is left in
+    # place" branch and said `deny` about a box that permits everything. The
+    # ruleset was right; the sentence was false, which is worse than either.
+    case "$EGRESS_MODE" in
+        open)
+            log "ERROR: ${reason}; the mode is 'open', so the unfiltered ruleset is left as it is" >&2
+            log "Nothing has been closed. Fix the cause and re-run 'agentbox firewall-check'." >&2
+            exit "$rc"
+            ;;
+        observe)
+            if standing_deny_in_place; then
+                log "ERROR: ${reason}; the mode is 'observe', so the previous OBSERVE ruleset is left in place — it logs and PERMITS, it does not deny" >&2
+                exit "$rc"
+            fi
+            ;;
+    esac
+
     if standing_deny_in_place; then
         log "ERROR: ${reason}; the previous deny ruleset is left in place" >&2
         exit "$rc"
@@ -906,7 +1094,7 @@ _close_and_exit() {
     # HOST_IP is assigned, so derive it here, and fall back to accepting port 22
     # from any source, which is safe behind the hypervisor's NAT.
     local gw="${HOST_IP:-}"
-    [ -n "$gw" ] || gw=$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}') || gw=""
+    [ -n "$gw" ] || gw=$(ip route 2>/dev/null | awk '/^default/ && !seen { print $3; seen = 1 }') || gw=""
 
     # Only the three builtin chains are flushed, never the whole table. `-F`
     # with no argument would empty Docker's chains too, and Docker recreates
@@ -1023,15 +1211,34 @@ read_allowlist_raw() {
 #
 # An unrecognised line is reported rather than silently dropped, which the old
 # grep-filter did.
+# Every octet 0-255 and the prefix 0-32. Shape is not validity.
+cidr4_in_range() {
+    local a="${1%%/*}" p="${1##*/}" o
+    [ "$p" -le 32 ] 2>/dev/null || return 1
+    local IFS=.
+    # shellcheck disable=SC2086  # splitting on dots is the point.
+    set -- $a
+    [ $# -eq 4 ] || return 1
+    for o in "$@"; do
+        [ "$o" -le 255 ] 2>/dev/null || return 1
+    done
+    return 0
+}
+
 classify_allowlist_line() {
     local t="$1"
     case "$t" in
         */*)
-            # CIDR, v4 or v6.
+            # CIDR, v4 or v6, with the RANGES checked and not only the shape.
+            # `999.1.2.3/99` matched the old pattern and went to `ipset add`,
+            # which failed — and a failed add under `set -e` took the whole
+            # rebuild down, so one typo in allowlist.local closed the box. A
+            # malformed line is a warning and a skip now, never a rebuild
+            # failure.
             if printf '%s' "$t" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$'; then
-                printf 'cidr4'
+                if cidr4_in_range "$t"; then printf 'cidr4'; else printf 'bad'; fi
             elif printf '%s' "$t" | grep -qE '^[0-9A-Fa-f:]+/[0-9]{1,3}$'; then
-                printf 'cidr6'
+                if [ "${t##*/}" -le 128 ] 2>/dev/null; then printf 'cidr6'; else printf 'bad'; fi
             else
                 printf 'bad'
             fi ;;
@@ -1133,9 +1340,14 @@ collect_resolvers() {
 
 RESOLVERS=$(collect_resolvers)
 
-HOST_IP=$(ip route | awk '/^default/ {print $3; exit}')
+HOST_IP=$(ip route | awk '/^default/ && !seen { print $3; seen = 1 }')
 [ -n "$HOST_IP" ] || die_fw "failed to detect the default gateway"
 log "Host gateway: ${HOST_IP}"
+
+# Resolved once, here, so the restore file and the resolver config cannot
+# disagree about where containers should be sending their queries.
+DNSMASQ_BRIDGE=$(docker_bridge_addr)
+[ -z "$DNSMASQ_BRIDGE" ] || log "Container resolver address: ${DNSMASQ_BRIDGE}"
 
 UPLINK=$(uplink_iface || true)
 [ -n "$UPLINK" ] || die_fw "failed to detect the uplink interface"
@@ -1158,18 +1370,19 @@ printf '%s\n' "$RESOLVERS" | sed 's/^/  /'
 # The live set must exist for `ipset swap` to work; -exist makes this a no-op
 # on every run after the first.
 #
-# `timeout ${DNS_ENTRY_TTL}` is the set's DEFAULT, and it exists for dnsmasq:
-# an address dnsmasq adds as it resolves a name ages out an hour later, so a
-# rotated-away address does not accumulate for ever. Everything this rebuild
-# adds is added with `timeout 0`, which means permanent — permanent until the
-# next swap replaces it, which is the lifetime it always had.
-#
-# An older box's live set has no timeout in its header. Nothing special is
-# needed: `ipset swap` carries the new set's header across, so the first
-# rebuild after an upgrade converts it. Measured.
-ipset create "$IPSET_NAME" hash:net timeout "$DNS_ENTRY_TTL" -exist
+# Exactly as it always was: no timeout on this one. Everything in it is put
+# there by this rebuild and replaced by the next swap, which is the lifetime it
+# has always had. Giving it a default timeout was the first design; it made
+# `ipset create -exist` fail against a set an older box already had without one,
+# and the ERR trap turned that into a hard close on upgrade.
+ipset create "$IPSET_NAME" hash:net -exist
 ipset destroy "$IPSET_TMP" 2>/dev/null || true
-ipset create "$IPSET_TMP" hash:net timeout "$DNS_ENTRY_TTL"
+ipset create "$IPSET_TMP" hash:net
+
+# The resolver's set. Created if absent and otherwise left exactly alone: the
+# rebuild must never swap it, copy it, or clear it except when the suffix list
+# itself changes, which is handled after the config is written.
+ipset create "$IPSET_RESOLVED" hash:net timeout "$RESOLVED_TTL" -exist
 
 log "Fetching GitHub IP ranges from ${GH_META_URL}..."
 gh_ranges=$(curl -sS -m 20 "$GH_META_URL" || true)
@@ -1193,7 +1406,7 @@ while read -r cidr; do
     if [[ ! "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
         die_fw "invalid CIDR from GitHub meta: ${cidr}"
     fi
-    ipset add "$IPSET_TMP" "$cidr" timeout 0 -exist
+    ipset add "$IPSET_TMP" "$cidr" -exist
     gh_count=$((gh_count + 1))
 done < <(printf '%s\n' "$gh_cidrs")
 log "Added ${gh_count} GitHub ranges"
@@ -1205,7 +1418,7 @@ cidr_count=0
 if [ -n "$CIDRS4" ]; then
     while read -r _c; do
         [ -n "$_c" ] || continue
-        ipset add "$IPSET_TMP" "$_c" timeout 0 -exist
+        ipset add "$IPSET_TMP" "$_c" -exist
         cidr_count=$((cidr_count + 1))
     done < <(printf '%s\n' "$CIDRS4")
     log "Added ${cidr_count} allowlisted address range(s)"
@@ -1282,7 +1495,7 @@ while [ "$pass" -le "$RESOLVE_PASSES" ]; do
             [ -n "$ip" ] || continue
             # -exist makes a repeat harmless, which is what lets the passes
             # accumulate rather than conflict.
-            ipset add "$IPSET_TMP" "$ip" timeout 0 -exist
+            ipset add "$IPSET_TMP" "$ip" -exist
             n=$((n + 1))
         done < <(printf '%s\n' "$ips")
         pass_seen=$((pass_seen + n))
@@ -1312,33 +1525,9 @@ log "Address set holds $(ipset save "$IPSET_TMP" | grep -c '^add ' || true) entr
 
 # Atomic from the kernel's point of view: rules referencing the set start
 # matching the new contents on the next packet, with no gap in between.
-# Carry dnsmasq's entries across the swap, and this is a measurement rather
-# than a preference. The spec offered the cheaper option — let a rebuild forget
-# them and let the next lookup put them back — on the assumption that lookups
-# are cheap. They are, but that is not the question. The question is whether
-# there IS a next lookup that reaches dnsmasq, and measured on Ubuntu 24.04:
-#
-#   query[A] api.github.com from 127.0.0.1
-#   cached api.github.com is 140.82.113.6      <- answered from dnsmasq's cache
-#   entries in the set afterwards: 0            <- and NOT re-added
-#
-# dnsmasq feeds the set when it FORWARDS an answer and not when it serves one
-# from its own cache. So forgetting them would black-hole every suffix-matched
-# host for the remainder of its TTL after each rebuild — and longer, because
-# the application may not re-query at all. Preserving them is a dozen lines and
-# removes the whole failure mode.
-#
-# Which entries are dnsmasq's? The ones with a timeout. Everything this rebuild
-# added is `timeout 0`, so the distinction needs no bookkeeping of its own.
-preserved=0
-while read -r _ip _ttl; do
-    [ -n "$_ip" ] || continue
-    ipset add "$IPSET_TMP" "$_ip" timeout "$_ttl" -exist 2>/dev/null || continue
-    preserved=$((preserved + 1))
-done < <(ipset save "$IPSET_NAME" 2>/dev/null \
-         | awk '/^add / { t = 0; for (i = 1; i <= NF; i++) if ($i == "timeout") t = $(i+1); if (t + 0 > 0) print $3, t }' || true)
-[ "$preserved" -eq 0 ] || log "Carried ${preserved} resolver-added address(es) across the swap"
-
+# No preserve loop. The resolver's addresses are in a set of their own that
+# this swap does not touch, so there is nothing to carry and no window between
+# reading and swapping in which an address can be lost.
 ipset swap "$IPSET_TMP" "$IPSET_NAME"
 ipset destroy "$IPSET_TMP"
 # Only now: until the swap, the file would describe a set that is not live.
@@ -1375,13 +1564,32 @@ log "Address set swapped in"
 # every process keeps resolving through 127.0.0.53 exactly as before and every
 # lookup reaches dnsmasq. That configuration is written once by provisioning;
 # what is rewritten here, on every rebuild, is only the list of names.
+# What dnsmasq should be answering on. Loopback always; on a Docker box also the
+# default bridge's address, because a container's resolver is the daemon's and
+# a container that cannot reach dnsmasq cannot make a suffix line work — and,
+# worse, feeds nothing, so its lookups never authorise anything.
+dnsmasq_listen_addrs() {
+    printf '%s\n' "$DNSMASQ_ADDR"
+    local br
+    br=$(docker_bridge_addr)
+    [ -z "$br" ] || printf '%s\n' "$br"
+}
+
 write_dnsmasq_conf() {
-    local tmp="${DNSMASQ_CONF}.new" d
+    local tmp="${DNSMASQ_CONF}.new" d a
     install -d -m 0755 "$(dirname "$DNSMASQ_CONF")"
     {
         printf '# Written by agent-box init-firewall.sh. Do not edit.\n'
-        printf 'listen-address=%s\n' "$DNSMASQ_ADDR"
-        printf 'bind-interfaces\n'
+        while read -r a; do
+            [ -n "$a" ] || continue
+            printf 'listen-address=%s\n' "$a"
+        done < <(dnsmasq_listen_addrs)
+        # `bind-dynamic`, not `bind-interfaces`: the docker bridge does not exist
+        # when this unit first runs, and `bind-interfaces` binds once at start
+        # and never notices an address appearing later. Both still restrict
+        # dnsmasq to the addresses named above — this is not `bind-interfaces`
+        # traded for listening everywhere.
+        printf 'bind-dynamic\n'
         printf 'no-resolv\n'
         # Only the resolvers the firewall already permits. dnsmasq is the one
         # process that talks to them now.
@@ -1390,14 +1598,33 @@ write_dnsmasq_conf() {
             printf 'server=%s\n' "$ns"
         done < <(printf '%s\n' "$RESOLVERS")
         printf 'cache-size=1000\n'
+        # Strictly below the set entry's lifetime. dnsmasq feeds the set only on
+        # a FORWARDED answer, so a cache that outlived the entry would leave a
+        # window where the name still resolves and the address is no longer
+        # allowed — the host goes dark and nothing says why.
+        printf 'max-cache-ttl=%s\n' "$DNS_CACHE_TTL"
+        # An upstream answer that names a private or loopback address would
+        # otherwise put the hypervisor gateway, or the guest itself, into the
+        # allowed set — an allowlisted suffix becoming a way to reach the host.
+        printf 'stop-dns-rebind\n'
+        printf 'rebind-localhost-ok\n'
         # Names the guest must never be able to resolve to something local.
         printf 'domain-needed\n'
         printf 'bogus-priv\n'
-        # The feed itself: an answer for any of these adds its addresses.
+        # The feed: SUFFIX LINES ONLY.
+        #
+        # An exact name is not fed, and that is the whole distinction. dnsmasq's
+        # `ipset=/example.com/set` matches example.com AND every subdomain of
+        # it, so feeding exact names turned every entry in allowlist.base into a
+        # wildcard for its subtree — `api.anthropic.com` would have admitted
+        # anything.anthropic.com the moment something resolved it. Exact names
+        # are pre-resolved by this rebuild and pinned; a dot line is a subtree
+        # and follows the resolver. A rotating host that needs the feed says so
+        # by being written with the dot.
         while read -r d; do
             [ -n "$d" ] || continue
-            printf 'ipset=/%s/%s\n' "$d" "$IPSET_NAME"
-        done < <(printf '%s\n%s\n' "$DOMAINS" "$SUFFIXES" | grep -v '^$' | sort -u)
+            printf 'ipset=/%s/%s\n' "$d" "$IPSET_RESOLVED"
+        done < <(printf '%s\n' "$SUFFIXES" | grep -v '^$' | sort -u)
         # Query logging, in observe mode only: it is how `agentbox egress-log`
         # puts a name to an address, and it is a privacy and volume cost that
         # the quiet default should not pay.
@@ -1405,6 +1632,15 @@ write_dnsmasq_conf() {
             printf 'log-queries\n'
         fi
     } > "$tmp"
+    chown root:root "$tmp" 2>/dev/null || true
+    chmod 0644 "$tmp"
+
+    # What verify() compares against: the feed rules alone, so an unrelated
+    # edit elsewhere in the file is not mistaken for a tampered allowlist and
+    # a tampered allowlist is not hidden by an unrelated edit.
+    DNSMASQ_FEED_HASH=$(grep '^ipset=' "$tmp" | sort | sha256sum | awk '{print $1}')
+    printf '%s\n' "$DNSMASQ_FEED_HASH" > "$DNSMASQ_HASH_FILE" 2>/dev/null || true
+
     if [ -f "$DNSMASQ_CONF" ] && cmp -s "$tmp" "$DNSMASQ_CONF"; then
         rm -f "$tmp"
         return 1   # unchanged; no restart needed
@@ -1415,7 +1651,18 @@ write_dnsmasq_conf() {
 
 if command -v dnsmasq >/dev/null 2>&1; then
     if write_dnsmasq_conf; then
-        log "Resolver configuration changed; restarting dnsmasq"
+        # A suffix has been added or removed, so the resolver's set no longer
+        # corresponds to the rules that filled it. Flushed rather than reasoned
+        # about: an entry fed by a suffix that is no longer allowlisted must
+        # stop being reachable, and there is no way to tell from an address
+        # which rule put it there. The cost is one re-lookup for the suffixes
+        # that ARE still allowed, which is the cheaper mistake.
+        ipset flush "$IPSET_RESOLVED" 2>/dev/null || true
+        log "Resolver configuration changed; flushed ${IPSET_RESOLVED} and restarting dnsmasq"
+        if ! dnsmasq --test --conf-file="$DNSMASQ_CONF" >/dev/null 2>&1; then
+            log "ERROR: the generated dnsmasq configuration does not parse" >&2
+            die_fw "refusing to restart dnsmasq with a configuration it rejects"
+        fi
         systemctl restart dnsmasq 2>/dev/null \
             || log "WARN: could not restart dnsmasq; suffix matching will lag until it restarts" >&2
     else
@@ -1460,12 +1707,19 @@ done
     # gateway stays the only way in, whatever the mode. IPv6 also stays closed
     # in every mode — there is no v6 allowlist to open, so opening it would be
     # opening it entirely rather than opening it to the same places.
+    #
+    # FORWARD stays DROP in `open` too. Setting it to ACCEPT undid the thing
+    # AGENTBOX-FWD's RETURN was chosen to preserve: with the policy open, a
+    # packet that falls off the end of Docker's chains is accepted by the
+    # policy instead of dropped, so container-to-container isolation and
+    # Docker's own rules stop being the last word. Open means this box stops
+    # judging egress, which is done in the chains — not that the kernel stops
+    # applying what Docker asked for.
     printf ':INPUT DROP [0:0]\n'
+    printf ':FORWARD DROP [0:0]\n'
     if [ "$EGRESS_MODE" = "open" ]; then
-        printf ':FORWARD ACCEPT [0:0]\n'
         printf ':OUTPUT ACCEPT [0:0]\n'
     else
-        printf ':FORWARD DROP [0:0]\n'
         printf ':OUTPUT DROP [0:0]\n'
     fi
     printf ':%s - [0:0]\n' "$CHAIN_IN"
@@ -1480,6 +1734,20 @@ done
     # gateway — not the whole subnet, which under vz is the host plus every
     # other VM on the machine.
     printf -- '-A %s -s %s/32 -p tcp --dport 22 -j ACCEPT\n' "$CHAIN_IN" "$HOST_IP"
+
+    # A container asking the guest's resolver. This is INBOUND, which is not
+    # where it looks like it belongs: the query is addressed to the bridge's
+    # OWN address, so the kernel delivers it locally through INPUT rather than
+    # forwarding it. The rule was written into the forward chain first and
+    # containers still could not resolve anything, which is how the distinction
+    # was found.
+    #
+    # Narrow on purpose: only from the bridge, only to the bridge address, only
+    # port 53. It does not open the guest to the container for anything else.
+    if [ -n "$DNSMASQ_BRIDGE" ]; then
+        printf -- '-A %s -i docker0 -d %s/32 -p udp --dport 53 -j ACCEPT\n' "$CHAIN_IN" "$DNSMASQ_BRIDGE"
+        printf -- '-A %s -i docker0 -d %s/32 -p tcp --dport 53 -j ACCEPT\n' "$CHAIN_IN" "$DNSMASQ_BRIDGE"
+    fi
 
     # --- the guest's own egress -------------------------------------------
     printf -- '-A %s -o lo -j ACCEPT\n' "$CHAIN_OUT"
@@ -1507,6 +1775,10 @@ done
     # everything the guest legitimately needs from the host is either an
     # already-established connection, DNS above, or carried over vsock.
     printf -- '-A %s -m set --match-set %s dst -j ACCEPT\n' "$CHAIN_OUT" "$IPSET_NAME"
+    # The resolver's own set, alongside and never merged with it. Two rules
+    # rather than two populations in one set: the rebuild owns the first and
+    # replaces it wholesale, dnsmasq owns the second and its entries expire.
+    printf -- '-A %s -m set --match-set %s dst -j ACCEPT\n' "$CHAIN_OUT" "$IPSET_RESOLVED"
 
     # And then the mode decides. Everything above this point is identical in
     # all three: loopback, established, the guest's own containers, DNS to the
@@ -1519,11 +1791,28 @@ done
             printf -- '-A %s -j REJECT --reject-with icmp-admin-prohibited\n' "$CHAIN_OUT"
             ;;
         observe)
+            # Observe relaxes the ALLOWLIST. It does not relax the resolver
+            # restriction, and that is a deliberate exception rather than an
+            # oversight: port 53 to an arbitrary server is an exfiltration
+            # channel whose payload is the query name, so "allowed and logged"
+            # would be a channel that carries data out and records only that
+            # something was sent. The permitted resolvers were accepted higher
+            # up, so anything reaching here on 53 is a foreign one.
+            printf -- '-A %s -p udp --dport 53 -j REJECT --reject-with icmp-admin-prohibited\n' "$CHAIN_OUT"
+            printf -- '-A %s -p tcp --dport 53 -j REJECT --reject-with icmp-admin-prohibited\n' "$CHAIN_OUT"
             # Log the attempt, then allow it. NEW only, so one connection is one
-            # line rather than one per packet, and rate-limited so a busy agent
-            # cannot fill the journal. The limit drops LOG LINES, never packets:
-            # the ACCEPT below is unconditional and outside the limit.
-            printf -- '-A %s -m conntrack --ctstate NEW -m limit --limit 60/minute --limit-burst 30 -j LOG --log-prefix "%s" --log-level info\n' \
+            # line rather than one per packet.
+            #
+            # `hashlimit` keyed on destination and port, not a single global
+            # `limit`: with one bucket for the whole chain, a chatty host —
+            # a telemetry endpoint retrying, or an agent that has noticed the
+            # log — exhausts the budget and every OTHER destination goes
+            # unrecorded. Per destination, drowning the log costs a new address
+            # each time. The limit drops LOG LINES, never packets: the ACCEPT
+            # below is unconditional and outside it.
+            printf -- '-A %s -m conntrack --ctstate NEW -m hashlimit --hashlimit-above 6/minute --hashlimit-burst 12 --hashlimit-mode dstip,dstport --hashlimit-name %s --hashlimit-htable-expire 600000 -j ACCEPT\n' \
+                "$CHAIN_OUT" "abx_egress"
+            printf -- '-A %s -m conntrack --ctstate NEW -j LOG --log-prefix "%s" --log-level info\n' \
                 "$CHAIN_OUT" "$LOG_PREFIX"
             printf -- '-A %s -j ACCEPT\n' "$CHAIN_OUT"
             ;;
@@ -1568,12 +1857,26 @@ done
         printf -- '-A %s %s\n' "$CHAIN_FWD" "$_r"
     done < <(fwd_leading_rules "$UPLINK")
     printf -- '-A %s -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n' "$CHAIN_FWD"
-    while read -r ns; do
-        [ -n "$ns" ] || continue
-        printf -- '-A %s -d %s/32 -p udp --dport 53 -j ACCEPT\n' "$CHAIN_FWD" "$ns"
-        printf -- '-A %s -d %s/32 -p tcp --dport 53 -j ACCEPT\n' "$CHAIN_FWD" "$ns"
-    done < <(printf '%s\n' "$RESOLVERS")
+    # A container's DNS goes to dnsmasq on the bridge address, and to nothing
+    # else. It used to be permitted straight to the upstream resolvers, which
+    # meant a container's lookups never passed through dnsmasq and therefore
+    # never fed the set — so a suffix line worked in the guest and silently did
+    # not work in a container. daemon.json points containers here.
+    _br="$DNSMASQ_BRIDGE"
+    if [ -n "$_br" ]; then
+        printf -- '-A %s -d %s/32 -p udp --dport 53 -j ACCEPT\n' "$CHAIN_FWD" "$_br"
+        printf -- '-A %s -d %s/32 -p tcp --dport 53 -j ACCEPT\n' "$CHAIN_FWD" "$_br"
+    else
+        # No bridge yet: fall back to the upstreams so a box without Docker,
+        # or one whose daemon has not started, still resolves.
+        while read -r ns; do
+            [ -n "$ns" ] || continue
+            printf -- '-A %s -d %s/32 -p udp --dport 53 -j ACCEPT\n' "$CHAIN_FWD" "$ns"
+            printf -- '-A %s -d %s/32 -p tcp --dport 53 -j ACCEPT\n' "$CHAIN_FWD" "$ns"
+        done < <(printf '%s\n' "$RESOLVERS")
+    fi
     printf -- '-A %s -m set --match-set %s dst -j ACCEPT\n' "$CHAIN_FWD" "$IPSET_NAME"
+    printf -- '-A %s -m set --match-set %s dst -j ACCEPT\n' "$CHAIN_FWD" "$IPSET_RESOLVED"
     # Containers follow the box's mode, for the same reason they follow its
     # allowlist: "what this box may reach" should not have two answers.
     case "$EGRESS_MODE" in
@@ -1581,16 +1884,26 @@ done
             printf -- '-A %s -j REJECT --reject-with icmp-admin-prohibited\n' "$CHAIN_FWD"
             ;;
         observe)
-            printf -- '-A %s -m conntrack --ctstate NEW -m limit --limit 60/minute --limit-burst 30 -j LOG --log-prefix "%s" --log-level info\n' \
+            # Same shape as the guest's own chain, including the DNS exception:
+            # a container may reach the permitted resolvers (accepted above) and
+            # nothing else on port 53.
+            printf -- '-A %s -p udp --dport 53 -j REJECT --reject-with icmp-admin-prohibited\n' "$CHAIN_FWD"
+            printf -- '-A %s -p tcp --dport 53 -j REJECT --reject-with icmp-admin-prohibited\n' "$CHAIN_FWD"
+            printf -- '-A %s -m conntrack --ctstate NEW -m hashlimit --hashlimit-above 6/minute --hashlimit-burst 12 --hashlimit-mode dstip,dstport --hashlimit-name %s --hashlimit-htable-expire 600000 -j ACCEPT\n' \
+                "$CHAIN_FWD" "abx_fwd"
+            printf -- '-A %s -m conntrack --ctstate NEW -j LOG --log-prefix "%s" --log-level info\n' \
                 "$CHAIN_FWD" "$LOG_PREFIX"
             printf -- '-A %s -j ACCEPT\n' "$CHAIN_FWD"
             ;;
         open)
-            # RETURN, not ACCEPT: this chain is reached from DOCKER-USER, and
-            # accepting here would short-circuit Docker's own chains, including
-            # the isolation between its networks. Open means we stop judging,
-            # not that everything else stops judging too.
-            printf -- '-A %s -j RETURN\n' "$CHAIN_FWD"
+            # ACCEPT here is the EGRESS LEG only, and that is why it is safe.
+            # Everything that is not leaving by the uplink already RETURNed at
+            # the top of this chain, back to Docker's own rules and their
+            # isolation between networks; what reaches this line is a container
+            # talking to the outside, which is exactly what open stops judging.
+            # The FORWARD policy is untouched, so anything falling off the end
+            # of Docker's chains is still dropped by the kernel.
+            printf -- '-A %s -j ACCEPT\n' "$CHAIN_FWD"
             ;;
     esac
 

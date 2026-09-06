@@ -197,6 +197,16 @@ Every box has one, chosen at create and shown by `agentbox egress`:
 | `observe` | **allowed** | yes | the log rule is in place and the chain ends in ACCEPT, never a silent deny |
 | `open` | allowed, unfiltered | no | INPUT is intact and OUTPUT is unfiltered |
 
+One thing `observe` does **not** relax: DNS to a server other than the guest's
+own resolver stays refused, in every mode except `open`. Port 53 to an
+arbitrary host is a channel whose payload is the query name, so "allowed and
+logged" there would carry data out while recording only that something went.
+
+The mode every reporter shows is read from the **live ruleset**, not from the
+file that records what was asked for. When the two disagree the answer is
+`unknown`, with a `firewall_detail` saying what each of them said — which is
+the honest answer to "which of these should I believe".
+
 Changing the mode rebuilds the firewall immediately and prints the
 verification, so the answer to "did that take" is on the screen. `open` prints
 a warning naming what it gives up. The mode appears in the create summary, in
@@ -235,17 +245,47 @@ api.example.com       an exact name. Resolved on every rebuild, so it works
 *.staging.example     the same thing, if you prefer the glob.
 ```
 
-A suffix cannot be pre-resolved — that is the point of it — so it works through
-the guest's own resolver: dnsmasq answers every lookup in the guest and adds
-the addresses it returns to the allowed set. That also means an exact name
-whose CDN rotates keeps working, because the set follows what the guest
-actually resolved rather than what a rebuild pinned fifteen minutes ago.
+**A dot line is a subtree and follows the resolver. A bare name is one host,
+pinned at rebuild.** They are different mechanisms, not two spellings:
 
-Two consequences worth knowing. **If the resolver is down, nothing resolves and
-the box is closed to everything by name** — it fails closed, not open, and
-`firewall-check` says `FAIL resolver-up` in as many words. And **an IPv6 range
-is accepted and reported as inert**, because v6 egress is closed entirely;
-the line is remembered for the day that changes.
+- `api.example.com` is resolved on every rebuild and its addresses are pinned
+  until the next one. Nothing else under `example.com` is admitted.
+- `.example.com` is not resolved in advance at all. It becomes a rule in the
+  guest's resolver, which adds each address to a second set as the guest looks
+  a name up — so `anything.example.com` is admitted the moment something
+  resolves it.
+
+So a dot line is how you say "this whole environment", and it is also how you
+say "this host rotates its addresses faster than a rebuild can pin them" — the
+two entries in `allowlist.base` written with a dot, `.cdn.playwright.dev` and
+`.storage.googleapis.com`, are there for the second reason and carry the cost
+of the first. Write a bare name unless you mean the subtree.
+
+The two sets are kept apart on purpose. The rebuild owns the pinned one and
+replaces it wholesale; the resolver owns the other and its entries expire after
+an hour. That is what makes removing a line take effect: delete a suffix, and
+the next rebuild flushes the resolver's set rather than carrying its addresses
+forward for ever.
+
+Three consequences worth knowing. **If the resolver is down, nothing resolves
+and the box is closed to everything by name** — it fails closed, not open, and
+`firewall-check` says `FAIL resolver-up` in as many words. **An IPv6 range is
+accepted and reported as inert**, because v6 egress is closed entirely; the
+line is remembered for the day that changes. And **a malformed line is a
+warning, not a failure** — it is named in the log and skipped, so a typo in
+`allowlist.local` cannot take the box down.
+
+### Observe's log is a record, not a control
+
+Worth being plain about, because the word "log" invites the opposite reading.
+In observe mode the traffic is **allowed first and recorded second**, and the
+recording is rate-limited per destination so that one chatty host cannot crowd
+the others out of the journal. When the limit bites, packets still pass and log
+lines are dropped — never the other way round. An agent that wanted to hide a
+destination could bury it under its own noise, and the per-destination limit
+raises the price of that without removing it. Observe tells you what a
+repository reaches for when it is not trying to deceive you; it is not a
+control, and a box you do not trust belongs in `deny`.
 
 ### The JSON is the contract
 

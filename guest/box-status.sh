@@ -52,40 +52,24 @@ fi
 
 # --- the egress mode --------------------------------------------------------
 #
-# The `firewall` field is the MODE now: deny, observe, open or unknown. It used
-# to be drop/open/unknown, read from the OUTPUT policy. The policy is still what
-# is checked — a mode file saying `deny` on a box whose ruleset is not actually
-# denying would be the worst of both — but the answer is reported in the same
-# vocabulary the operator chose the box with.
+# The `firewall` field is the MODE now: deny, observe, open or unknown. It is
+# derived from the LIVE RULESET by guest/egress-mode.sh, never from the mode
+# file — a file is what somebody asked for, and reporting it as fact is how a
+# box that permits everything comes to be described as denying.
 #
-# `unknown` whenever the two disagree or the ruleset cannot be read at all. This
-# command must never report a mode it did not see evidence for.
+# When the file and the ruleset disagree, the answer is `unknown` and
+# `firewall_detail` says what both of them said. Unknown is the honest answer
+# to "which of these two do you believe", and picking one silently is not.
 FIREWALL="unknown"
-# `-w`: a rebuild can hold the xtables lock for a stretch, and iptables 1.8
-# without it exits non-zero rather than waiting — which would report `unknown`
-# on a perfectly healthy box every time `status --watch` landed on a rebuild.
-MODE_CLAIMED=""
-[ -r /etc/agent-box/egress-mode ] \
-    && MODE_CLAIMED=$(tr -d '[:space:]' < /etc/agent-box/egress-mode 2>/dev/null)
-if POLICY=$(sudo -n iptables -w 5 -S 2>/dev/null | grep -- '-P OUTPUT'); then
-    case "${MODE_CLAIMED}:${POLICY}" in
-        deny:*DROP*)
-            FIREWALL="deny" ;;
-        observe:*DROP*)
-            # Observe also runs OUTPUT DROP; what distinguishes it is that the
-            # chain ends in ACCEPT after a LOG rather than in REJECT. Check the
-            # thing that differs, not the thing that does not.
-            if sudo -n iptables -w 5 -S AGENTBOX-OUT 2>/dev/null | grep -q -- '-j LOG --log-prefix'; then
-                FIREWALL="observe"
-            fi ;;
-        open:*ACCEPT*)
-            FIREWALL="open" ;;
-        :*DROP*)
-            # No mode file: an older box, or one whose /etc was not written.
-            # The policy is denying, so say so in the old vocabulary rather
-            # than inventing a mode nobody set.
-            FIREWALL="deny" ;;
-    esac
+FIREWALL_DETAIL=""
+if MODE_LINE=$("${ABX_LIB_DIR}/egress-mode.sh" 2>/dev/null); then
+    _live=$(printf '%s' "$MODE_LINE" | sed -n 's/.*live=\([a-z]*\).*/\1/p')
+    FIREWALL_DETAIL=$(printf '%s' "$MODE_LINE" | sed -n 's/.*detail=//p')
+    if [ -n "$FIREWALL_DETAIL" ]; then
+        FIREWALL="unknown"
+    else
+        FIREWALL="${_live:-unknown}"
+    fi
 fi
 
 # --- orphaned runs --------------------------------------------------------
@@ -111,4 +95,5 @@ fi
 exec python3 "${ABX_LIB_DIR}/run-format.py" "$MODE" \
     --claude-version "$CLAUDE_VERSION" \
     --firewall "$FIREWALL" \
+    --firewall-detail "$FIREWALL_DETAIL" \
     --sessions "$SESSIONS"

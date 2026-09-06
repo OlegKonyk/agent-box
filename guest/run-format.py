@@ -974,6 +974,11 @@ def cmd_box_json(args):
                 {
                     "claude_version": args.claude_version or None,
                     "firewall": args.firewall or "unknown",
+                    # Empty when the mode file and the live ruleset agree.
+                    # Non-empty means `firewall` is "unknown" and this says
+                    # which two things disagreed, so a reader is never left
+                    # with an unexplained unknown.
+                    "firewall_detail": args.firewall_detail or None,
                     "run": Run(runid).status_object() if runid else None,
                     "runs_total": len(all_runids()),
                     # null, not [], when it could not be read: see
@@ -994,6 +999,8 @@ def cmd_box_text(args):
         sessions = _clean_sessions(sessions)
     runid = newest_runid()
     parts = ["fw=%s" % (args.firewall or "unknown")]
+    if args.firewall_detail:
+        parts.append("(%s)" % args.firewall_detail)
     if args.claude_version:
         parts.append("claude=%s" % scrub(args.claude_version.split()[0]))
     parts.append("runs=%d" % len(all_runids()))
@@ -1057,6 +1064,7 @@ def main(argv=None):
     parser.add_argument("--box-text", action="store_true", help="one text line per box")
     parser.add_argument("--claude-version", default="")
     parser.add_argument("--firewall", default="unknown")
+    parser.add_argument("--firewall-detail", default="")
     parser.add_argument("--sessions", default="[]")
     args = parser.parse_args(argv)
 
