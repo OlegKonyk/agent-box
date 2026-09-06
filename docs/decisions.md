@@ -1084,6 +1084,67 @@ remote condition can fabricate, and is fatal. Those are three outcomes and
 `container_probe` already returned three values; the code was collapsing them
 into two.
 
+## The check that the allowlist permits something, without asking the internet
+
+Applying that rule left a hole, and it is worth naming because it is the
+predictable cost of getting the rule right. Once the outbound probes became
+advisory, **no fatal check asserted that the allowlist lets anything through.**
+`allowlist-rule` looks like it does and does not: it greps the chain for a rule
+referencing the set, which is exactly as true of a set holding nothing.
+
+The state is reachable without any race. One name that fails to resolve is a
+journal WARN and a `continue`, and `resolved_any` is satisfied by a single name
+out of nineteen, while the GitHub ranges are added unconditionally. So a rebuild
+during a partial DNS failure could swap in a set holding the GitHub ranges and
+almost nothing else, exit 0, and leave the unit active — with `firewall-check`
+exiting 0, `agentbox status` reporting `drop`, and an overnight run starting at
+02:30 and dying on its first call to the model API. Every signal green on a box
+where no agent can work.
+
+Two changes close it, and both keep the direction-of-failure rule intact.
+
+**The rebuild records what it resolved.** One line per name in
+`/run/agent-box-firewall-resolved`, written only once the swap has happened, so
+the file can never describe a set that is not live. `verify()` then asks a
+question that is entirely local: does the live set still contain every address
+the last rebuild recorded for `api.anthropic.com`? Both halves are readable from
+the kernel, and it fails only on affirmative evidence — the file says these went
+in, and `ipset test` says they are not there.
+
+**And that one name's resolution failure is a rebuild failure.** Not a WARN and
+a `continue`. Without `api.anthropic.com` the box cannot do the single thing it
+exists to do, so the rebuild refuses the swap, keeps the standing ruleset with
+its previous addresses, and exits non-zero — visible, and retried on the next
+tick.
+
+### An emptied allowlist is self-sealing, which the test had to learn
+
+Worth recording because the obvious repair does not work. The smoke empties the
+live set and asserts the new check fails; the first version then simply
+restarted the unit to put the box back, and the restart failed. It has to: the
+rebuild needs `api.github.com` for the meta ranges, `api.github.com` is only
+reachable through the ipset, and the ipset is what was emptied. A box in that
+state cannot rebuild its way out on its own.
+
+That is the same property the hard close has, and the recovery is the same
+shape: open egress by hand, then rebuild. There is a second step to it that is
+easy to get wrong, and the test got it wrong once before measuring it: **the
+policy is not what refuses the packet.** `AGENTBOX-OUT` is jumped from `OUTPUT`
+rule 1 and ends in REJECT, so a rejected connection never reaches the `OUTPUT`
+policy at all, and `iptables -P OUTPUT ACCEPT` on its own changes nothing. The
+chain has to be flushed as well:
+
+```
+sudo iptables -P OUTPUT ACCEPT
+sudo iptables -F AGENTBOX-OUT          # not -F on its own: that takes Docker's chains
+sudo systemctl restart agent-box-firewall.service
+```
+
+Which is precisely what `open_network_for_provisioning` does, for precisely this
+reason. Anyone who empties that set on a real box needs both lines, and the
+recovery text the hard close prints is right to name the chain flush rather than
+only the policy.
+
 ## Why `firewall-check` rebuilds, having only verified
 
 `agentbox firewall-check` ran `init-firewall.sh --verify-only`, which returns

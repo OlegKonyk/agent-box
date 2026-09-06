@@ -489,7 +489,7 @@ FW_OUT="${TMP_ROOT}/firewall.out"
 rc=$?
 cat "$FW_OUT"
 if [ "$rc" -eq 0 ]; then ok "firewall-check exited 0"; else bad "firewall-check exited ${rc}"; fi
-for check in policy-drop policy-drop-v6 allowlist-rule literal-ip-denied foreign-dns-denied egress-denied anthropic-allowed github-allowed uplink-not-bridge; do
+for check in policy-drop policy-drop-v6 allowlist-rule allowlist-holds literal-ip-denied foreign-dns-denied egress-denied anthropic-allowed github-allowed uplink-not-bridge; do
     if grep -q "^PASS  ${check}" "$FW_OUT"; then
         ok "firewall check ${check}"
     else
@@ -3026,7 +3026,8 @@ dfw_rc=$BOUNDED_RC
 cat "$DFW_OUT"
 if [ "$dfw_rc" -eq 0 ]; then ok "firewall-check exited 0 on the Docker instance"; else bad "firewall-check exited ${dfw_rc} on the Docker instance"; fi
 for check in policy-drop policy-drop-v6 forward-drop out-chain-first allowlist-rule \
-             literal-ip-denied foreign-dns-denied egress-denied anthropic-allowed github-allowed \
+             allowlist-holds literal-ip-denied foreign-dns-denied egress-denied \
+             anthropic-allowed github-allowed \
              uplink-not-bridge docker-user-jump docker-egress docker-allowed; do
     if grep -q "^PASS  ${check}" "$DFW_OUT"; then
         ok "firewall check ${check} (docker instance)"
@@ -3134,7 +3135,7 @@ AL_OUT="${TMP_ROOT}/allowlist-reach.out"
 # a pool is the shape a real download has, and a name that is genuinely absent
 # still fails all six.
 # shellcheck disable=SC2016  # $u and $code must expand in the guest, not here.
-run_bounded 1200 "$AL_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c '
+run_bounded 600 "$AL_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c '
 for u in http://ports.ubuntu.com/ \
          https://download.docker.com/linux/ubuntu/gpg \
          https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt \
@@ -3160,7 +3161,15 @@ for u in http://ports.ubuntu.com/ \
     # So the retry runs the remedy and tries again: a name that is genuinely
     # absent still fails, and this asserts that the advice we give actually
     # works.
-    if [ "${code:-000}" = 000 ]; then
+    # Only the host the retry was written for. Applied to all ten, a genuinely
+    # missing entry — the defect this check exists to find — paid a firewall
+    # restart plus six more twelve-second attempts before reporting, and ten
+    # such hosts ran past the bound on this step, at which point run_bounded
+    # kills it and nothing has been written at all.
+    # (No apostrophes below this line: the whole block is one single-quoted
+    # argument to bash -c, and one would end it.)
+    case "$u" in *cdn.playwright.dev*) retry_this=1 ;; *) retry_this=0 ;; esac
+    if [ "${code:-000}" = 000 ] && [ "$retry_this" -eq 1 ]; then
         printf "REBUILD-RETRY %s\n" "$u"
         sudo systemctl restart agent-box-firewall.service >/dev/null 2>&1 || true
         for _try in 1 2 3 4 5 6; do
@@ -3174,7 +3183,15 @@ done
 '
 # REBUILD-RETRY too, or the evidence that the documented remedy was tried is
 # filtered out of the displayed output while sitting in the file.
+al_rc=$BOUNDED_RC
 grep -E '^(REACH|REBUILD-RETRY)' "$AL_OUT" || cat "$AL_OUT"
+# Its own status, so a kill at the bound is reported as itself rather than as
+# ten reachability failures with no output behind them.
+if [ "$al_rc" -eq 0 ]; then
+    ok "the reachability probe completed within its bound"
+else
+    bad "the reachability probe exited ${al_rc} (124 means it hit run_bounded's limit)"
+fi
 # The three added last are the ones the review found unexercised: the two Docker
 # Hub blob CDNs (one of which was added only after a real pull was redirected to
 # it and refused) and the ghcr blob host, whose entry the allowlist's own comment
@@ -3241,6 +3258,172 @@ fi
 
 printf -- '\n--- tear the stack down ---\n'
 dguest bash -c 'cd /tmp/abx-stack && docker compose down 2>&1 | tail -2; docker network rm abxnet >/dev/null 2>&1; true'
+
+# ===========================================================================
+step "12bb. an empty allowlist is a FAILURE, not a green box with no egress"
+# ===========================================================================
+#
+# Finding T2. Making the outbound probes advisory left the fatal set with no
+# member that asserts the allowlist permits anything: `allowlist-rule` checks
+# that the CHAIN references the set, which is equally true of a set holding
+# nothing. A rebuild during a partial DNS failure could therefore swap in a set
+# with the GitHub ranges and little else, exit 0, and leave every signal green
+# on a box where no agent can reach the model API.
+#
+# The new check reads what the last rebuild recorded and asks the kernel whether
+# the live set still holds it — local, no network, and it can only fail on
+# affirmative evidence. This empties the set and asserts it says so.
+
+EMPTY_OUT="${TMP_ROOT}/empty-allowlist.out"
+# shellcheck disable=SC2016  # every expansion here is the guest, not this shell.
+run_bounded 300 "$EMPTY_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c '
+set -u
+echo "RECORDED_CRIT=$(sudo awk "/^api.anthropic.com /" /run/agent-box-firewall-resolved | wc -l | tr -d " ")"
+sudo ipset flush allowed-domains
+echo "SET_ENTRIES=$(sudo ipset save allowed-domains | grep -c "^add " || true)"
+sudo /opt/agent-box/guest/init-firewall.sh --verify-only > /tmp/abx-empty-verify.log 2>&1
+echo "VERIFY_RC=$?"
+grep -E "^(PASS|FAIL|WARN)  allowlist-holds" /tmp/abx-empty-verify.log || echo "NO-ALLOWLIST-HOLDS-LINE"
+echo "--- and the box is repaired before anything else runs ---"
+# Egress has to be opened by hand FIRST, and that is a real property rather
+# than a test artefact: an emptied allowlist is self-sealing. The rebuild needs
+# api.github.com for the meta ranges, api.github.com is only reachable through
+# the ipset, and the ipset is what was emptied — so the unit fails, which is
+# what a naive restart measured.
+#
+# And the POLICY is not what refuses it. AGENTBOX-OUT is jumped from OUTPUT
+# rule 1 and ends in REJECT, so the packet is rejected inside the chain and
+# never reaches the policy at all; setting OUTPUT to ACCEPT on its own changed
+# nothing, which the second attempt measured. The chain has to be flushed too.
+# This is exactly what open_network_for_provisioning does, for the same reason.
+sudo iptables -w 5 -P OUTPUT ACCEPT
+sudo iptables -w 5 -F AGENTBOX-OUT
+echo "OPENED=$(curl -sS -m 10 -o /dev/null -w "%{http_code}" https://api.github.com/meta 2>/dev/null || true)"
+sudo systemctl restart agent-box-firewall.service
+echo "REPAIR_RC=$?"
+sudo /opt/agent-box/guest/init-firewall.sh --verify-only > /tmp/abx-repair-verify.log 2>&1
+echo "REVERIFY_RC=$?"
+grep -E "^(PASS|FAIL)  allowlist-holds" /tmp/abx-repair-verify.log || true
+'
+cat "$EMPTY_OUT"
+
+if grep -qE '^RECORDED_CRIT=[1-9]' "$EMPTY_OUT"; then
+    ok "the rebuild recorded what it resolved for api.anthropic.com"
+else
+    bad "no recorded resolution for api.anthropic.com; the new check has nothing to read"
+fi
+if grep -q '^SET_ENTRIES=0' "$EMPTY_OUT"; then
+    ok "the live set was really emptied, so the check below is not vacuous"
+else
+    bad "the live set was not emptied"
+fi
+if grep -q '^VERIFY_RC=0' "$EMPTY_OUT"; then
+    bad "verify passed on a box whose allowlist holds nothing"
+else
+    ok "verify FAILED on a box whose allowlist holds nothing"
+fi
+if grep -q '^FAIL  allowlist-holds' "$EMPTY_OUT"; then
+    ok "and it named the allowlist as the reason"
+else
+    bad "verify failed without naming the allowlist"
+fi
+if grep -qE '^OPENED=[1-5][0-9][0-9]' "$EMPTY_OUT"; then
+    ok "flushing AGENTBOX-OUT and opening the policy really restores egress"
+else
+    bad "egress was not open after the manual recovery, so the rebuild could not have worked"
+fi
+if grep -q '^REPAIR_RC=0' "$EMPTY_OUT"; then
+    ok "opening egress and rebuilding repairs the box"
+else
+    bad "the repair rebuild failed"
+fi
+if grep -q '^REVERIFY_RC=0' "$EMPTY_OUT" && grep -q '^PASS  allowlist-holds' "$EMPTY_OUT"; then
+    ok "and allowlist-holds passes again afterwards"
+else
+    bad "allowlist-holds still fails after the repair"
+fi
+
+# ===========================================================================
+step "12c. the rebuild lock: a second writer waits, times out, and touches nothing"
+# ===========================================================================
+#
+# Finding T7. Every green run so far took the lock uncontended, so the only
+# branch of take_fw_lock that had ever executed was the success path — and the
+# three that decide what happens when two writers meet are the entire reason
+# the lock exists. AGENT_BOX_FW_LOCK and AGENT_BOX_LOCK_WAIT are here for this.
+#
+# A background `flock` on the real lock file stands in for a rebuild in
+# progress. Two claims: a rebuild that cannot get the lock exits 1 and leaves
+# the standing ruleset byte-identical, and the hook proceeds anyway with a WARN,
+# because blocking there would block the daemon starting.
+
+LOCK_OUT="${TMP_ROOT}/lock-contention.out"
+# shellcheck disable=SC2016  # every expansion here is the guest's, not this shell.
+run_bounded 300 "$LOCK_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -c '
+set -u
+LOCK=/run/agent-box-firewall.lock
+BEFORE=$(sudo iptables -w 5 -S AGENTBOX-OUT | md5sum | cut -d" " -f1)
+echo "BEFORE_MD5=$BEFORE"
+
+# Hold it for 25s. The redirection has to happen INSIDE sudo: the lock file is
+# created by the firewall script as root, so the guest user cannot open it for
+# writing and `9>$LOCK` out here would fail before flock ever ran.
+sudo sh -c "exec 9>$LOCK; flock -x 9; sleep 25" &
+HOLDER=$!
+sleep 3
+echo "HOLDER_ALIVE=$(kill -0 $HOLDER 2>/dev/null && echo yes || echo no)"
+
+echo "--- a rebuild, with a 5s patience ---"
+sudo env AGENT_BOX_LOCK_WAIT=5 /opt/agent-box/guest/init-firewall.sh > /tmp/abx-lock-rebuild.log 2>&1
+echo "REBUILD_RC=$?"
+grep -c "has held" /tmp/abx-lock-rebuild.log | sed "s/^/REBUILD_SAW_LOCK_MSG=/"
+
+echo "--- the hook, with a 3s patience ---"
+sudo env AGENT_BOX_LOCK_WAIT_HOOK=3 /opt/agent-box/guest/init-firewall.sh --docker-hook > /tmp/abx-lock-hook.log 2>&1
+echo "HOOK_RC=$?"
+grep -c "proceeding without the rebuild lock" /tmp/abx-lock-hook.log | sed "s/^/HOOK_SAW_WARN=/"
+
+wait $HOLDER 2>/dev/null || true
+AFTER=$(sudo iptables -w 5 -S AGENTBOX-OUT | md5sum | cut -d" " -f1)
+echo "AFTER_MD5=$AFTER"
+echo "--- rebuild log ---"; tail -5 /tmp/abx-lock-rebuild.log
+echo "--- hook log ---";    tail -5 /tmp/abx-lock-hook.log
+'
+cat "$LOCK_OUT"
+
+if grep -q '^HOLDER_ALIVE=yes' "$LOCK_OUT"; then
+    ok "the stand-in writer is holding the lock, so the checks below are not vacuous"
+else
+    bad "the stand-in writer did not hold the lock; the contention checks proved nothing"
+fi
+if grep -q '^REBUILD_RC=1' "$LOCK_OUT"; then
+    ok "a rebuild that cannot take the lock exits 1"
+else
+    bad "a rebuild that cannot take the lock did not exit 1"
+fi
+if grep -q '^REBUILD_SAW_LOCK_MSG=1' "$LOCK_OUT"; then
+    ok "it said why: another rebuild has held the lock"
+else
+    bad "the rebuild did not report the lock as the reason"
+fi
+LOCK_BEFORE=$(sed -n 's/^BEFORE_MD5=//p' "$LOCK_OUT" | head -1)
+LOCK_AFTER=$(sed -n 's/^AFTER_MD5=//p' "$LOCK_OUT" | head -1)
+printf 'AGENTBOX-OUT before=%s after=%s\n' "${LOCK_BEFORE:-?}" "${LOCK_AFTER:-?}"
+if [ -n "$LOCK_BEFORE" ] && [ "$LOCK_BEFORE" = "$LOCK_AFTER" ]; then
+    ok "the refused rebuild left the standing ruleset byte-identical"
+else
+    bad "the standing ruleset changed while a rebuild was refused the lock"
+fi
+if grep -q '^HOOK_RC=0' "$LOCK_OUT"; then
+    ok "the hook still succeeds when it cannot take the lock"
+else
+    bad "the hook failed when it could not take the lock; that would stop docker.service"
+fi
+if grep -q '^HOOK_SAW_WARN=1' "$LOCK_OUT"; then
+    ok "the hook said it was proceeding without the lock"
+else
+    bad "the hook did not warn that it proceeded without the lock"
+fi
 
 # ===========================================================================
 step "12d. a --docker box comes back from a stop/start without deadlocking"

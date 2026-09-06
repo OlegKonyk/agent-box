@@ -56,6 +56,28 @@ GH_META_URL="${AGENT_BOX_GH_META_URL:-https://api.github.com/meta}"
 IPSET_NAME="allowed-domains"
 IPSET_TMP="allowed-domains-new"
 
+# --- what the last rebuild actually resolved ---------------------------------
+#
+# A state file beside the set, one line per allowlisted name, holding the
+# addresses that rebuild put in. It exists so that verify() can ask a question
+# it could not otherwise ask without the network: does the LIVE set still
+# contain what the last rebuild resolved?
+#
+# Finding T2. Making the outbound probes advisory was right, and it left the
+# fatal set with no member that asserts the allowlist permits anything.
+# `allowlist-rule` looks like it covers that and does not: it greps the chain
+# for a rule referencing the set, which is equally true of a set holding
+# nothing. Meanwhile one unresolvable name is a WARN and a `continue`, and
+# `resolved_any` is satisfied by a single name out of nineteen — so a rebuild
+# during a partial DNS failure could swap in a set holding the GitHub ranges
+# and almost nothing else, exit 0, and leave every operator-facing signal green
+# on a box where no agent can reach the model API.
+RESOLVED_STATE="${AGENT_BOX_RESOLVED_STATE:-/run/agent-box-firewall-resolved}"
+# The one name whose absence makes the box useless rather than merely degraded.
+# Its resolution failure is a rebuild failure, and its addresses missing from
+# the live set is a fatal verification failure.
+CRITICAL_NAME="api.anthropic.com"
+
 # The three chains this script owns. Everything it does to the filter table is
 # confined to these plus the policies and the jumps that reach them.
 CHAIN_IN="AGENTBOX-IN"
@@ -83,8 +105,12 @@ DOCKER_USER="DOCKER-USER"
 # `-w` on every iptables call is the cheap one, and it covers the xtables lock
 # even for a writer that predates this file or bypasses it.
 LOCK_FILE="${AGENT_BOX_FW_LOCK:-/run/agent-box-firewall.lock}"
-LOCK_WAIT_REBUILD=120
-LOCK_WAIT_HOOK=30
+# Overridable so the contention branches can be exercised without a two-minute
+# test. Finding T7: until now the only branch of take_fw_lock that had ever run
+# was the success path, and the three that decide what happens when two writers
+# meet were the whole point of the mechanism.
+LOCK_WAIT_REBUILD="${AGENT_BOX_LOCK_WAIT:-120}"
+LOCK_WAIT_HOOK="${AGENT_BOX_LOCK_WAIT_HOOK:-30}"
 IPT_WAIT=5
 
 # Returns 0 if the lock was taken, 1 if it timed out, and 0 if locking is not
@@ -255,6 +281,14 @@ PROBE_IMAGE="alpine:3"
 # answers with an HTTP error, and the difference is the whole point of the
 # check: an answered request means the connection was permitted. Prints
 # "connected", "blocked" or "error: ..." on stdout.
+#
+# `download timed out` is deliberately NOT in the blocked list, which is finding
+# T4. The chain this probe tests ends in REJECT, not DROP, so a container our
+# rules refuse gets an immediate ICMP admin-prohibited and busybox says
+# "can't connect" or "Connection refused". A timeout is the one signature the
+# ruleset under test cannot produce — it means the probe did not reach a verdict
+# — so reading it as proof of blocking would let an absence pass the check that
+# R2 made fatal. It falls through to "error:", which is a WARN.
 container_probe() {
     local url="$1" out rc
     out=$(timeout "$DOCKER_PROBE_TIMEOUT" docker run --rm --network bridge "$PROBE_IMAGE" \
@@ -263,7 +297,7 @@ container_probe() {
         printf 'connected'
     elif printf '%s' "$out" | grep -q 'server returned error'; then
         printf 'connected'
-    elif printf '%s' "$out" | grep -qE "can't connect|bad address|network is unreachable|Connection refused|download timed out|Permission denied"; then
+    elif printf '%s' "$out" | grep -qE "can't connect|bad address|network is unreachable|Connection refused|Permission denied"; then
         printf 'blocked'
     else
         printf 'error: %s' "$(printf '%s' "$out" | tr '\n' ' ')"
@@ -391,6 +425,41 @@ verify() {
         failures=$((failures + 1))
     else
         log "PASS  egress-denied      https://example.com blocked as expected"
+    fi
+
+    # The allowlist PERMITS something, asserted without the network. This is
+    # the fatal counterpart to the advisory probes below, and finding T2: with
+    # those made advisory, nothing fatal was left that could notice a box which
+    # is correctly closed and completely useless.
+    #
+    # It reads what the last rebuild recorded for the one name that matters and
+    # asks the kernel whether the live set still holds it. Both halves are
+    # local. It fails only on affirmative evidence — the set exists, the file
+    # says these addresses were put in it, and they are not there — which is
+    # the same direction-of-failure rule every other fatal check follows.
+    if [ ! -r "$RESOLVED_STATE" ]; then
+        log "FAIL  allowlist-holds    no rebuild has recorded its resolutions at ${RESOLVED_STATE}"
+        failures=$((failures + 1))
+    else
+        local crit_ips crit_missing=0 crit_total=0 ip
+        crit_ips=$(awk -v n="$CRITICAL_NAME" '$1 == n { for (i = 2; i <= NF; i++) print $i }' \
+                       "$RESOLVED_STATE" 2>/dev/null | sort -u)
+        if [ -z "$crit_ips" ]; then
+            log "FAIL  allowlist-holds    the last rebuild recorded no address for ${CRITICAL_NAME}"
+            failures=$((failures + 1))
+        else
+            while read -r ip; do
+                [ -n "$ip" ] || continue
+                crit_total=$((crit_total + 1))
+                ipset test "$IPSET_NAME" "$ip" >/dev/null 2>&1 || crit_missing=$((crit_missing + 1))
+            done < <(printf '%s\n' "$crit_ips")
+            if [ "$crit_missing" -eq 0 ]; then
+                log "PASS  allowlist-holds    the live set holds all ${crit_total} recorded address(es) for ${CRITICAL_NAME}"
+            else
+                log "FAIL  allowlist-holds    ${crit_missing} of ${crit_total} recorded address(es) for ${CRITICAL_NAME} are missing from the live set"
+                failures=$((failures + 1))
+            fi
+        fi
     fi
 
     # The two below are the ones that fail on an absence, so they are advisory.
@@ -538,9 +607,37 @@ fi
 # deliberately does not rebuild anything, because a rebuild needs DNS and
 # api.github.com and must never be on the critical path of starting a daemon.
 
+# Every iptables call the hook makes goes through this, so that the v4/v6 split
+# is applied uniformly instead of at the four sites that happened to be written
+# as `if ! cmd`. That was finding T1: the empty-chain fallback's appends were
+# plain commands in a function called plainly, so under `set -e` a v6 failure
+# exited the whole script before the `fatal` variable was ever consulted — and
+# with the `-` gone from ExecStartPost, systemd stops docker.service on that.
+# The guard existed, was correct, and was unreachable from the branch that
+# needed it most.
+#
+# HOOK_RC accumulates; HOOK_FATAL says which arm we are on. Both are globals
+# because this must be callable from anywhere inside docker_hook without
+# depending on where bash happens to have scoped a local.
+HOOK_RC=0
+HOOK_FATAL=1
+hook_ipt() {
+    if "$@"; then
+        return 0
+    fi
+    if [ "$HOOK_FATAL" -eq 1 ]; then
+        log "ERROR: docker-hook: command failed: $*" >&2
+        HOOK_RC=1
+    else
+        log "WARN: docker-hook: command failed on the v6 arm, which is advisory: $*"
+    fi
+    return 0
+}
+
 docker_hook() {
-    local ipt rc=0 uplink fatal
+    local ipt uplink
     uplink=$(uplink_iface || true)
+    HOOK_RC=0
 
     for ipt in iptables ip6tables; do
         # The v4 arm has to succeed; the v6 arm must never be able to take the
@@ -553,17 +650,20 @@ docker_hook() {
         # then have no Docker at all, explained by one journal line from a
         # firewall script. v6 egress is closed by policy in any case, so a
         # missing v6 DOCKER-USER is a warning, not a failure.
-        fatal=1
-        [ "$ipt" = "iptables" ] || fatal=0
+        HOOK_FATAL=1
+        [ "$ipt" = "iptables" ] || HOOK_FATAL=0
         if ! command -v "$ipt" >/dev/null 2>&1; then
             log "WARN: docker-hook: ${ipt} is not installed; skipping"
             continue
         fi
-        ensure_chain "$ipt" "$CHAIN_FWD" || {
+        if ! chain_exists "$ipt" "$CHAIN_FWD"; then
+            hook_ipt "$ipt" -w "$IPT_WAIT" -N "$CHAIN_FWD"
+        fi
+        if ! chain_exists "$ipt" "$CHAIN_FWD"; then
             log "WARN: docker-hook: could not ensure ${CHAIN_FWD} in ${ipt}"
-            [ "$fatal" -eq 1 ] && rc=1
+            [ "$HOOK_FATAL" -eq 1 ] && HOOK_RC=1
             continue
-        }
+        fi
         # An empty chain would let everything through to DOCKER-FORWARD. If the
         # full rebuild has not run yet, close the chain rather than leave it
         # open, and let the next timer tick fill it in properly.
@@ -575,43 +675,36 @@ docker_hook() {
                 while read -r _r; do
                     [ -n "$_r" ] || continue
                     # shellcheck disable=SC2086  # $_r is a rule body and must word-split.
-                    "$ipt" -w "$IPT_WAIT" -A "$CHAIN_FWD" $_r
+                    hook_ipt "$ipt" -w "$IPT_WAIT" -A "$CHAIN_FWD" $_r
                 done < <(fwd_leading_rules "$uplink")
-                "$ipt" -w "$IPT_WAIT" -A "$CHAIN_FWD" -j REJECT --reject-with icmp-admin-prohibited
+                hook_ipt "$ipt" -w "$IPT_WAIT" -A "$CHAIN_FWD" -j REJECT --reject-with icmp-admin-prohibited
             else
-                "$ipt" -w "$IPT_WAIT" -A "$CHAIN_FWD" -j REJECT --reject-with icmp6-adm-prohibited
+                hook_ipt "$ipt" -w "$IPT_WAIT" -A "$CHAIN_FWD" -j REJECT --reject-with icmp6-adm-prohibited
             fi
         fi
         # v4 failures are real failures: with no `-` on the ExecStartPost, a
         # non-zero return here stops a daemon whose containers this script
         # cannot filter, which is the correct outcome. v6 egress is closed by
         # policy, so its arm stays advisory.
-        if ! "$ipt" -w "$IPT_WAIT" -P FORWARD DROP; then
-            if [ "$fatal" -eq 1 ]; then
-                log "ERROR: docker-hook could not set the ${ipt} FORWARD policy to DROP" >&2
-                rc=1
-            else
-                log "WARN: docker-hook could not set the ${ipt} FORWARD policy to DROP"
-            fi
-        fi
+        hook_ipt "$ipt" -w "$IPT_WAIT" -P FORWARD DROP
         if chain_exists "$ipt" "$DOCKER_USER"; then
             ensure_jump_first "$ipt" "$DOCKER_USER" "$CHAIN_FWD" || true
             if [ "$(first_rule "$ipt" "$DOCKER_USER")" = "-A ${DOCKER_USER} -j ${CHAIN_FWD}" ]; then
                 log "docker-hook: ${ipt} ${DOCKER_USER} rule 1 is the ${CHAIN_FWD} jump"
-            elif [ "$fatal" -eq 1 ]; then
+            elif [ "$HOOK_FATAL" -eq 1 ]; then
                 log "ERROR: docker-hook could not place the ${CHAIN_FWD} jump in ${ipt} ${DOCKER_USER}" >&2
-                rc=1
+                HOOK_RC=1
             else
                 log "WARN: docker-hook could not place the ${CHAIN_FWD} jump in ${ipt} ${DOCKER_USER}"
             fi
-        elif [ "$fatal" -eq 1 ]; then
+        elif [ "$HOOK_FATAL" -eq 1 ]; then
             log "ERROR: docker-hook found no ${DOCKER_USER} chain in ${ipt}" >&2
-            rc=1
+            HOOK_RC=1
         else
             log "WARN: docker-hook found no ${DOCKER_USER} chain in ${ipt} (v6 egress is closed by policy)"
         fi
     done
-    return "$rc"
+    return "$HOOK_RC"
 }
 
 if [ "${1:-}" = "--docker-hook" ]; then
@@ -894,6 +987,11 @@ resolve_ipv4() {
 }
 
 resolved_any=0
+critical_resolved=0
+# Rewritten from scratch by this rebuild, and only moved into place once the
+# swap has happened, so the file can never describe a set that is not live.
+RESOLVED_TMP="${RESOLVED_STATE}.new"
+: > "$RESOLVED_TMP"
 pass=1
 while [ "$pass" -le "$RESOLVE_PASSES" ]; do
     pass_seen=0
@@ -917,6 +1015,10 @@ while [ "$pass" -le "$RESOLVE_PASSES" ]; do
         done < <(printf '%s\n' "$ips")
         pass_seen=$((pass_seen + n))
         resolved_any=1
+        [ "$domain" = "$CRITICAL_NAME" ] && critical_resolved=1
+        # One line per name per pass; verify() unions them. Recorded after the
+        # adds, so a line here means those addresses reached the tmp set.
+        printf '%s %s\n' "$domain" "$(printf '%s' "$ips" | tr '\n' ' ')" >> "$RESOLVED_TMP"
         [ "$pass" -eq 1 ] && log "Added ${n} address(es) for ${domain}"
     done < <(printf '%s\n' "$DOMAINS")
     if [ "$pass" -gt 1 ]; then
@@ -927,12 +1029,21 @@ while [ "$pass" -le "$RESOLVE_PASSES" ]; do
 done
 
 [ "$resolved_any" -eq 1 ] || die_fw "not a single allowlisted name resolved"
+# Not a WARN and a continue. Without this name the box cannot reach the model
+# API, which is the one thing it exists to do, and swapping in a set that omits
+# it would produce a guest that looks healthy and cannot work. die_fw keeps the
+# standing ruleset — the previous set stays live, addresses and all — and exits
+# non-zero, so the unit fails visibly and the next tick retries.
+[ "$critical_resolved" -eq 1 ] \
+    || die_fw "${CRITICAL_NAME} did not resolve; refusing to swap in a set without it"
 log "Address set holds $(ipset save "$IPSET_TMP" | grep -c '^add ' || true) entries after ${RESOLVE_PASSES} pass(es)"
 
 # Atomic from the kernel's point of view: rules referencing the set start
 # matching the new contents on the next packet, with no gap in between.
 ipset swap "$IPSET_TMP" "$IPSET_NAME"
 ipset destroy "$IPSET_TMP"
+# Only now: until the swap, the file would describe a set that is not live.
+mv -f "$RESOLVED_TMP" "$RESOLVED_STATE" 2>/dev/null || true
 log "Address set swapped in"
 
 # ---------------------------------------------------------------------------
@@ -1088,5 +1199,16 @@ ensure_jumps ip6tables
 log "Chain jumps in place"
 
 log "Firewall configuration complete"
+
+# The lock covered the ipset swap and the restore, and both are done. verify()
+# reads the ruleset and sends probes; it mutates nothing and needs no lock.
+# Holding it there was finding T5: two 30-second container probes and two
+# 10-second curls can add a hundred seconds to a hold whose waiters are bounded
+# at 120 and 30 seconds, so the hook's fallback to the unlocked path happened in
+# exactly the window the hook's lock was added for.
+# Braces again, for the reason recorded on take_fw_lock: a bare
+# `exec 9>&- 2>/dev/null` would make the stderr redirection permanent and
+# silence everything verify() has to say below.
+{ exec 9>&-; } 2>/dev/null || true
 trap - ERR
 verify

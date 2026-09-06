@@ -76,6 +76,28 @@ FIREWALL_WAS_STOPPED=0
 # `iptables -F` with no argument empties Docker's chains as well, and Docker
 # puts them back only when the daemon restarts.
 AGENTBOX_CHAINS=(AGENTBOX-IN AGENTBOX-OUT AGENTBOX-FWD)
+# The same constant and the same reasoning as guest/init-firewall.sh. iptables
+# 1.8.x without -w does not queue on a held xtables lock: it prints "Another app
+# is currently holding the xtables lock" and exits non-zero. Every call below
+# used to discard that with `2>/dev/null || true`, in the one function whose job
+# is to close a box that has just failed to provision — while dockerd, restarted
+# moments earlier, is reinstalling its own rules and holding that very lock.
+IPT_WAIT=5
+
+# Run one iptables command, tolerate its failure, and SAY SO. The blanket
+# `2>/dev/null || true` was finding T3's other half: a failure produced no
+# output at all and the summary line asserted the outcome rather than checking
+# it. Returns 0 always; the caller reads FW_CLOSE_ERRORS.
+FW_CLOSE_ERRORS=0
+ipt_try() {
+    local out
+    if out=$("$@" 2>&1); then
+        return 0
+    fi
+    FW_CLOSE_ERRORS=$((FW_CLOSE_ERRORS + 1))
+    log "WARN: firewall command failed: $* :: $(printf '%s' "$out" | tr '\n' ' ')" >&2
+    return 0
+}
 
 open_network_for_provisioning() {
     [ "$FIREWALL_WAS_STOPPED" -eq 0 ] || return 0
@@ -86,11 +108,11 @@ open_network_for_provisioning() {
         local ipt chain
         for ipt in iptables ip6tables; do
             command -v "$ipt" >/dev/null 2>&1 || continue
-            "$ipt" -P INPUT ACCEPT   2>/dev/null || true
-            "$ipt" -P FORWARD ACCEPT 2>/dev/null || true
-            "$ipt" -P OUTPUT ACCEPT  2>/dev/null || true
+            ipt_try "$ipt" -w "$IPT_WAIT" -P INPUT ACCEPT
+            ipt_try "$ipt" -w "$IPT_WAIT" -P FORWARD ACCEPT
+            ipt_try "$ipt" -w "$IPT_WAIT" -P OUTPUT ACCEPT
             for chain in "${AGENTBOX_CHAINS[@]}"; do
-                "$ipt" -F "$chain" 2>/dev/null || true
+                ipt_try "$ipt" -w "$IPT_WAIT" -F "$chain"
             done
         done
         FIREWALL_WAS_STOPPED=1
@@ -119,39 +141,62 @@ close_network_on_exit() {
         gw=$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}') || gw=""
         # Only the three builtin chains, never the whole table. See the comment
         # on AGENTBOX_CHAINS above.
+        FW_CLOSE_ERRORS=0
         for ipt in iptables ip6tables; do
             command -v "$ipt" >/dev/null 2>&1 || continue
-            "$ipt" -P INPUT DROP   2>/dev/null || true
-            "$ipt" -P FORWARD DROP 2>/dev/null || true
-            "$ipt" -P OUTPUT DROP  2>/dev/null || true
-            "$ipt" -F INPUT   2>/dev/null || true
-            "$ipt" -F FORWARD 2>/dev/null || true
-            "$ipt" -F OUTPUT  2>/dev/null || true
+            ipt_try "$ipt" -w "$IPT_WAIT" -P INPUT DROP
+            ipt_try "$ipt" -w "$IPT_WAIT" -P FORWARD DROP
+            ipt_try "$ipt" -w "$IPT_WAIT" -P OUTPUT DROP
+            ipt_try "$ipt" -w "$IPT_WAIT" -F INPUT
+            ipt_try "$ipt" -w "$IPT_WAIT" -F FORWARD
+            ipt_try "$ipt" -w "$IPT_WAIT" -F OUTPUT
             for chain in "${AGENTBOX_CHAINS[@]}"; do
-                "$ipt" -N "$chain" 2>/dev/null || true
-                "$ipt" -F "$chain" 2>/dev/null || true
+                "$ipt" -w "$IPT_WAIT" -N "$chain" 2>/dev/null || true
+                ipt_try "$ipt" -w "$IPT_WAIT" -F "$chain"
             done
-            "$ipt" -A AGENTBOX-IN  -i lo -j ACCEPT 2>/dev/null || true
-            "$ipt" -A AGENTBOX-OUT -o lo -j ACCEPT 2>/dev/null || true
-            "$ipt" -I INPUT  1 -j AGENTBOX-IN  2>/dev/null || true
-            "$ipt" -I OUTPUT 1 -j AGENTBOX-OUT 2>/dev/null || true
-            if "$ipt" -n -L DOCKER-USER >/dev/null 2>&1; then
-                "$ipt" -I DOCKER-USER 1 -j AGENTBOX-FWD 2>/dev/null || true
+            ipt_try "$ipt" -w "$IPT_WAIT" -A AGENTBOX-IN  -i lo -j ACCEPT
+            ipt_try "$ipt" -w "$IPT_WAIT" -A AGENTBOX-OUT -o lo -j ACCEPT
+            ipt_try "$ipt" -w "$IPT_WAIT" -I INPUT  1 -j AGENTBOX-IN
+            ipt_try "$ipt" -w "$IPT_WAIT" -I OUTPUT 1 -j AGENTBOX-OUT
+            if "$ipt" -w "$IPT_WAIT" -n -L DOCKER-USER >/dev/null 2>&1; then
+                ipt_try "$ipt" -w "$IPT_WAIT" -I DOCKER-USER 1 -j AGENTBOX-FWD
             fi
         done
         # Same reasoning as the hard close in init-firewall.sh: egress stays
         # shut, but the operator can still get in to see why. A VM that failed
         # to provision is exactly the one someone needs a shell on.
-        iptables -A AGENTBOX-IN  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-        iptables -A AGENTBOX-OUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+        ipt_try iptables -w "$IPT_WAIT" -A AGENTBOX-IN  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        ipt_try iptables -w "$IPT_WAIT" -A AGENTBOX-OUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        local ssh_rule_placed=0
         if [ -n "$gw" ]; then
-            iptables -A AGENTBOX-IN -s "${gw}/32" -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
+            iptables -w "$IPT_WAIT" -A AGENTBOX-IN -s "${gw}/32" -p tcp --dport 22 -j ACCEPT 2>/dev/null \
+                && ssh_rule_placed=1
         else
-            iptables -A AGENTBOX-IN -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
+            iptables -w "$IPT_WAIT" -A AGENTBOX-IN -p tcp --dport 22 -j ACCEPT 2>/dev/null \
+                && ssh_rule_placed=1
         fi
-        iptables  -A AGENTBOX-FWD -j REJECT --reject-with icmp-admin-prohibited 2>/dev/null || true
-        ip6tables -A AGENTBOX-FWD -j REJECT --reject-with icmp6-adm-prohibited  2>/dev/null || true
-        log "Egress is closed; SSH from the host still works." >&2
+        [ "$ssh_rule_placed" -eq 1 ] || FW_CLOSE_ERRORS=$((FW_CLOSE_ERRORS + 1))
+        ipt_try iptables  -w "$IPT_WAIT" -A AGENTBOX-FWD -j REJECT --reject-with icmp-admin-prohibited
+        ipt_try ip6tables -w "$IPT_WAIT" -A AGENTBOX-FWD -j REJECT --reject-with icmp6-adm-prohibited
+
+        # Read back rather than assert. The old code printed "Egress is closed"
+        # unconditionally, so a hard close that had lost every xtables race
+        # reported the state it exists to produce while leaving the state it
+        # exists to prevent — ACCEPT policies and no rules — on a VM the
+        # operator's next move is to open a shell on.
+        local policies_ok=1
+        for pol in INPUT FORWARD OUTPUT; do
+            iptables -w "$IPT_WAIT" -S 2>/dev/null | grep -qx -- "-P ${pol} DROP" || policies_ok=0
+        done
+        if [ "$policies_ok" -eq 1 ] && [ "$ssh_rule_placed" -eq 1 ]; then
+            log "Egress is closed; SSH from the host still works." >&2
+            [ "$FW_CLOSE_ERRORS" -eq 0 ] \
+                || log "NOTE: ${FW_CLOSE_ERRORS} firewall command(s) failed on the way there; see the WARN lines above." >&2
+        else
+            log "ERROR: egress may be OPEN — the hard close did not complete (${FW_CLOSE_ERRORS} command(s) failed)." >&2
+            log "Recovery: 'sudo systemctl restart ${FIREWALL_UNIT}', and check 'sudo iptables -S' before using this box." >&2
+            log "If this instance runs Docker, add 'sudo systemctl restart docker'." >&2
+        fi
     fi
     exit "$rc"
 }
