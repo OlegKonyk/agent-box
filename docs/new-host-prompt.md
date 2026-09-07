@@ -14,7 +14,9 @@ phase's check has passed and you have shown me its output.
 Start:
 
 ```
+brew install lima gitleaks uv
 git clone https://github.com/OlegKonyk/agent-box ~/dev/agent-box
+ln -sf ~/dev/agent-box/bin/agentbox ~/.local/bin/agentbox
 ```
 
 Then read `~/dev/agent-box/docs/new-host.md` top to bottom before running
@@ -49,6 +51,42 @@ Rules that override everything else:
    of the same failure. Do not work around a refusal. Record where you stopped
    and what you saw.
 6. Every claim comes with the command and its output. Never "it works".
+
+Install the window onto the boxes as well, in phase 3, and use it:
+
+```
+uv tool install git+https://github.com/OlegKonyk/porthole
+porthole
+```
+
+porthole is a terminal window that lists every box with its egress mode, the
+run each one is on, and streams that run's log. It only calls the `agentbox`
+CLI and reads its `--json` output. In it: `j`/`k` or arrows pick a box, the
+right pane follows its newest run, `enter` lists the box's runs, `s` stops the
+selected run after a confirmation, `a` attaches a terminal to its session,
+`r` refreshes, `l` toggles log follow, `?` is help, `q` quits. When I am not at the machine I will use the CLI
+instead, so also tell me these when the first run is going:
+
+```
+agentbox status                                  # one line per box
+agentbox runs ~/dev/<repo>                       # this box's runs, newest first
+agentbox logs ~/dev/<repo> -f                    # follow the newest run
+agentbox stop-run ~/dev/<repo>                   # interrupt it; nothing is reverted
+agentbox ask ~/dev/<repo>                        # the question a waiting run left
+agentbox resume ~/dev/<repo> --answer "..."      # answer it and continue
+agentbox learnings ~/dev/<repo>                  # what the runs wrote down
+agentbox egress-log ~/dev/<repo> --since 24h     # what an observe box reached
+```
+
+After the first green run, turn the observe log into the allowlist and switch
+the box to deny:
+
+```
+agentbox egress-log ~/dev/<repo> --since 24h --as-allowlist
+# show me that output; I decide what goes into ~/.config/agent-box/guest/allowlist.local
+agentbox egress ~/dev/<repo> deny
+agentbox firewall-check ~/dev/<repo>
+```
 
 When the box is up, the token is in, verify-auth passes and the firewall check
 passes, write the first brief from `templates/brief.md`: not the real task yet,
