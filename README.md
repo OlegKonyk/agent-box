@@ -75,7 +75,9 @@ cd ~/dev/agent-box
 
 `create` takes a few minutes the first time, mostly downloading the Ubuntu
 image. Full walkthrough, including what each step actually checks:
-**[docs/first-run.md](docs/first-run.md)**.
+**[docs/first-run.md](docs/first-run.md)**. Setting up a second machine, with
+the human-only steps marked so an agent can drive the rest:
+**[docs/new-host.md](docs/new-host.md)**.
 
 ## Commands
 
@@ -171,6 +173,7 @@ host/preflight.sh       repository scan; reports paths only, never contents
 templates/brief.md      the task brief to copy and fill in
 test/smoke.sh           builds a real VM, checks it, destroys it
 docs/first-run.md       permission, token, daily loop, decommissioning
+docs/new-host.md        bringing a second machine up, phase by phase, agent-drivable
 docs/daily-use.md       the two modes, config carry-over, plugins, the friction
 docs/decisions.md       why it is built this way, and what was rejected
 ```
