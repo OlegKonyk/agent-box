@@ -10,6 +10,14 @@
 #
 # Usage: test/smoke.sh
 #
+# Run it from a terminal, or detach it with a launcher that resets signal
+# dispositions (python's subprocess with preexec_fn, say). A background job of
+# a non-interactive shell (`nohup test/smoke.sh &`) inherits SIGINT as IGNORED,
+# and the `status --watch` interrupt check then waits on a process that cannot
+# receive the signal. Three lines below that start with FAIL are the guest's
+# own firewall report, echoed by steps that break the resolver on purpose and
+# then check the report says so; the RESULT line at the end is the verdict.
+#
 # Exit 0 if every check passed, 1 otherwise.
 #
 # Note on `limactl validate`: it has no --param flag, so validating the bare
