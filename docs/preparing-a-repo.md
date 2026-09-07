@@ -55,7 +55,11 @@ limactl shell agent-box-<repo basename> -- sh -c 'umask 077; cat > ~/app.env' < 
 ```
 
 The brief then tells the agent `set -a; . ~/app.env; set +a` before commands
-that need them. This works with any app whose config reads the process
+that need them. That line is shell, not dotenv: a value with a space or a `#`
+must be quoted (`KEY='123 Main St #4'`), or the shell runs the second word as
+a command and stops exporting there. A `.env` written for `python-dotenv`
+tolerates unquoted spaces; `sh` does not. Quote every value when you write the
+file and the same file serves both. This works with any app whose config reads the process
 environment first and a `.env` file second, which is what `python-dotenv`
 (`load_dotenv` does not override existing variables), `pydantic-settings`,
 and `dotenv` for Node all do by default. If yours only reads a file, point it
