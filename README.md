@@ -186,6 +186,7 @@ templates/brief.md      the task brief to copy and fill in
 test/smoke.sh           builds a real VM, checks it, destroys it
 docs/first-run.md       permission, token, daily loop, decommissioning
 docs/new-host.md        bringing a second machine up, phase by phase, agent-drivable
+docs/new-host-prompt.md the prompt to hand an agent on that machine
 docs/preparing-a-repo.md  what to do to a repository, especially a monorepo, before its first create
 docs/daily-use.md       the two modes, config carry-over, plugins, the friction
 docs/decisions.md       why it is built this way, and what was rejected
