@@ -604,8 +604,9 @@ see the next paragraph.
 
 And **nothing here pulls an image**. `docker system prune -af --volumes` below
 will delete `alpine:3`, and a firewall that re-pulled it every fifteen minutes
-because you tidied your disk would be a bad trade. Run one container of any
-kind, or `docker pull alpine:3` once, and the probes resume.
+because you tidied your disk would be a bad trade. `docker pull alpine:3`
+once and the probes resume; building or running other images does not count,
+because the probe looks for that one tag.
 
 **Rosetta, for amd64 images.** `--rosetta` at create time, and then
 `docker run --platform linux/amd64 …` works on Apple silicon. It needs Rosetta

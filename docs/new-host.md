@@ -5,11 +5,12 @@ and a person only steps in where a keyboard is genuinely required. It assumes
 nothing is installed yet. Read it top to bottom once; then execute phase by
 phase, and do not start a phase until the previous one's check has passed.
 
-The first host this was proven on ran three brief-driven runs to completion
-on a plain box; the Docker and Playwright profile has passed its firewall and
-smoke checks but has **not yet carried an agent run with a token**. The first
-new host will be the first to do both, which is why every phase below ends
-with a check rather than an assumption.
+On the first host this was proven twice: three brief-driven runs on a plain
+box, then one on a Docker and Playwright box that built a compose stack,
+downloaded Chromium, ran a pytest suite and committed a fix, all under
+`--egress deny`. A second host has different device management, proxies and
+networks, which is why every phase below ends with a check rather than an
+assumption.
 
 ---
 
@@ -161,7 +162,7 @@ recipe in phase 9 instead of guessing.
 cat > ~/.config/agent-box/guest/plugins.txt <<'TXT'
 # Marketplaces and plugins installed inside the guest at provisioning time.
 marketplace konyklabs/claude-plugins
-install governor@konyklabs-plugins
+install supervisor@konyklabs-plugins
 install py-testing@konyklabs-plugins
 TXT
 ```
@@ -264,9 +265,16 @@ agentbox firewall-check ~/dev/<repo>
 ```
 
 Every guest line must say `PASS`. The container lines say `SKIP` on a fresh
-box until an image is present locally; they become live after the first run
-pulls one, and you re-run this command then. A container line saying `FAIL`
-means container egress is not filtered: stop.
+box, because the probe uses `alpine:3` and will not pull it from inside the
+firewall unit; a run that builds its own images does not change that. Pull it
+once, then re-run:
+
+```
+limactl shell agent-box-<repo basename> -- docker pull alpine:3
+agentbox firewall-check ~/dev/<repo>
+```
+
+A container line saying `FAIL` means container egress is not filtered: stop.
 
 If `allowlist.local` has values, prove one of them from inside the box before
 trusting a test that depends on it. `agentbox shell ~/dev/<repo>` opens a tmux
@@ -314,8 +322,10 @@ recreate it after the first run if the brief let the agent build one under
 `/work`; the fix is to keep the two apart by path, as the brief above does.
 
 **Check:** a run with state `done`, exit 0, a branch with one commit, and a
-diff a person has read. Then `agentbox firewall-check` once more, now with the
-container probes live.
+diff a person has read. If the Chromium download logged connection retries
+before succeeding, that is the near-zero-TTL CDN address described in
+[daily-use.md](daily-use.md); it recovers on its own, and `firewall-check`
+refreshes the set if it does not.
 
 ## 9. If the repository's reach is unknown: observe first
 
@@ -371,6 +381,5 @@ case run `agentbox token` on each.
 | 5 | `agentbox preflight` | exit 0 |
 | 5 | `agentbox status` | `running`, `fw=deny`, `runs=0` |
 | 7 | `agentbox verify-auth` | `pass` and a reply |
-| 7 | `agentbox firewall-check` | all `PASS`; `SKIP` allowed on container lines |
+| 7 | `agentbox firewall-check` | all `PASS`; container lines `PASS` after `docker pull alpine:3` |
 | 8 | `agentbox runs` | one `done`, exit 0 |
-| 8 | `agentbox firewall-check` | container lines now `PASS` |
