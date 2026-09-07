@@ -170,10 +170,14 @@ cred_paths="${TMP}/cred_paths"
 
 if [ "$is_git" -eq 1 ] && git -C "$REPO" rev-parse --verify HEAD >/dev/null 2>&1; then
     # Tracked files only: an ignored, untracked .env is the intended way to
-    # hold local config and is not a finding on its own.
+    # hold local config and is not a finding on its own. A committed template
+    # (.env.example and its conventional siblings) is documentation of the
+    # shape, not a credential; gitleaks still scans its contents above, so a
+    # template that carries a real value is caught there.
     git -C "$REPO" ls-files -z \
         | tr '\0' '\n' \
         | grep -E '(^|/)(\.env($|\..*)|id_rsa.*|id_dsa.*|id_ecdsa.*|id_ed25519.*)$|\.(pem|p12|pfx|key|jks|keystore)$' \
+        | grep -vE '(^|/)\.env\.(example|sample|template|dist)$' \
         | sed "s#^#${REPO}/#" >> "$cred_paths" 2>/dev/null || true
 fi
 
