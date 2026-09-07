@@ -182,6 +182,87 @@ and shows a desktop notification when it ends. One watcher per run, tracked by
 a pid file under `~/.config/agent-box/watchers/`. The guest has no way to reach
 your desktop and is not given one.
 
+## Self-healing
+
+A run that fails unattended used to stop and wait for a person. Three pieces
+change that, and all three live in the guest, so recovery does not depend on
+anyone being at the host.
+
+**Every brief gets a preamble.** `guest/conventions.md` is prepended to every
+brief before the CLI sees it. It tells the agent three things: when it needs a
+decision only the operator can make, write the question to
+`/work/.agent-box/ask.md` and end the turn; when it had to fix something about
+the environment, or found a defect in the brief or in this box, append an
+entry to `/work/.agent-box/learnings.md`; and never touch the firewall, the
+token or the allowlist. Read the file; it is short and it is the contract.
+
+**Heal on failure: `run --heal N`.**
+
+```
+./bin/agentbox run ~/dev/my-app briefs/task.md --heal 2 --heal-delay 120
+```
+
+When that run ends `failed` (not stopped, not waiting, not exit 3), the guest
+starts a follow-up run on its own. Failed after the CLI ran, that is: a run
+that dies in its preconditions (no token, the firewall unit down, `/work` not a
+repository) is refused before the agent exists, and a follow-up in the same
+box would meet the same refusal, so none is started and the summary says why.
+The follow-up is: same model, same caps, a fresh run id, and
+a new `agent/` branch cut from wherever the failed run left the tree, so its
+commits are kept and nothing is redone. Its brief is `guest/heal-brief.md` rendered with the failed run's
+state, exit code, result, the tail of its console and its last words, followed
+by the **original** brief. It says: diagnose before changing anything, repair
+the environment and write the learning down, do not loop on a brief or
+application defect, then continue from where the previous run stopped. Each
+follow-up has one less attempt; the chain stops at zero and the summary says
+"this needs a person". `--heal-delay` is the wait before each follow-up, so a
+failure with a cooldown behind it is not retried into the same wall.
+
+`runs --json` carries `heal_attempt` and `heal_parent`; `runs` shows the
+follow-ups as ordinary runs, newest first, and `last-run.txt` names the child.
+
+**Ask instead of die: the `waiting` state.** A run that left a question in
+`ask.md` during its own lifetime is recorded as `waiting`, whatever its exit
+code was, unless it was stopped. `runs`, `status` and porthole show it, `run
+--wait` exits 75 for it, and nothing burns while it waits.
+
+```
+./bin/agentbox ask ~/dev/my-app                      # the question, scrubbed
+./bin/agentbox resume ~/dev/my-app --answer "Option B, and keep the test."
+./bin/agentbox resume ~/dev/my-app 20260907-192113 --answer-file answer.md
+```
+
+`resume` starts a new run whose brief is `guest/resume-brief.md`: the question,
+the answer, then the original brief, with the instruction to take the answer
+as decided. The answer goes in on stdin, never as an argument in the guest.
+With no run id it resumes the newest waiting run. A resumed run keeps the
+heal budget the waiting run had.
+
+Answer from anywhere you can run the CLI. From a phone that means a Remote
+Control session on the host, which is a session you already have.
+
+**Learnings.** `agentbox learnings <repo>` prints
+`/work/.agent-box/learnings.md`, scrubbed. The entries have a fixed shape
+(symptom, cause, fix, prevent) and a cause class: `environment`, `brief`,
+`framework` or `application`. `framework` entries are about agent-box itself
+and are the list to work through when improving it. The file lives under
+`/work` on purpose: it is the operator's record, it survives the box, and it
+is excluded from git through `.git/info/exclude` like the rest of
+`.agent-box/`.
+
+**The watchdog, for the failure the guest cannot heal.** A stopped VM, a Mac
+that slept through a run, Lima falling over: the guest cannot recover from
+those because the guest is what went away. `agentbox keepalive <repo> on`
+marks a box, and `agentbox watchdog --install` puts a launchd job on the host
+that runs every five minutes and, for each marked box, starts it if it is
+stopped and asks the guest to heal its newest run if that run is `lost` and
+has heal budget left. It starts no new work and touches no unmarked box. The
+log is `~/.config/agent-box/watchdog.log`.
+
+What the loop does not do, on purpose: it never widens the allowlist, never
+changes the egress mode, never raises a cap, never pushes. A heal that would
+need any of those writes a learning and stops.
+
 ## Egress modes
 
 Every box has one, chosen at create and shown by `agentbox egress`:
@@ -604,8 +685,9 @@ see the next paragraph.
 
 And **nothing here pulls an image**. `docker system prune -af --volumes` below
 will delete `alpine:3`, and a firewall that re-pulled it every fifteen minutes
-because you tidied your disk would be a bad trade. Run one container of any
-kind, or `docker pull alpine:3` once, and the probes resume.
+because you tidied your disk would be a bad trade. `docker pull alpine:3`
+once and the probes resume; building or running other images does not count,
+because the probe looks for that one tag.
 
 **Rosetta, for amd64 images.** `--rosetta` at create time, and then
 `docker run --platform linux/amd64 …` works on Apple silicon. It needs Rosetta

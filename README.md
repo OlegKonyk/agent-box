@@ -75,7 +75,9 @@ cd ~/dev/agent-box
 
 `create` takes a few minutes the first time, mostly downloading the Ubuntu
 image. Full walkthrough, including what each step actually checks:
-**[docs/first-run.md](docs/first-run.md)**.
+**[docs/first-run.md](docs/first-run.md)**. Setting up a second machine, with
+the human-only steps marked so an agent can drive the rest:
+**[docs/new-host.md](docs/new-host.md)**.
 
 ## Commands
 
@@ -96,6 +98,11 @@ One instance per repository, named `agent-box-<repo basename>`.
 | `agentbox sessions <repo> [--json]` | List the VM's tmux sessions, with age and last activity. |
 | `agentbox run <repo> <brief.md> [options]` | Start one headless task from a brief and return at once. Default model `sonnet`. |
 | `agentbox runs <repo> [--json]` | List this VM's runs, newest first, with state, turns and cost. |
+| `agentbox resume <repo> [runid] --answer TEXT \| --answer-file F` | Answer a `waiting` run's question and continue its brief in a new run. |
+| `agentbox ask <repo> [runid]` | Print the question a `waiting` run left. |
+| `agentbox learnings <repo>` | Print what the runs wrote down about what they had to fix and what should change. |
+| `agentbox keepalive <repo> on\|off\|status` | Mark a box for the watchdog: restart it when stopped, heal its newest run when lost. |
+| `agentbox watchdog --install\|--uninstall\|--run` | The launchd job (every 5 minutes) behind `keepalive`. |
 | `agentbox logs <repo> [runid] [-f] [--json]` | Read a run back, formatted and scrubbed inside the guest. |
 | `agentbox stop-run <repo> [runid]` | Interrupt the newest running task, or a named one. Nothing is reverted. |
 | `agentbox plugins <repo> [--update]` | Apply `plugins.txt` inside the VM. |
@@ -107,8 +114,12 @@ One instance per repository, named `agent-box-<repo basename>`.
 | `agentbox egress-log <repo\|name> [--since DUR] [--json] [--as-allowlist]` | What an `observe` box tried to reach, with the names it resolved. `--as-allowlist` emits lines to paste into `allowlist.local`. |
 | `agentbox firewall-check <repo\|name>` | Rebuild the egress allowlist and re-verify it, inside the VM. The container probes are advisory. |
 
-`run` takes `--model M`, `--max-turns N`, `--max-budget-usd X`, `--wait` and
-`--notify`. `resize`, `stop`, `destroy` and `firewall-check` also take a bare
+`run` takes `--model M`, `--max-turns N`, `--max-budget-usd X`, `--wait`,
+`--notify`, and `--heal N [--heal-delay SECS]`: when the run fails, the box
+itself starts up to N follow-up runs, each told what failed and to repair the
+environment before continuing the same brief. How that loop, the `waiting`
+state and the learnings file fit together is in
+[docs/daily-use.md](docs/daily-use.md) under "Self-healing". `resize`, `stop`, `destroy` and `firewall-check` also take a bare
 instance name, so a VM can still be shut down, resized and deleted after its
 repository directory is gone. Every subcommand stops reading options at a
 literal `--`, so a caller that builds a command line rather than typing it can
@@ -160,7 +171,10 @@ guest/lib.sh            the preconditions and token handling the next three shar
 guest/agent-run.sh      one headless task, as the non-root guest user
 guest/claude-session.sh one interactive session, as the non-root guest user
 guest/verify-auth.sh    one small model call, to prove the token works
-guest/run-ctl.sh        start, stop and list the guest's tmux sessions
+guest/run-ctl.sh        start, stop, heal, resume and list the guest's runs
+guest/conventions.md    prepended to every brief: ask, write learnings, hands off the rails
+guest/heal-brief.md     the follow-up brief a failed run starts itself with
+guest/resume-brief.md   the follow-up brief `agentbox resume` builds from the answer
 guest/hook-event.sh     the hook command; one JSON line per hook event
 guest/hooks.settings.json    the hooks block, merged in with --settings
 guest/run-format.py     merge the sensors and print them, scrubbed, in the guest
@@ -171,6 +185,8 @@ host/preflight.sh       repository scan; reports paths only, never contents
 templates/brief.md      the task brief to copy and fill in
 test/smoke.sh           builds a real VM, checks it, destroys it
 docs/first-run.md       permission, token, daily loop, decommissioning
+docs/new-host.md        bringing a second machine up, phase by phase, agent-drivable
+docs/preparing-a-repo.md  what to do to a repository, especially a monorepo, before its first create
 docs/daily-use.md       the two modes, config carry-over, plugins, the friction
 docs/decisions.md       why it is built this way, and what was rejected
 ```

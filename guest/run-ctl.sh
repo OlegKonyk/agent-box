@@ -8,6 +8,12 @@
 # Usage:
 #   run-ctl.sh start --runid R --slug S --brief PATH [--model M]
 #                    [--max-turns N] [--max-budget-usd X]
+#                    [--heal-left N --heal-max M --heal-attempt K --heal-parent R]
+#                    [--heal-delay S] [--origin R] [--resume-of R] [--delay S]
+#   run-ctl.sh heal  --of RUNID [--parent-state failed|lost]
+#   run-ctl.sh resume --of RUNID            (the operator's answer on stdin)
+#   run-ctl.sh ask   [runid]
+#   run-ctl.sh learnings
 #   run-ctl.sh stop  [runid]
 #   run-ctl.sh sessions [--json]
 #   run-ctl.sh state [runid]
@@ -36,6 +42,9 @@ command -v tmux >/dev/null 2>&1 || die "tmux is not installed in this guest"
 
 cmd_start() {
     local runid="" slug="task" model="sonnet" brief="" max_turns="" max_budget=""
+    # The heal and resume lineage. All optional; a plain `agentbox run` sets
+    # none of them and the run is its own origin.
+    local heal_left="" heal_max="" heal_attempt="" heal_parent="" heal_delay="" origin="" resume_of="" delay=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --runid)          runid="${2:?--runid needs a value}"; shift 2 ;;
@@ -44,8 +53,22 @@ cmd_start() {
             --brief)          brief="${2:?--brief needs a value}"; shift 2 ;;
             --max-turns)      max_turns="${2:?--max-turns needs a value}"; shift 2 ;;
             --max-budget-usd) max_budget="${2:?--max-budget-usd needs a value}"; shift 2 ;;
+            --heal-left)      heal_left="${2:?--heal-left needs a value}"; shift 2 ;;
+            --heal-max)       heal_max="${2:?--heal-max needs a value}"; shift 2 ;;
+            --heal-attempt)   heal_attempt="${2:?--heal-attempt needs a value}"; shift 2 ;;
+            --heal-parent)    heal_parent="${2:?--heal-parent needs a value}"; shift 2 ;;
+            --heal-delay)     heal_delay="${2:?--heal-delay needs a value}"; shift 2 ;;
+            --origin)         origin="${2:?--origin needs a value}"; shift 2 ;;
+            --resume-of)      resume_of="${2:?--resume-of needs a value}"; shift 2 ;;
+            --delay)          delay="${2:?--delay needs a value}"; shift 2 ;;
             *) die "unknown argument: $1" ;;
         esac
+    done
+    for _n in "$heal_left" "$heal_max" "$heal_attempt" "$heal_delay" "$delay"; do
+        case "$_n" in ''|*[!0-9]*) [ -z "$_n" ] || die "heal counts and delays are whole numbers, got '${_n}'" ;; esac
+    done
+    for _r in "$heal_parent" "$origin" "$resume_of"; do
+        [ -z "$_r" ] || abx_valid_runid "$_r" || die "not a run id: ${_r}"
     done
 
     [ -n "$runid" ] || die "start needs --runid"
@@ -63,8 +86,16 @@ cmd_start() {
 
     local args=(--runid "$runid" --slug "$slug" --model "$model"
                 --brief "$brief" --session "$session")
-    [ -n "$max_turns" ]  && args+=(--max-turns "$max_turns")
-    [ -n "$max_budget" ] && args+=(--max-budget-usd "$max_budget")
+    [ -n "$max_turns" ]    && args+=(--max-turns "$max_turns")
+    [ -n "$max_budget" ]   && args+=(--max-budget-usd "$max_budget")
+    [ -n "$heal_left" ]    && args+=(--heal-left "$heal_left")
+    [ -n "$heal_max" ]     && args+=(--heal-max "$heal_max")
+    [ -n "$heal_attempt" ] && args+=(--heal-attempt "$heal_attempt")
+    [ -n "$heal_parent" ]  && args+=(--heal-parent "$heal_parent")
+    [ -n "$heal_delay" ]   && args+=(--heal-delay "$heal_delay")
+    [ -n "$origin" ]       && args+=(--origin "$origin")
+    [ -n "$resume_of" ]    && args+=(--resume-of "$resume_of")
+    [ -n "$delay" ]        && args+=(--delay "$delay")
 
     # Detached, so the limactl shell that started it can return immediately.
     # The tmux server outlives that shell, which is the whole point: a run is
@@ -489,7 +520,13 @@ derived_state() {
         # write its status — exactly the case where claiming a clean stop
         # would be a guess.
         exit:3|exit:lost) ;;
-        exit:*) [ ! -e "${dir}/stopped" ] || raw="exit:stopped" ;;
+        exit:*)
+            # A stop outranks a question: an interrupted run that had also
+            # written ask.md was stopped, and saying `waiting` would invite an
+            # answer nobody is going to read.
+            if [ -e "${dir}/stopped" ]; then raw="exit:stopped"
+            elif [ -e "${dir}/waiting" ]; then raw="exit:waiting"
+            fi ;;
     esac
     printf '%s' "$raw"
 }
@@ -525,6 +562,281 @@ cmd_latest() {
 }
 
 # ---------------------------------------------------------------------------
+# heal, resume, ask, learnings
+# ---------------------------------------------------------------------------
+#
+# The self-healing loop lives here, in the guest, because the point of it is a
+# box that recovers with nobody at the host. A failed run with heal budget left
+# starts its own follow-up; a run that stopped to ask records `waiting` and is
+# resumed with the operator's answer; both follow-ups carry the ORIGINAL brief,
+# never a nested heal brief, so the chain cannot grow a prompt.
+
+# A field from a run's meta.json, or empty.
+meta_field() {
+    local dir="${1:?}" key="${2:?}"
+    jq -r --arg k "$key" 'if has($k) and .[$k] != null then (.[$k]|tostring) else empty end' \
+        "${dir}/meta.json" 2>/dev/null | head -1
+}
+
+# A fresh run id that is not the one given: two runs cannot share a second.
+fresh_runid_after() {
+    local avoid="${1:-}" id
+    id=$(date -u +%Y%m%d-%H%M%S)
+    while [ "$id" = "$avoid" ] || [ -d "${ABX_RUNS_DIR}/${id}" ]; do
+        sleep 1
+        id=$(date -u +%Y%m%d-%H%M%S)
+    done
+    printf '%s' "$id"
+}
+
+# The brief every follow-up is built on: the run's own origin's brief, so a
+# heal of a heal still carries the operator's words and not last attempt's
+# preamble. Falls back to the run's own brief when there is no origin.
+origin_brief_of() {
+    local dir="${1:?}" runid="${2:?}" origin f
+    origin=$(meta_field "$dir" origin)
+    [ -n "$origin" ] && abx_valid_runid "$origin" || origin="$runid"
+    f="${ABX_BRIEFS_DIR}/${origin}.md"
+    [ -f "$f" ] || f="${ABX_BRIEFS_DIR}/${runid}.md"
+    [ -f "$f" ] || return 1
+    printf '%s\t%s' "$origin" "$f"
+}
+
+# Substitute {KEY} placeholders in a template with values read from files, so
+# a value containing a slash, an ampersand or a newline cannot break the
+# template. The last placeholder, {BRIEF}, is the whole original brief.
+render_template() {
+    # render_template TEMPLATE OUT KEY=FILE...
+    local tpl="${1:?}" out="${2:?}"; shift 2
+    python3 - "$tpl" "$out" "$@" <<'PYX'
+import sys
+tpl, out = sys.argv[1], sys.argv[2]
+text = open(tpl, encoding="utf-8", errors="replace").read()
+for kv in sys.argv[3:]:
+    key, _, path = kv.partition("=")
+    try:
+        val = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        val = ""
+    text = text.replace("{" + key + "}", val.rstrip("\n"))
+with open(out, "w", encoding="utf-8") as fh:
+    fh.write(text)
+PYX
+}
+
+# Start a follow-up of `parent` from `brief`, inheriting model, caps, origin,
+# delay and the remaining heal budget as given. Prints the child run id.
+start_followup() {
+    # start_followup PARENT_DIR PARENT_RUNID BRIEF_PATH CHILD_RUNID HEAL_LEFT KIND
+    local pdir="${1:?}" parent="${2:?}" brief="${3:?}" child="${4:?}" heal_left="${5:?}" kind="${6:?}"
+    local model slug branch turns budget heal_max attempt origin heal_delay delay=""
+    model=$(meta_field "$pdir" model); [ -n "$model" ] || model="sonnet"
+    slug=$(meta_field "$pdir" slug)
+    if [ -z "$slug" ]; then
+        branch=$(meta_field "$pdir" branch)
+        slug=${branch#agent/}; slug=${slug%-"$parent"}
+    fi
+    [ -n "$slug" ] || slug="task"
+    turns=$(meta_field "$pdir" max_turns)
+    budget=$(meta_field "$pdir" max_budget_usd)
+    heal_max=$(meta_field "$pdir" heal_max)
+    attempt=$(meta_field "$pdir" heal_attempt); [ -n "$attempt" ] || attempt=0
+    origin=$(meta_field "$pdir" origin); [ -n "$origin" ] || origin="$parent"
+    heal_delay=$(meta_field "$pdir" heal_delay)
+
+    local args=(--runid "$child" --slug "$slug" --model "$model" --brief "$brief" --origin "$origin")
+    [ -n "$turns" ]  && args+=(--max-turns "$turns")
+    [ -n "$budget" ] && args+=(--max-budget-usd "$budget")
+    [ -n "$heal_max" ] && args+=(--heal-max "$heal_max")
+    [ -n "$heal_delay" ] && args+=(--heal-delay "$heal_delay")
+    args+=(--heal-left "$heal_left")
+    case "$kind" in
+        heal)
+            args+=(--heal-parent "$parent" --heal-attempt "$((attempt + 1))")
+            [ -z "$heal_delay" ] || args+=(--delay "$heal_delay") ;;
+        resume)
+            args+=(--resume-of "$parent")
+            # A resumed run keeps the attempt count it had, so a heal after a
+            # resume still counts against the same budget.
+            [ "$attempt" -eq 0 ] || args+=(--heal-attempt "$attempt") ;;
+    esac
+    cmd_start "${args[@]}" >/dev/null || return 1
+    printf '%s\n' "$child"
+}
+
+cmd_heal() {
+    local of="" parent_state="" parent_exit="" dir state heal_left child brief origin_line origin obrief
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --of)           of="${2:?--of needs a run id}"; shift 2 ;;
+            --parent-state) parent_state="${2:?--parent-state needs a value}"; shift 2 ;;
+            --parent-exit)  parent_exit="${2:?--parent-exit needs a value}"; shift 2 ;;
+            *) die "unknown argument: $1" ;;
+        esac
+    done
+    [ -n "$of" ] || die "heal needs --of RUNID"
+    dir=$(abx_run_dir "$of")
+    [ -f "${dir}/meta.json" ] || die "no such run: ${of}"
+
+    # The run's own finish() calls this while its status still says running,
+    # and tells us what it is about to record. Anyone else asks the record.
+    if [ -n "$parent_state" ]; then
+        state="$parent_state"
+    else
+        case "$(derived_state "$dir")" in
+            exit:lost) state="lost" ;;
+            exit:3)    state="leak" ;;
+            exit:stopped) state="stopped" ;;
+            exit:waiting) state="waiting" ;;
+            exit:0)    state="done" ;;
+            exit:*)    state="failed" ;;
+            *)         state="running" ;;
+        esac
+    fi
+    case "$state" in
+        failed|lost) ;;
+        *) die "run ${of} is ${state}; only a failed or lost run is healed" ;;
+    esac
+
+    heal_left=$(meta_field "$dir" heal_left)
+    case "$heal_left" in ''|*[!0-9]*) heal_left=0 ;; esac
+    if [ "$heal_left" -le 0 ]; then
+        printf 'run-ctl: %s has no heal budget left; not starting a follow-up\n' "$of" >&2
+        return 2
+    fi
+
+    origin_line=$(origin_brief_of "$dir" "$of") || die "no brief on record for ${of}; cannot heal it"
+    origin=${origin_line%%$'\t'*}; obrief=${origin_line#*$'\t'}
+
+    child=$(fresh_runid_after "$of")
+    brief="${ABX_BRIEFS_DIR}/${child}.md"
+
+    local tmp; tmp=$(mktemp -d -t agent-box-heal.XXXXXX)
+    local attempt heal_max
+    attempt=$(meta_field "$dir" heal_attempt); [ -n "$attempt" ] || attempt=0
+    heal_max=$(meta_field "$dir" heal_max); [ -n "$heal_max" ] || heal_max=$((attempt + heal_left))
+    printf '%s' "$((attempt + 1))"                    > "${tmp}/ATTEMPT"
+    printf '%s' "$heal_max"                           > "${tmp}/MAX"
+    printf '%s' "$of"                                 > "${tmp}/PARENT"
+    printf '%s' "$state"                              > "${tmp}/STATE"
+    # The run's own exit code when it told us (its status file still says
+    # running while its exit path is calling this); the record otherwise.
+    if [ -n "$parent_exit" ]; then printf '%s' "$parent_exit" > "${tmp}/EXIT"
+    else printf '%s' "$(abx_status_read "$dir" | sed 's/^exit://')" > "${tmp}/EXIT"; fi
+    printf '%s' "$(meta_field "$dir" branch)"         > "${tmp}/BRANCH"
+    jq -r 'select(.type=="result") | .subtype // "-"' "${dir}/events.jsonl" 2>/dev/null | tail -1 > "${tmp}/RESULT"
+    [ -s "${tmp}/RESULT" ] || printf -- '-' > "${tmp}/RESULT"
+    # The console tail, stripped of its timestamps and cut to what a diagnosis
+    # needs. Raw, because it stays inside the guest: this text becomes the next
+    # run's prompt and never crosses to the host.
+    tail -n 25 "${dir}/console.log" 2>/dev/null | sed -E 's/^[0-9T:-]+Z //' | cut -c1-400 > "${tmp}/TAIL"
+    [ -s "${tmp}/TAIL" ] || printf '(no console output recorded)' > "${tmp}/TAIL"
+    python3 "${ABX_LIB_DIR}/run-format.py" --last-text "$of" 2>/dev/null | cut -c1-1200 > "${tmp}/LAST_TEXT"
+    [ -s "${tmp}/LAST_TEXT" ] || printf '(none)' > "${tmp}/LAST_TEXT"
+    cp "$obrief" "${tmp}/BRIEF"
+
+    ( umask 077; render_template "${ABX_LIB_DIR}/heal-brief.md" "$brief" \
+        ATTEMPT="${tmp}/ATTEMPT" MAX="${tmp}/MAX" PARENT="${tmp}/PARENT" STATE="${tmp}/STATE" \
+        EXIT="${tmp}/EXIT" BRANCH="${tmp}/BRANCH" RESULT="${tmp}/RESULT" TAIL="${tmp}/TAIL" \
+        LAST_TEXT="${tmp}/LAST_TEXT" BRIEF="${tmp}/BRIEF" )
+    rm -rf "$tmp"
+    chmod 600 "$brief" 2>/dev/null || true
+
+    start_followup "$dir" "$of" "$brief" "$child" "$((heal_left - 1))" heal \
+        || die "could not start the heal run for ${of}"
+}
+
+# The newest run recorded as waiting, or nothing.
+newest_waiting() {
+    local d runid newest=""
+    [ -d "$ABX_RUNS_DIR" ] || return 1
+    for d in "$ABX_RUNS_DIR"/*/; do
+        [ -f "${d}meta.json" ] || continue
+        d=${d%/}
+        runid=${d##*/}
+        abx_valid_runid "$runid" || continue
+        [ "$(derived_state "$d")" = "exit:waiting" ] || continue
+        newest="$runid"
+    done
+    [ -n "$newest" ] || return 1
+    printf '%s\n' "$newest"
+}
+
+cmd_resume() {
+    local of="" dir state child brief origin_line obrief heal_left
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --of) of="${2:?--of needs a run id}"; shift 2 ;;
+            *) die "unknown argument: $1" ;;
+        esac
+    done
+    if [ -z "$of" ]; then
+        of=$(newest_waiting) || die "no run is waiting. 'agentbox runs <repo>' lists what there is."
+        printf 'run-ctl: resuming %s, the newest waiting run\n' "$of" >&2
+    fi
+    dir=$(abx_run_dir "$of")
+    [ -f "${dir}/meta.json" ] || die "no such run: ${of}"
+    state=$(derived_state "$dir")
+    case "$state" in
+        running) die "run ${of} is still running; stop it or wait for it" ;;
+        exit:3)  die "run ${of} tripped the leak check; rotate the token before anything else" ;;
+    esac
+
+    local tmp; tmp=$(mktemp -d -t agent-box-resume.XXXXXX)
+    # The answer arrives on stdin, so it is never an argument and never in a
+    # process listing. Empty is refused: a resume with nothing to say is a
+    # re-run, and `agentbox run` is how you do one of those.
+    cat > "${tmp}/ANSWER"
+    [ -s "${tmp}/ANSWER" ] || { rm -rf "$tmp"; die "the answer is empty; nothing to resume with"; }
+
+    origin_line=$(origin_brief_of "$dir" "$of") || { rm -rf "$tmp"; die "no brief on record for ${of}; cannot resume it"; }
+    obrief=${origin_line#*$'\t'}
+
+    if [ -f "${dir}/ask.md" ]; then
+        cut -c1-4000 "${dir}/ask.md" > "${tmp}/ASK"
+    else
+        printf '(the run did not leave a question; the operator is giving instructions)' > "${tmp}/ASK"
+    fi
+    printf '%s' "$of" > "${tmp}/PARENT"
+    printf '%s' "${state#exit:}" > "${tmp}/STATE"
+    printf '%s' "$(meta_field "$dir" branch)" > "${tmp}/BRANCH"
+    cp "$obrief" "${tmp}/BRIEF"
+
+    child=$(fresh_runid_after "$of")
+    brief="${ABX_BRIEFS_DIR}/${child}.md"
+    ( umask 077; render_template "${ABX_LIB_DIR}/resume-brief.md" "$brief" \
+        PARENT="${tmp}/PARENT" STATE="${tmp}/STATE" BRANCH="${tmp}/BRANCH" \
+        ASK="${tmp}/ASK" ANSWER="${tmp}/ANSWER" BRIEF="${tmp}/BRIEF" )
+    rm -rf "$tmp"
+    chmod 600 "$brief" 2>/dev/null || true
+
+    heal_left=$(meta_field "$dir" heal_left)
+    case "$heal_left" in ''|*[!0-9]*) heal_left=0 ;; esac
+
+    # The question has been answered; a stale ask.md must not mark the next
+    # run as waiting the moment it starts.
+    rm -f "${AGENT_BOX_WORK:-/work}/.agent-box/ask.md" 2>/dev/null || true
+
+    start_followup "$dir" "$of" "$brief" "$child" "$heal_left" resume \
+        || die "could not start the resumed run for ${of}"
+}
+
+# The question a waiting run left, scrubbed on its way out.
+cmd_ask() {
+    local runid="${1:-}"
+    if [ -z "$runid" ]; then
+        runid=$(newest_waiting) || die "no run is waiting."
+    fi
+    abx_valid_runid "$runid" || die "not a run id: ${runid}"
+    exec python3 "${ABX_LIB_DIR}/run-format.py" --ask "$runid"
+}
+
+# What the runs wrote down, scrubbed on its way out.
+cmd_learnings() {
+    exec python3 "${ABX_LIB_DIR}/run-format.py" --learnings
+}
+
+# ---------------------------------------------------------------------------
 
 case "${1:-}" in
     start)    shift; cmd_start "$@" ;;
@@ -534,5 +846,9 @@ case "${1:-}" in
     runs)      shift; cmd_runs "$@" ;;
     reconcile) shift; cmd_reconcile ;;
     latest)    shift; cmd_latest ;;
-    *) die "usage: run-ctl.sh start|stop|sessions|state|runs|reconcile|latest" ;;
+    heal)      shift; cmd_heal "$@" ;;
+    resume)    shift; cmd_resume "$@" ;;
+    ask)       shift; cmd_ask "$@" ;;
+    learnings) shift; cmd_learnings ;;
+    *) die "usage: run-ctl.sh start|stop|sessions|state|runs|reconcile|latest|heal|resume|ask|learnings" ;;
 esac

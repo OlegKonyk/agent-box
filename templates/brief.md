@@ -87,5 +87,12 @@ When to stop and report rather than improvise.
 
 ## Notes
 
+The box prepends its conventions to this brief: how to ask the operator a
+question instead of guessing (`/work/.agent-box/ask.md`, then `agentbox
+resume`), and how to write down what had to be fixed
+(`/work/.agent-box/learnings.md`). Start the run with `--heal N` to let the
+box retry a failure on its own; give `--heal-delay` a value longer than any
+cooldown the tests are subject to.
+
 Nothing in this brief may name a customer, an internal system, or an internal
 hostname. The repository is generic and this file travels with it.

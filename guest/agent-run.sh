@@ -35,6 +35,16 @@ TMUX_SESSION=""
 MAX_TURNS=""
 MAX_BUDGET=""
 INTERRUPTED=0
+# Self-healing lineage. HEAL_LEFT is how many follow-ups this run may still
+# start when it fails; the rest is bookkeeping for the record and the prompt.
+HEAL_LEFT=""
+HEAL_MAX=""
+HEAL_ATTEMPT=""
+HEAL_PARENT=""
+HEAL_DELAY=""
+ORIGIN=""
+RESUME_OF=""
+START_DELAY=""
 
 die() { printf 'agent-run: %s\n' "$*" >&2; exit 1; }
 
@@ -55,6 +65,14 @@ while [ $# -gt 0 ]; do
         --session)        TMUX_SESSION="${2:?--session needs a value}"; shift 2 ;;
         --max-turns)      MAX_TURNS="${2:?--max-turns needs a value}"; shift 2 ;;
         --max-budget-usd) MAX_BUDGET="${2:?--max-budget-usd needs a value}"; shift 2 ;;
+        --heal-left)      HEAL_LEFT="${2:?--heal-left needs a value}"; shift 2 ;;
+        --heal-max)       HEAL_MAX="${2:?--heal-max needs a value}"; shift 2 ;;
+        --heal-attempt)   HEAL_ATTEMPT="${2:?--heal-attempt needs a value}"; shift 2 ;;
+        --heal-parent)    HEAL_PARENT="${2:?--heal-parent needs a value}"; shift 2 ;;
+        --heal-delay)     HEAL_DELAY="${2:?--heal-delay needs a value}"; shift 2 ;;
+        --origin)         ORIGIN="${2:?--origin needs a value}"; shift 2 ;;
+        --resume-of)      RESUME_OF="${2:?--resume-of needs a value}"; shift 2 ;;
+        --delay)          START_DELAY="${2:?--delay needs a value}"; shift 2 ;;
         -h|--help)
             sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
@@ -70,6 +88,11 @@ SLUG=$(printf '%s' "$SLUG" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | s
 # otherwise collide, on the branch name and on the run directory alike.
 [ -n "$RUNID" ] || RUNID=$(date -u +%Y%m%d-%H%M%S)
 BRANCH="agent/${SLUG}-${RUNID}"
+for _n in "$HEAL_LEFT" "$HEAL_MAX" "$HEAL_ATTEMPT" "$HEAL_DELAY" "$START_DELAY"; do
+    case "$_n" in ''|*[!0-9]*) [ -z "$_n" ] || die "heal counts and delays are whole numbers, got '${_n}'" ;; esac
+done
+# A run is its own origin unless it was started as a follow-up of another.
+[ -n "$ORIGIN" ] || ORIGIN="$RUNID"
 
 # ---------------------------------------------------------------------------
 # The run directory, BEFORE anything can refuse
@@ -174,6 +197,7 @@ HOOKS_FILE="${RUN_DIR}/hooks.jsonl"
 CONSOLE_FILE="${RUN_DIR}/console.log"
 RUN_SUMMARY="${RUN_DIR}/summary.txt"
 STARTED_AT=$(abx_now_iso)
+STARTED_EPOCH=$(date +%s)
 : > "$EVENTS_FILE"
 : > "$CONSOLE_FILE"
 : > "$HOOKS_FILE"
@@ -238,6 +262,14 @@ write_meta() {
         --arg version    "$CLAUDE_VERSION" \
         --arg turns      "$MAX_TURNS" \
         --arg budget     "$MAX_BUDGET" \
+        --arg slug       "$SLUG" \
+        --arg origin     "$ORIGIN" \
+        --arg heal_left  "$HEAL_LEFT" \
+        --arg heal_max   "$HEAL_MAX" \
+        --arg heal_attempt "$HEAL_ATTEMPT" \
+        --arg heal_parent  "$HEAL_PARENT" \
+        --arg heal_delay   "$HEAL_DELAY" \
+        --arg resume_of    "$RESUME_OF" \
         '{runid: $runid,
           model: $model,
           branch: (if $branch == "" then null else $branch end),
@@ -246,13 +278,37 @@ write_meta() {
           tmux: (if $tmux == "" then null else $tmux end),
           max_turns: (if $turns == "" then null else ($turns | tonumber?) end),
           max_budget_usd: (if $budget == "" then null else ($budget | tonumber?) end),
-          claude_version: (if $version == "" then null else $version end)}' \
+          claude_version: (if $version == "" then null else $version end),
+          slug: $slug,
+          origin: $origin,
+          heal_left: (if $heal_left == "" then null else ($heal_left | tonumber?) end),
+          heal_max: (if $heal_max == "" then null else ($heal_max | tonumber?) end),
+          heal_attempt: (if $heal_attempt == "" then null else ($heal_attempt | tonumber?) end),
+          heal_parent: (if $heal_parent == "" then null else $heal_parent end),
+          heal_delay: (if $heal_delay == "" then null else ($heal_delay | tonumber?) end),
+          resume_of: (if $resume_of == "" then null else $resume_of end)}' \
         > "$tmp" 2>/dev/null && mv -f "$tmp" "${RUN_DIR}/meta.json"
     chmod 600 "${RUN_DIR}/meta.json" 2>/dev/null || true
 }
 write_meta ""
 
 printf 'agent-run: run %s (%s)\n' "$RUNID" "${TMUX_SESSION:-no tmux session}"
+[ -z "$HEAL_PARENT" ] || printf 'agent-run: heal attempt %s of %s, after run %s\n' "${HEAL_ATTEMPT:-?}" "${HEAL_MAX:-?}" "$HEAL_PARENT"
+[ -z "$RESUME_OF" ]   || printf 'agent-run: resumed from run %s with the operator'"'"'s answer\n' "$RESUME_OF"
+
+# A follow-up waits before it starts, so a failure with a cooldown behind it
+# (a rate limit, a sandbox that refuses repeats) is not retried into the same
+# wall. The wait is part of the run and interruptible: `stop-run` during it
+# ends the run without the CLI ever starting.
+if [ -n "$START_DELAY" ] && [ "$START_DELAY" -gt 0 ]; then
+    printf 'agent-run: waiting %ss before starting\n' "$START_DELAY"
+    _waited=0
+    while [ "$_waited" -lt "$START_DELAY" ]; do
+        [ "$INTERRUPTED" -eq 0 ] && [ ! -e "${RUN_DIR}/stop-requested" ] || break
+        sleep 1
+        _waited=$((_waited + 1))
+    done
+fi
 
 # ---------------------------------------------------------------------------
 # Preconditions. All of them, before anything is changed.
@@ -291,6 +347,17 @@ else
     cat "$BRIEF_SRC" > "$BRIEF_FILE"
 fi
 [ -s "$BRIEF_FILE" ] || die "the brief is empty"
+
+# The box conventions go in front of every brief: how to ask instead of
+# failing, how to write a learning down, what not to touch. They are a file in
+# this directory rather than a string here so they can be read, reviewed and
+# improved as prose.
+CONVENTIONS="${ABX_LIB_DIR}/conventions.md"
+if [ -f "$CONVENTIONS" ]; then
+    _with=$(mktemp -t agent-box-brief.XXXXXX)
+    { sed "s/{RUNID}/${RUNID}/g" "$CONVENTIONS"; cat "$BRIEF_FILE"; } > "$_with"
+    mv -f "$_with" "$BRIEF_FILE"
+fi
 
 # ---------------------------------------------------------------------------
 # Bookkeeping stays out of the work repo's tracked files
@@ -587,6 +654,37 @@ else
     RUN_STATE="failed"
 fi
 
+# Did the run stop to ask? The conventions tell the agent to write its question
+# to /work/.agent-box/ask.md and end its turn. A question written during THIS
+# run (newer than its start) makes the state `waiting`, whatever the exit code
+# said, unless the run was stopped: an interrupted question is not a question
+# anyone is going to answer. The file is copied into the run directory so the
+# record survives the next run overwriting it, and the marker beside the
+# status is what run-ctl.sh and run-format.py read.
+ASK_FILE="${SUMMARY_DIR}/ask.md"
+ASKED=0
+if [ "$RUN_STATE" != "stopped" ] && [ -s "$ASK_FILE" ]; then
+    _ask_mtime=$(stat -c %Y "$ASK_FILE" 2>/dev/null || printf 0)
+    if [ "$_ask_mtime" -ge "$STARTED_EPOCH" ]; then
+        cp -f "$ASK_FILE" "${RUN_DIR}/ask.md" 2>/dev/null && chmod 600 "${RUN_DIR}/ask.md" 2>/dev/null || true
+        printf '%s\n' "$(abx_now_iso)" > "${RUN_DIR}/waiting"
+        chmod 600 "${RUN_DIR}/waiting" 2>/dev/null || true
+        RUN_STATE="waiting"
+        ASKED=1
+        printf 'agent-run: the run left a question in %s; recording it as waiting\n' "$ASK_FILE"
+    fi
+fi
+
+# Learnings written this run, counted for the summary. The file is the agent's
+# and lives under /work, so it is on the host's disk by design: it is the
+# record the operator reads to improve the brief and the box.
+LEARNINGS_FILE="${SUMMARY_DIR}/learnings.md"
+LEARNINGS_NEW=0
+if [ -s "$LEARNINGS_FILE" ]; then
+    LEARNINGS_NEW=$(grep -c "^## ${RUNID} " "$LEARNINGS_FILE" 2>/dev/null || true)
+    case "$LEARNINGS_NEW" in ''|*[!0-9]*) LEARNINGS_NEW=0 ;; esac
+fi
+
 {
     printf 'runid     : %s\n' "$RUNID"
     printf 'branch    : %s\n' "$BRANCH"
@@ -603,6 +701,13 @@ fi
         printf 'note      : interrupted. Nothing was reverted: the work tree is still on\n'
         printf '            %s, with whatever the run had done to it.\n' "$BRANCH"
     fi
+    if [ "$ASKED" -eq 1 ]; then
+        printf 'ask       : the run stopped to ask. Read it with agentbox ask, answer with\n'
+        printf '            agentbox resume <repo> --answer "..."\n'
+    fi
+    [ -z "$HEAL_PARENT" ] || printf 'heal      : attempt %s of %s, after run %s\n' "${HEAL_ATTEMPT:-?}" "${HEAL_MAX:-?}" "$HEAL_PARENT"
+    [ -z "$RESUME_OF" ]   || printf 'resumed   : from run %s\n' "$RESUME_OF"
+    [ "$LEARNINGS_NEW" -eq 0 ] || printf 'learnings : %s new entr%s in .agent-box/learnings.md\n' "$LEARNINGS_NEW" "$([ "$LEARNINGS_NEW" -eq 1 ] && printf y || printf ies)"
     printf '\nThe full event stream stays inside the VM, under ~/.agent-box/runs/%s/.\n' "$RUNID"
 } > "$SUMMARY_FILE"
 cp -f "$SUMMARY_FILE" "$RUN_SUMMARY" 2>/dev/null || true
@@ -654,6 +759,23 @@ fi
 
 if [ "$RUN_STATUS" -ne 0 ]; then
     restore_branch_if_untouched
+fi
+
+# Heal on failure. A failed run with budget left starts its own follow-up from
+# inside the guest, so recovery does not depend on anyone being at the host.
+# Never for a stop (someone chose that), never for a question (someone has to
+# answer it), never after a leak (exit 3 above never reaches here). After the
+# branch restore, so the follow-up sees the tree as this run finally left it.
+if [ "$RUN_STATE" = "failed" ] && [ -n "$HEAL_LEFT" ] && [ "$HEAL_LEFT" -gt 0 ]; then
+    if _child=$("${ABX_LIB_DIR}/run-ctl.sh" heal --of "$RUNID" --parent-state failed --parent-exit "$RUN_STATUS" 2>&1); then
+        printf '\nheal      : this run failed with %s attempt(s) left; started follow-up run %s\n' "$HEAL_LEFT" "$(abx_scrub_token "$_child")"
+        printf 'heal      : follow-up run %s\n' "$_child" >> "$SUMMARY_FILE"
+        cp -f "$SUMMARY_FILE" "$RUN_SUMMARY" 2>/dev/null || true
+    else
+        printf '\nheal      : could not start a follow-up: %s\n' "$(abx_scrub_token "$_child")"
+    fi
+elif [ "$RUN_STATE" = "failed" ] && [ -n "$HEAL_MAX" ]; then
+    printf '\nheal      : no attempts left (%s of %s used); this needs a person\n' "${HEAL_ATTEMPT:-0}" "$HEAL_MAX"
 fi
 
 printf '\nNothing has been pushed. Review the branch on the host, then push it yourself.\n'

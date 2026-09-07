@@ -53,6 +53,13 @@ usage: ${PROG} <command> [args]
                                     attach to a tmux session; runs are read-only
   sessions <repo> [--json]          list the VM's tmux sessions
   run <repo> <brief.md> [options]   start one headless task; returns at once
+  resume <repo> [runid] --answer TEXT | --answer-file F
+                                    answer a waiting run's question and continue it
+  ask <repo> [runid]                print the question a waiting run left
+  learnings <repo>                  print what the runs wrote down to improve
+  keepalive <repo> on|off|status    let the watchdog restart this box and heal lost runs
+  watchdog --install|--uninstall|--run
+                                    the launchd job that keeps kept-alive boxes running
   runs <repo> [--json]              list this VM's runs, newest first
   logs <repo> [runid] [-f] [--json] [--force-unsafe]
                                     read a run back, scrubbed, in the guest
@@ -77,6 +84,10 @@ run options:
   --wait              block until it finishes and print the summary
   --notify            desktop notification when it ends (or notify: true in
                       ${HOST_CONFIG_DIR}/config)
+  --heal N            when the run fails, let the box start up to N follow-up
+                      runs on its own, each told what failed and to repair the
+                      environment before continuing the same brief
+  --heal-delay SECS   wait this long before each follow-up (default 60)
 
 create options — all off by default, all fixed for the life of the instance
 except the sizing, which 'resize' can change:
@@ -241,7 +252,7 @@ check_operands() {
 # `running`, `exit:stopped`, or `exit:` and digits. Nothing else.
 valid_run_state() {
     case "${1:-}" in
-        running|exit:stopped) return 0 ;;
+        running|exit:stopped|exit:waiting) return 0 ;;
         exit:*)
             case "${1#exit:}" in
                 ''|*[!0-9]*) return 1 ;;
@@ -328,17 +339,27 @@ EOF
 # what lets `status` answer for a box that is not running.
 INSTANCE_META_DIR="${HOST_CONFIG_DIR}/instances"
 instance_meta_file() { printf '%s/%s' "$INSTANCE_META_DIR" "${1:?}"; }
-write_instance_egress() {
-    local inst="${1:?}" mode="${2:?}"
+# One `key=value` per line. Writing a key replaces that key's line and leaves
+# the others alone, so `agentbox egress` changing the mode does not forget
+# what `keepalive` or `create` recorded.
+write_instance_meta() {
+    local inst="${1:?}" key="${2:?}" value="${3:?}" f tmp
     mkdir -p "$INSTANCE_META_DIR" 2>/dev/null || return 0
-    printf 'egress=%s\n' "$mode" > "$(instance_meta_file "$inst")" 2>/dev/null || true
+    f=$(instance_meta_file "$inst")
+    tmp="${f}.tmp.$$"
+    { { [ -r "$f" ] && grep -v "^${key}=" "$f"; } || true; printf '%s=%s\n' "$key" "$value"; } > "$tmp" 2>/dev/null \
+        && mv -f "$tmp" "$f" 2>/dev/null || { rm -f "$tmp"; true; }
 }
-read_instance_egress() {
+# A word value: letters only, the way the egress mode and keepalive read. A
+# path (the repo) is read raw where it is needed, not through this.
+read_instance_meta() {
     local f
     f=$(instance_meta_file "${1:?}")
     [ -r "$f" ] || return 1
-    sed -n 's/^egress=\([a-z]*\)$/\1/p' "$f" | tail -1
+    sed -n "s/^${2:?}=\([a-z]*\)\$/\1/p" "$f" | tail -1
 }
+write_instance_egress() { write_instance_meta "${1:?}" egress "${2:?}"; }
+read_instance_egress()  { read_instance_meta  "${1:?}" egress; }
 
 # `notify: true` in the host config file, or nothing.
 config_notify_default() {
@@ -657,6 +678,7 @@ cmd_create() {
 
     "$LIMACTL" create --tty=false "${create_args[@]}" "$LIMA_TEMPLATE"
     write_instance_egress "$inst" "$egress"
+    write_instance_meta "$inst" repo "$repo"
 
     # After create, not before: on a machine that has never run Lima, ~/.lima
     # does not exist yet and the exclusion would fail for no reason.
@@ -962,8 +984,8 @@ cmd_update() {
 # the smoke test and any script wrapping this one need an exit status.
 cmd_run() {
     local repo brief inst slug runid model="sonnet"
-    local max_turns="" max_budget="" wait_for_it=0 notify=0
-    split_args "--model --max-turns --max-budget-usd" "$@"
+    local max_turns="" max_budget="" wait_for_it=0 notify=0 heal="" heal_delay=""
+    split_args "--model --max-turns --max-budget-usd --heal --heal-delay" "$@"
     check_operands 2 2 "run <repo> <brief.md> [options]"
     set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
     while [ $# -gt 0 ]; do
@@ -973,9 +995,15 @@ cmd_run() {
             --max-budget-usd) max_budget="$2"; shift 2 ;;
             --wait)           wait_for_it=1; shift ;;
             --notify)         notify=1; shift ;;
+            --heal)           heal="$2"; shift 2 ;;
+            --heal-delay)     heal_delay="$2"; shift 2 ;;
             *) die "unknown option: $1" ;;
         esac
     done
+    [ -z "$heal" ]       || case "$heal"       in ''|*[!0-9]*) die "--heal takes a whole number of attempts" ;; esac
+    [ -z "$heal_delay" ] || case "$heal_delay" in ''|*[!0-9]*) die "--heal-delay takes a whole number of seconds" ;; esac
+    [ -z "$heal_delay" ] || [ -n "$heal" ] || die "--heal-delay needs --heal"
+    if [ -n "$heal" ] && [ -z "$heal_delay" ]; then heal_delay=60; fi
     valid_plain_name "$model" || die "not a model name: ${model}"
     [ -z "$max_turns" ]  || case "$max_turns"  in ''|*[!0-9]*) die "--max-turns takes a whole number" ;; esac
     [ -z "$max_budget" ] || case "$max_budget" in ''|*[!0-9.]*) die "--max-budget-usd takes a number" ;; esac
@@ -1014,12 +1042,16 @@ cmd_run() {
                       --brief "${runid}.md")
     [ -n "$max_turns" ]  && start_args+=(--max-turns "$max_turns")
     [ -n "$max_budget" ] && start_args+=(--max-budget-usd "$max_budget")
+    if [ -n "$heal" ] && [ "$heal" -gt 0 ]; then
+        start_args+=(--heal-left "$heal" --heal-max "$heal" --heal-delay "$heal_delay")
+    fi
 
     guest_shell "$inst" "${GUEST_BIN}/run-ctl.sh" "${start_args[@]}" >/dev/null \
         || die "could not start the run in ${inst}"
 
     announce_egress_mode "$inst"
     info "run ${runid} started in ${inst} on model ${model}"
+    [ -z "$heal" ] || [ "$heal" -eq 0 ] || info "heal: up to ${heal} follow-up run(s) if it fails, ${heal_delay}s apart"
 
     if [ "$notify" -eq 1 ]; then
         start_run_watcher "$inst" "$runid" "$repo"
@@ -1060,6 +1092,15 @@ wait_for_run() {
         exit:lost)
             info "run ${runid} is lost: it stopped without recording an exit"
             return 1 ;;
+        exit:waiting)
+            info "run ${runid} stopped to ask a question"
+            printf -- '--- summary ---\n'
+            guest_shell "$inst" python3 "${GUEST_BIN}/run-format.py" --summary "$runid" || true
+            printf -- '--- question ---\n'
+            guest_shell "$inst" python3 "${GUEST_BIN}/run-format.py" --ask "$runid" || true
+            printf -- 'Answer with: %s resume %s --answer "..."\n' "$PROG" "$repo"
+            # EX_TEMPFAIL: not a failure, not done either.
+            return 75 ;;
         exit:*)
             code="${state#exit:}"
             # The summary is read and scrubbed inside the guest, not catted off
@@ -1080,6 +1121,81 @@ wait_for_run() {
             esac ;;
         *) info "run ${runid} is ${state}"; return 0 ;;
     esac
+}
+
+# Answer a waiting run and continue it. The answer goes in on stdin, never as
+# an argument to anything in the guest, and the guest builds the follow-up brief
+# from the ORIGINAL brief, the question and the answer.
+cmd_resume() {
+    local repo inst runid="" answer="" answer_file="" child
+    split_args "--answer --answer-file" "$@"
+    check_operands 1 2 "resume <repo> [runid] --answer TEXT | --answer-file FILE"
+    set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --answer)      answer="$2"; shift 2 ;;
+            --answer-file) answer_file="$2"; shift 2 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    repo=$(abs_repo "${ABX_POSV[0]}")
+    [ "${#ABX_POSV[@]}" -lt 2 ] || { runid="${ABX_POSV[1]}"; valid_runid "$runid" || die "not a run id: ${runid}"; }
+    [ -n "$answer" ] || [ -n "$answer_file" ] || die "resume needs --answer TEXT or --answer-file FILE"
+    [ -z "$answer" ] || [ -z "$answer_file" ] || die "give --answer or --answer-file, not both"
+    if [ -n "$answer_file" ]; then
+        answer_file=$(abs_file "$answer_file")
+        [ -f "$answer_file" ] || die "not a file: ${answer_file}"
+    fi
+    inst=$(instance_name "$repo")
+    require_limactl
+    require_instance "$inst"
+    require_running "$inst"
+    sync_guest_config "$inst"
+
+    # Not guest_shell: that helper closes stdin on purpose, and the answer is
+    # the one thing here that has to travel on it.
+    local -a of=()
+    [ -z "$runid" ] || of=(--of "$runid")
+    if [ -n "$answer_file" ]; then
+        child=$("$LIMACTL" shell --workdir /work "$inst" -- "${GUEST_BIN}/run-ctl.sh" resume ${of[@]+"${of[@]}"} < "$answer_file") || die "could not resume in ${inst}"
+    else
+        child=$(printf '%s\n' "$answer" | "$LIMACTL" shell --workdir /work "$inst" -- "${GUEST_BIN}/run-ctl.sh" resume ${of[@]+"${of[@]}"}) || die "could not resume in ${inst}"
+    fi
+    child=$(printf '%s' "$child" | tr -d '\r' | tail -1)
+    valid_runid "$child" || die "the guest did not return a run id for the resumed run"
+    announce_egress_mode "$inst"
+    info "resumed as run ${child} in ${inst}"
+    cat <<EOF
+
+Follow it with:
+  ${PROG} logs ${repo} -f
+  ${PROG} runs ${repo}
+EOF
+}
+
+cmd_ask() {
+    local repo inst runid=""
+    split_args "" "$@"
+    check_operands 1 2 "ask <repo> [runid]"
+    repo=$(abs_repo "${ABX_POSV[0]}")
+    [ "${#ABX_POSV[@]}" -lt 2 ] || { runid="${ABX_POSV[1]}"; valid_runid "$runid" || die "not a run id: ${runid}"; }
+    inst=$(instance_name "$repo")
+    require_limactl
+    require_instance "$inst"
+    require_running "$inst"
+    guest_shell "$inst" "${GUEST_BIN}/run-ctl.sh" ask ${runid:+"$runid"}
+}
+
+cmd_learnings() {
+    local repo inst
+    split_args "" "$@"
+    check_operands 1 1 "learnings <repo>"
+    repo=$(abs_repo "${ABX_POSV[0]}")
+    inst=$(instance_name "$repo")
+    require_limactl
+    require_instance "$inst"
+    require_running "$inst"
+    guest_shell "$inst" "${GUEST_BIN}/run-ctl.sh" learnings
 }
 
 cmd_runs() {
@@ -1312,6 +1428,136 @@ list_boxes() {
 # The one bespoke parser: `--watch` takes an OPTIONAL count, so its value
 # cannot be declared to split_args without swallowing the box name in
 # `status --watch <repo>`.
+# ---------------------------------------------------------------------------
+# keepalive and the watchdog
+# ---------------------------------------------------------------------------
+#
+# The one failure the guest cannot heal from inside is the guest itself going
+# away: the VM stopped, the Mac slept through a run, Lima fell over. A launchd
+# job on the host runs `agentbox watchdog --run` every five minutes; for every
+# box marked keepalive it starts the box if it is stopped and, if the newest
+# run is `lost` with heal budget left, asks the guest to heal it. Nothing else:
+# the watchdog never starts new work and never touches a box not marked.
+
+cmd_keepalive() {
+    local repo inst mode
+    split_args "" "$@"
+    check_operands 2 2 "keepalive <repo> on|off|status"
+    repo=$(abs_repo "${ABX_POSV[0]}")
+    inst=$(instance_name "$repo")
+    mode="${ABX_POSV[1]}"
+    require_instance "$inst"
+    case "$mode" in
+        on)
+            write_instance_meta "$inst" keepalive on
+            write_instance_meta "$inst" repo "$repo"
+            info "${inst}: keepalive on. The watchdog will start it when stopped and heal a lost run."
+            [ -f "$WATCHDOG_PLIST" ] || info "the watchdog is not installed; run '${PROG} watchdog --install'" ;;
+        off)
+            write_instance_meta "$inst" keepalive off
+            info "${inst}: keepalive off" ;;
+        status)
+            printf '%s: keepalive %s\n' "$inst" "$(read_instance_meta "$inst" keepalive 2>/dev/null || printf off)" ;;
+        *) die "keepalive takes on, off or status" ;;
+    esac
+}
+
+WATCHDOG_LABEL="com.agent-box.watchdog"
+WATCHDOG_PLIST="${HOME}/Library/LaunchAgents/${WATCHDOG_LABEL}.plist"
+WATCHDOG_LOG="${HOST_CONFIG_DIR}/watchdog.log"
+
+watchdog_log() {
+    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$WATCHDOG_LOG" >&2
+}
+
+watchdog_run() {
+    local f inst keep repo status runid state heal_left out
+    [ -d "$INSTANCE_META_DIR" ] || return 0
+    for f in "$INSTANCE_META_DIR"/*; do
+        [ -f "$f" ] || continue
+        inst=$(basename "$f")
+        keep=$(read_instance_meta "$inst" keepalive 2>/dev/null || true)
+        [ "$keep" = "on" ] || continue
+        # A path, not a token: read raw rather than through the [a-z] reader.
+        repo=$(sed -n 's/^repo=//p' "$f" | tail -1)
+        if [ -z "$repo" ] || [ ! -d "$repo" ]; then
+            watchdog_log "${inst}: keepalive is on but no repository is recorded; run '${PROG} keepalive <repo> on' once to record it"
+            continue
+        fi
+        instance_exists "$inst" || { watchdog_log "${inst}: no such instance any more; turning keepalive off"; write_instance_meta "$inst" keepalive off; continue; }
+        status=$("$LIMACTL" list --format '{{.Status}}' "$inst" 2>/dev/null | head -1)
+        if [ "$status" != "Running" ]; then
+            watchdog_log "${inst}: is ${status:-unknown}; starting it"
+            if out=$(cmd_start "$repo" 2>&1); then
+                watchdog_log "${inst}: started"
+            else
+                watchdog_log "${inst}: start failed: $(printf '%s' "$out" | tail -3 | tr '\n' ' ')"
+                continue
+            fi
+        fi
+        # Reconcile, then look at the newest run only: a lost run older than
+        # the newest one was already superseded by whatever came after it.
+        guest_shell "$inst" "${GUEST_BIN}/run-ctl.sh" reconcile >/dev/null 2>&1 || true
+        runid=$(guest_shell "$inst" "${GUEST_BIN}/run-ctl.sh" latest 2>/dev/null | tr -d '\r\n')
+        valid_runid "$runid" || continue
+        state=$(read_run_state "$inst" "$runid")
+        [ "$state" = "exit:lost" ] || continue
+        if out=$(guest_shell "$inst" "${GUEST_BIN}/run-ctl.sh" heal --of "$runid" 2>&1); then
+            watchdog_log "${inst}: run ${runid} was lost; started heal run $(printf '%s' "$out" | tr -d '\r' | tail -1)"
+        else
+            watchdog_log "${inst}: run ${runid} was lost and was not healed: $(printf '%s' "$out" | tr -d '\r' | tail -1)"
+        fi
+    done
+}
+
+cmd_watchdog() {
+    local action="--run"
+    split_args "" "$@"
+    check_operands 0 0 "watchdog --install|--uninstall|--run"
+    set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
+    [ $# -eq 0 ] || action="$1"
+    case "$action" in
+        --run)
+            require_limactl
+            mkdir -p "$HOST_CONFIG_DIR"
+            watchdog_run ;;
+        --install)
+            mkdir -p "$(dirname "$WATCHDOG_PLIST")" "$HOST_CONFIG_DIR"
+            cat > "$WATCHDOG_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${WATCHDOG_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${SELF}</string>
+    <string>watchdog</string>
+    <string>--run</string>
+  </array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>${WATCHDOG_LOG}</string>
+  <key>StandardErrorPath</key><string>${WATCHDOG_LOG}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>
+EOF
+            launchctl bootout "gui/$(id -u)" "$WATCHDOG_PLIST" >/dev/null 2>&1 || true
+            launchctl bootstrap "gui/$(id -u)" "$WATCHDOG_PLIST" || die "launchctl could not load ${WATCHDOG_PLIST}"
+            info "watchdog installed: ${WATCHDOG_PLIST}, every 300s, log ${WATCHDOG_LOG}"
+            info "it acts only on boxes with '${PROG} keepalive <repo> on'" ;;
+        --uninstall)
+            launchctl bootout "gui/$(id -u)" "$WATCHDOG_PLIST" >/dev/null 2>&1 || true
+            rm -f "$WATCHDOG_PLIST"
+            info "watchdog removed" ;;
+        *) die "watchdog takes --install, --uninstall or --run" ;;
+    esac
+}
+
 cmd_status() {
     local as_json=0 watch_secs="" only="" literal=0
     while [ $# -gt 0 ]; do
@@ -1739,6 +1985,11 @@ case "${1:-}" in
     attach)         shift; cmd_attach "$@" ;;
     sessions)       shift; cmd_sessions "$@" ;;
     run)            shift; cmd_run "$@" ;;
+    resume)         shift; cmd_resume "$@" ;;
+    ask)            shift; cmd_ask "$@" ;;
+    learnings)      shift; cmd_learnings "$@" ;;
+    keepalive)      shift; cmd_keepalive "$@" ;;
+    watchdog)       shift; cmd_watchdog "$@" ;;
     runs)           shift; cmd_runs "$@" ;;
     logs)           shift; cmd_logs "$@" ;;
     stop-run)       shift; cmd_stop_run "$@" ;;

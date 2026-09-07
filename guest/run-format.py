@@ -342,12 +342,25 @@ class Run:
         """
         return os.path.exists(os.path.join(self.dir, "stopped"))
 
+    @property
+    def is_waiting(self):
+        """Did the run stop to ask the operator something?
+
+        A marker beside the status, like `stopped`, for the same reason: the
+        status keeps the exit code. agent-run.sh writes it when the run left a
+        question in /work/.agent-box/ask.md during its own lifetime, and copies
+        the question to ask.md in the run directory.
+        """
+        return os.path.exists(os.path.join(self.dir, "waiting"))
+
     # running  the process is alive and the run is going
     # done     it ended on its own with exit 0
     # failed   it ended on its own with a non-zero exit
     # stopped  `agentbox stop-run` interrupted it and it ended
     # lost     it said running, and neither its tmux session nor its recorded
     #          pid was there; what happened to it is not known
+    # waiting  it ended after writing a question for the operator; `agentbox
+    #          resume` answers it. A stop outranks a question.
     # unknown  there is no status file to read
     @property
     def state(self):
@@ -366,6 +379,8 @@ class Run:
         if status.startswith("exit:"):
             if self.was_stopped:
                 return "stopped"
+            if self.is_waiting:
+                return "waiting"
             return "done" if status == "exit:0" else "failed"
         return "unknown"
 
@@ -657,6 +672,9 @@ class Run:
             "turns": result.get("num_turns"),
             "cost_usd": result.get("total_cost_usd"),
             "files_changed": self.files_changed,
+            "heal_attempt": meta.get("heal_attempt"),
+            "heal_parent": meta.get("heal_parent"),
+            "resume_of": meta.get("resume_of"),
         }
 
     def tail_summary(self):
@@ -860,6 +878,59 @@ def cmd_summary(args):
     return 0
 
 
+def _run_or_complain(args):
+    runid = args.runid or newest_runid()
+    if not runid:
+        print("no runs yet", file=sys.stderr)
+        return None
+    run = Run(runid)
+    if not os.path.isdir(run.dir):
+        print("no such run: %s" % runid, file=sys.stderr)
+        return None
+    return run
+
+
+def cmd_ask(args):
+    """The question a waiting run left, scrubbed. The agent wrote it."""
+    run = _run_or_complain(args)
+    if run is None:
+        return 1
+    if run.status == "exit:3" and not args.force_unsafe:
+        print(LEAK_BANNER % run.runid, file=sys.stderr, flush=True)
+        return 0
+    text = read_text(os.path.join(run.dir, "ask.md"))
+    if not text.strip():
+        print("run %s left no question (state: %s)" % (run.runid, run.state), file=sys.stderr)
+        return 1
+    for line in text.splitlines():
+        print(scrub(line))
+    return 0
+
+
+def cmd_last_text(args):
+    """The last assistant line of a run, scrubbed: what it said before it ended."""
+    run = _run_or_complain(args)
+    if run is None:
+        return 1
+    _, last_text = run.tail_summary()
+    if last_text:
+        print(scrub(last_text))
+    return 0
+
+
+def cmd_learnings(args):
+    """/work/.agent-box/learnings.md, scrubbed. Written by the runs, read by people."""
+    work = os.environ.get("AGENT_BOX_WORK", "/work")
+    path = os.path.join(work, ".agent-box", "learnings.md")
+    text = read_text(path)
+    if not text.strip():
+        print("no learnings recorded yet (%s)" % path, file=sys.stderr)
+        return 1
+    for line in text.splitlines():
+        print(scrub(line))
+    return 0
+
+
 # --- sessions --------------------------------------------------------------
 #
 # run-ctl.sh gathers them from tmux and builds the array with jq, so what
@@ -1046,6 +1117,9 @@ def main(argv=None):
     parser.add_argument("--json", action="store_true", help="one JSON object per line")
     parser.add_argument("--list", action="store_true", help="list runs instead")
     parser.add_argument("--summary", action="store_true", help="print summary.txt, scrubbed")
+    parser.add_argument("--ask", action="store_true", help="print the question a waiting run left, scrubbed")
+    parser.add_argument("--last-text", action="store_true", help="print the run's last assistant line, scrubbed")
+    parser.add_argument("--learnings", action="store_true", help="print /work/.agent-box/learnings.md, scrubbed")
     parser.add_argument("--sessions-in", action="store_true", help="format a session list from stdin")
     parser.add_argument(
         "--force-unsafe",
@@ -1077,6 +1151,12 @@ def main(argv=None):
         return cmd_list(args)
     if args.summary:
         return cmd_summary(args)
+    if args.ask:
+        return cmd_ask(args)
+    if args.last_text:
+        return cmd_last_text(args)
+    if args.learnings:
+        return cmd_learnings(args)
     return cmd_logs(args)
 
 

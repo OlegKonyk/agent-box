@@ -10,6 +10,14 @@
 #
 # Usage: test/smoke.sh
 #
+# Run it from a terminal, or detach it with a launcher that resets signal
+# dispositions (python's subprocess with preexec_fn, say). A background job of
+# a non-interactive shell (`nohup test/smoke.sh &`) inherits SIGINT as IGNORED,
+# and the `status --watch` interrupt check then waits on a process that cannot
+# receive the signal. Three lines below that start with FAIL are the guest's
+# own firewall report, echoed by steps that break the resolver on purpose and
+# then check the report says so; the RESULT line at the end is the verdict.
+#
 # Exit 0 if every check passed, 1 otherwise.
 #
 # Note on `limactl validate`: it has no --param flag, so validating the bare
@@ -1317,6 +1325,114 @@ else
 fi
 
 # ===========================================================================
+step "8a2. heal: a failed run with budget starts its own follow-up, and the chain ends"
+# ===========================================================================
+#
+# The fake token from 8d is still in place, so the run reaches the CLI and fails
+# there — a failure of the agent's work, which is what heal is for. A run that
+# dies in its preconditions is deliberately NOT healed (see docs/daily-use.md).
+# This proves the mechanism and its bound: one follow-up, told what failed,
+# itself failing at the same auth, and no third.
+
+HEAL_OUT="${TMP_ROOT}/heal.out"
+run_bounded 90 "$HEAL_OUT" "$AGENTBOX" run "$CLEAN_REPO" "${TMP_ROOT}/noop-brief.md" --heal 1 --heal-delay 1
+cat "$HEAL_OUT"
+HEAL_RUNID=$(sed -n 's/^agentbox: run \([0-9-]*\) started.*/\1/p' "$HEAL_OUT" | head -1)
+if grep -q 'heal: up to 1 follow-up' "$HEAL_OUT"; then ok "run announced the heal budget"; else bad "run did not announce the heal budget"; fi
+
+HEAL_CHILD=""
+for _attempt in $(seq 1 30); do
+    HEAL_CHILD=$(guest bash -c "grep -l '\"heal_parent\": \"${HEAL_RUNID}\"' \$HOME/.agent-box/runs/*/meta.json 2>/dev/null | head -1 | xargs -r dirname | xargs -r basename" 2>/dev/null | tr -d '\r\n')
+    [ -n "$HEAL_CHILD" ] && break
+    sleep 2
+done
+printf 'heal child: %s\n' "${HEAL_CHILD:-<none>}"
+if [ -n "$HEAL_CHILD" ] && [ "$HEAL_CHILD" != "$HEAL_RUNID" ]; then ok "the failed run started a follow-up"; else bad "no follow-up run was started"; fi
+
+if [ -n "$HEAL_CHILD" ]; then
+    CHILD_STATE=""
+    for _attempt in $(seq 1 30); do
+        CHILD_STATE=$(guest /opt/agent-box/guest/run-ctl.sh state "$HEAL_CHILD" 2>/dev/null | tr -d '\r\n')
+        case "$CHILD_STATE" in running|"") sleep 2 ;; *) break ;; esac
+    done
+    printf 'child state: %s\n' "$CHILD_STATE"
+    case "$CHILD_STATE" in
+        exit:0) bad "the tokenless follow-up recorded exit:0" ;;
+        exit:[0-9]*) ok "the follow-up ended with a non-zero exit" ;;
+        *) bad "the follow-up never ended (${CHILD_STATE})" ;;
+    esac
+    CHILD_LEFT=$(guest bash -c "jq -r '.heal_left' \$HOME/.agent-box/runs/${HEAL_CHILD}/meta.json" 2>/dev/null | tr -d '\r\n')
+    if [ "$CHILD_LEFT" = "0" ]; then ok "the follow-up has no heal budget left"; else bad "the follow-up's heal_left is '${CHILD_LEFT}', expected 0"; fi
+    GRAND=$(guest bash -c "grep -l '\"heal_parent\": \"${HEAL_CHILD}\"' \$HOME/.agent-box/runs/*/meta.json 2>/dev/null | wc -l" 2>/dev/null | tr -d ' \r\n')
+    if [ "${GRAND:-0}" = "0" ]; then ok "the chain stopped: no third run"; else bad "a third run was started past the budget"; fi
+    if guest bash -c "grep -q 'Heal attempt 1 of 1 for run ${HEAL_RUNID}' \$HOME/.agent-box/briefs/${HEAL_CHILD}.md && grep -q 'The original brief follows' \$HOME/.agent-box/briefs/${HEAL_CHILD}.md"; then
+        ok "the follow-up's brief names the failed run and carries the original brief"
+    else
+        bad "the follow-up's brief is not the rendered heal template"
+    fi
+    HEAL_RUNS="${TMP_ROOT}/heal-runs.json"
+    "$AGENTBOX" runs "$CLEAN_REPO" --json > "$HEAL_RUNS" 2>/dev/null
+    if python3 -c "import json,sys; d=json.load(open('$HEAL_RUNS')); d=d if isinstance(d,list) else d.get('runs',[]); sys.exit(0 if any(r.get('heal_parent')=='$HEAL_RUNID' and r.get('heal_attempt')==1 for r in d) else 1)"; then
+        ok "runs --json carries heal_parent and heal_attempt"
+    else
+        bad "runs --json does not carry the heal lineage"
+    fi
+fi
+
+step "8a3. waiting and resume: a question is recorded, shown, answered and continued"
+# ===========================================================================
+#
+# A synthetic waiting run, the way the stop tests build theirs, because reaching
+# the end of a real run needs a token this box does not have. What is real: the
+# derived state, `ask`, and `resume` building the follow-up from the original
+# brief and the answer, then starting it.
+
+WAITING=20260101-333333
+guest bash -l > /dev/null 2>&1 <<SH
+set -u
+d="\$HOME/.agent-box/runs/${WAITING}"
+rm -rf "\$d"; mkdir -p "\$d" "\$HOME/.agent-box/briefs"; chmod 700 "\$d"
+printf 'exit:0\n' > "\$d/status"
+printf '2026-01-01T03:33:33Z\n' > "\$d/waiting"
+printf 'Which option, A or B?\n' > "\$d/ask.md"
+printf '{"runid":"${WAITING}","model":"sonnet","branch":"agent/ask-${WAITING}","brief":"${WAITING}.md","started_at":"2026-01-01T03:33:33Z","tmux":null,"max_turns":7,"max_budget_usd":null,"claude_version":null,"slug":"ask","origin":"${WAITING}","heal_left":2,"heal_max":2}\n' > "\$d/meta.json"
+printf '# Brief: the original words\n\nDo the thing.\n' > "\$HOME/.agent-box/briefs/${WAITING}.md"
+mkdir -p /work/.agent-box; printf 'stale question\n' > /work/.agent-box/ask.md
+SH
+WAIT_RUNS="${TMP_ROOT}/waiting-runs.out"
+"$AGENTBOX" runs "$CLEAN_REPO" > "$WAIT_RUNS" 2>&1
+if grep -qE "${WAITING}.*waiting" "$WAIT_RUNS"; then ok "runs shows the waiting state"; else bad "runs does not show waiting"; cat "$WAIT_RUNS"; fi
+ASK_OUT="${TMP_ROOT}/ask.out"
+run_bounded 60 "$ASK_OUT" "$AGENTBOX" ask "$CLEAN_REPO" "$WAITING"
+if grep -q 'Which option, A or B?' "$ASK_OUT"; then ok "ask prints the question"; else bad "ask did not print the question"; cat "$ASK_OUT"; fi
+ASK_NEWEST="${TMP_ROOT}/ask-newest.out"
+run_bounded 60 "$ASK_NEWEST" "$AGENTBOX" ask "$CLEAN_REPO"
+if grep -q 'Which option, A or B?' "$ASK_NEWEST"; then ok "ask with no run id finds the newest waiting run"; else bad "ask with no run id did not find the waiting run"; fi
+
+RESUME_OUT="${TMP_ROOT}/resume.out"
+run_bounded 90 "$RESUME_OUT" "$AGENTBOX" resume "$CLEAN_REPO" "$WAITING" --answer "Option B, and say why."
+cat "$RESUME_OUT"
+RESUMED=$(sed -n 's/^agentbox: resumed as run \([0-9-]*\) .*/\1/p' "$RESUME_OUT" | head -1)
+if [ -n "$RESUMED" ]; then ok "resume started a follow-up run (${RESUMED})"; else bad "resume did not start a run"; fi
+if [ -n "$RESUMED" ]; then
+    if guest bash -c "grep -q 'Option B, and say why.' \$HOME/.agent-box/briefs/${RESUMED}.md && grep -q 'Which option, A or B?' \$HOME/.agent-box/briefs/${RESUMED}.md && grep -q 'the original words' \$HOME/.agent-box/briefs/${RESUMED}.md"; then
+        ok "the resumed brief carries the question, the answer and the original brief"
+    else
+        bad "the resumed brief is missing the question, the answer or the original"
+    fi
+    RES_META=$(guest bash -c "jq -c '[.resume_of,.origin,.heal_left,.max_turns,.model]' \$HOME/.agent-box/runs/${RESUMED}/meta.json" 2>/dev/null | tr -d '\r\n')
+    printf 'resumed meta: %s\n' "$RES_META"
+    if [ "$RES_META" = "[\"${WAITING}\",\"${WAITING}\",2,7,\"sonnet\"]" ]; then
+        ok "the resumed run inherits origin, heal budget, caps and model"
+    else
+        bad "the resumed run's lineage is wrong: ${RES_META}"
+    fi
+    if guest test ! -e /work/.agent-box/ask.md; then ok "resume cleared the stale ask.md from the mount"; else bad "ask.md is still in the mount after resume"; fi
+fi
+EMPTY_OUT="${TMP_ROOT}/resume-empty.out"
+run_bounded 60 "$EMPTY_OUT" "$AGENTBOX" resume "$CLEAN_REPO" "$WAITING" --answer ""
+if [ "$BOUNDED_RC" -ne 0 ] && grep -qiE 'empty|needs --answer' "$EMPTY_OUT"; then ok "resume refuses an empty answer"; else bad "resume accepted an empty answer"; cat "$EMPTY_OUT"; fi
+
 step "8e. hook-event.sh turns one hook payload into one line"
 # ===========================================================================
 

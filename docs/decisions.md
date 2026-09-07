@@ -1671,3 +1671,48 @@ permits everything. The ruleset was correct and the sentence was false, which
 is worse than either, because the sentence is what somebody acts on. It now
 names the observe ruleset for what it is.
 
+
+## Why the healing loop lives in the guest, and stops where it does
+
+The point of a self-healing run is a box that recovers with nobody at the host.
+So the loop is guest-side: a failed run starts its own follow-up from its exit
+path, through `run-ctl.sh heal`, with a brief rendered from a template in this
+repository and the failed run's own record. The host CLI only sets the budget
+(`run --heal N`) and reads the lineage back. A host-side retry loop would have
+been simpler to write and would have died with the host session, which is the
+one thing it must not do.
+
+Three things bound it, each because the alternative was seen or obvious:
+
+- **Follow-ups carry the original brief, never the previous follow-up's.** A
+  chain that nested its prompts would grow one heal preamble per attempt and
+  drift from what the operator asked. `origin` in `meta.json` names the run
+  whose brief is the real one; every heal and every resume renders from that.
+- **It never heals a stop, a question or a leak.** A stop was a person's
+  choice. A question needs a person's answer. A leak (`exit:3`) needs a token
+  rotated, and a retry with the same token is exactly wrong. Only `failed` and
+  `lost` are healed, and `lost` only by the watchdog, because a lost run's own
+  exit path never ran.
+- **It never widens anything.** No allowlist change, no egress mode change, no
+  cap raised, no push. The conventions header says so to the agent; the
+  scripts give it no way to do otherwise. A heal that would need one of those
+  is told to write a learning and stop, which is the honest outcome.
+
+`waiting` is a marker beside the status, like `stopped`, for the same reason
+`stopped` is: the status keeps the exit code, and the state is derived from
+the two in exactly two places (`run-ctl.sh derived_state` and
+`run-format.py Run.state`) that a test keeps in agreement. A stop outranks a
+question; a leak outranks both.
+
+The learnings file is under `/work` and not in the guest home because it is
+the operator's record, not the run's: it should outlive the box and be read
+on the host without a command. The rest of `.agent-box/` is already excluded
+from git through `info/exclude`, so it travels with the mount and never with
+the repository. The `framework` cause class exists so the entries about this
+tool can be filtered from the entries about a repository, and worked through.
+
+The watchdog is the one host-side piece, and it is deliberately dumb: start a
+box that is stopped, heal a newest run that is lost, only for boxes an
+operator marked, every five minutes, from launchd. It starts no new work. It
+is also the least proven part of the design, having been exercised only by
+hand at the time of writing.
