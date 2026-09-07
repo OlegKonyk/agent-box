@@ -120,8 +120,14 @@ Then the four files, in this order.
 
 **`~/.config/agent-box/blocklist.txt` — human.** One literal term per line:
 the names, hostnames and codenames that must never leave this machine. It sits
-in the parent directory, never in `guest/`, and is never mounted. Set it
-private:
+in the parent directory, never in `guest/`, and is never mounted. Two things
+learned the hard way: a **public** product or company name does not belong on
+it, because a public sample that names its vendor in every file will never
+mount; and a repository that is itself full of internal names (a work
+monorepo) cannot pass a scan for those names either. For that repository the
+honest setting is an **empty** file, so preflight becomes the secrets scan
+alone, which is the check that matters. Decide per host, write it down in the
+local note (phase 10), and set it private:
 
 ```
 chmod 600 ~/.config/agent-box/blocklist.txt
@@ -166,6 +172,11 @@ install supervisor@konyklabs-plugins
 install py-testing@konyklabs-plugins
 TXT
 ```
+
+**The application's own credentials — not here.** A test app that needs an
+OAuth client secret, a payment sandbox key or a gateway URL gets them inside
+the guest, never in the mount: see phase 7b. Preflight will refuse a `.env`
+in the repository, and it is right to.
 
 **`~/.config/agent-box/guest/claude/CLAUDE.md` — agent, from the person's
 existing one.** Copy only the standing instructions you want inside the box.
@@ -285,6 +296,32 @@ refused. Type the host name in that shell; do not put it in a report.
 **Check:** verify-auth `pass`, firewall-check all `PASS` or `SKIP`, one staging
 host reachable if the allowlist names one.
 
+## 7b. The application's credentials, into the guest
+
+Test-tier values only. They go to `~/app.env` in the guest home, mode 600,
+outside the mount, and the brief exports them with `set -a; . ~/app.env; set +a`.
+That line is **shell**, not dotenv: quote every value, because a street with a
+space or a suite number with `#` otherwise ends the export at that line and
+the run starts with half an environment. From the host, one line, nothing
+printed:
+
+```
+limactl shell agent-box-<repo basename> -- sh -c 'umask 077; cat > ~/app.env' < /path/on/this/mac/app.env
+```
+
+Then, inside the guest, make sure it sources cleanly:
+
+```
+limactl shell agent-box-<repo basename> -- sh -c 'set -a; . ~/app.env; set +a; echo sourced ok'
+```
+
+`python-dotenv`, `pydantic-settings` and Node's `dotenv` all read the process
+environment ahead of a `.env` file, so no application change is needed. If a
+value is only ever read from a file, point the app at `~/app.env` with its own
+option; never write `/work/.env`.
+
+**Check:** `sourced ok`, and a `wc -l` of the file that matches the source.
+
 ## 8. The first run
 
 Write the brief by copying `templates/brief.md`. The whole file is the prompt.
@@ -295,7 +332,7 @@ built there overwrites the Mac's. A worked example that exercises Docker,
 Playwright and a seeded bug is the demo stack's `brief.md` from the first host.
 
 ```
-agentbox run ~/dev/<repo> briefs/<task>.md --model sonnet
+agentbox run ~/dev/<repo> briefs/<task>.md --model sonnet --heal 2 --heal-delay 180
 agentbox logs ~/dev/<repo> -f
 ```
 
@@ -303,6 +340,26 @@ The run is detached; `logs -f` follows it, `agentbox runs ~/dev/<repo>` lists
 it, `agentbox stop-run ~/dev/<repo>` interrupts it, and `porthole` shows all of
 that in one window. The agent works on a branch named `agent/<slug>-<stamp>`
 and cannot push.
+
+`--heal 2` lets the box retry a failure twice on its own, each attempt told
+what failed and to repair the environment first; `--heal-delay` should exceed
+any cooldown the live tier is subject to. Two states to know:
+
+- **`waiting`**: the agent needed a decision only you can make and wrote it
+  down instead of guessing. `agentbox ask ~/dev/<repo>` prints the question;
+  `agentbox resume ~/dev/<repo> --answer "…"` continues the brief with your
+  answer. From your phone, that is a Remote Control session on this host.
+- **`failed` with "this needs a person"**: the heal budget is spent. Read
+  `agentbox logs`, then `agentbox learnings ~/dev/<repo>`, which is where the
+  runs write what they had to fix and what should change in the brief, the
+  box or the app.
+
+To have the box survive a stopped VM or a sleeping Mac unattended:
+
+```
+agentbox keepalive ~/dev/<repo> on
+agentbox watchdog --install        # once per host; a launchd job every 5 minutes
+```
 
 When it ends:
 
@@ -348,6 +405,24 @@ agentbox egress ~/dev/<repo> deny
 which rebuilds the firewall and prints the verification. Tell whoever gave
 permission that the box has moved from observe to deny.
 
+## 9b. The work monorepo
+
+Everything above applies; the differences are in the repository, and they are
+the subject of [preparing-a-repo.md](preparing-a-repo.md): clone rather than
+mount the working copy, one command per tier written down, a `mock|live`
+switch every service reads, the live tier's cost stated at the top of its
+README, and a box sized for several services:
+
+```
+agentbox create ~/dev/<monorepo> --docker --playwright --egress observe \
+    --cpus 6 --memory 12GiB --disk 80GiB
+```
+
+Start in `observe`, run the live tier once, turn the log into the allowlist,
+switch to `deny`. The first brief for such a repository is not the refactor;
+it is "make the three tier commands true", so the refactor runs against a
+suite the agent can execute unattended.
+
 ## 10. Record it
 
 The setup produced facts that are not in any repository and that the next
@@ -382,4 +457,5 @@ case run `agentbox token` on each.
 | 5 | `agentbox status` | `running`, `fw=deny`, `runs=0` |
 | 7 | `agentbox verify-auth` | `pass` and a reply |
 | 7 | `agentbox firewall-check` | all `PASS`; container lines `PASS` after `docker pull alpine:3` |
-| 8 | `agentbox runs` | one `done`, exit 0 |
+| 7b | `sh -c 'set -a; . ~/app.env'` in the guest | `sourced ok` |
+| 8 | `agentbox runs` | one `done`, exit 0; or `waiting` with a question you can answer |
