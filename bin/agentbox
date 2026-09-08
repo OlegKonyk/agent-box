@@ -8,7 +8,15 @@
 
 set -euo pipefail
 
-BOX_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# Resolve symlinks first: docs/new-host.md installs this script as
+# ~/.local/bin/agentbox -> <checkout>/bin/agentbox, and host/ lives beside
+# the real file, not beside the link. macOS ships no `readlink -f`.
+_self="${BASH_SOURCE[0]}"
+while [ -L "$_self" ]; do
+  _target=$(readlink "$_self")
+  case "$_target" in /*) _self="$_target" ;; *) _self="$(dirname "$_self")/$_target" ;; esac
+done
+BOX_DIR=$(cd "$(dirname "$_self")/.." && pwd)
 HOST_CONFIG_DIR="${AGENT_BOX_CONFIG_DIR:-${HOME}/.config/agent-box}"
 # ONLY this subdirectory is mounted into the guest. blocklist.txt stays in the
 # parent, where preflight reads it host-side: it is the literal list of terms
@@ -26,7 +34,8 @@ WATCHER_DIR="${HOST_CONFIG_DIR}/watchers"
 # This script's own absolute path. `--notify` re-invokes it detached, and $0 is
 # whatever the caller typed, which may be relative to a directory the
 # background process will not be sitting in.
-SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
+SELF=$(cd "$(dirname "$_self")" && pwd)/$(basename "$_self")
+unset _self _target
 
 # Everything guest-side lives under one prefix, named once.
 GUEST_BIN="/opt/agent-box/guest"
