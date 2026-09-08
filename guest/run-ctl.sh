@@ -10,8 +10,11 @@
 #                    [--max-turns N] [--max-budget-usd X]
 #                    [--heal-left N --heal-max M --heal-attempt K --heal-parent R]
 #                    [--heal-delay S] [--origin R] [--resume-of R] [--delay S]
+#                    [--review-model M] [--review-of R]
 #   run-ctl.sh heal  --of RUNID [--parent-state failed|lost]
 #   run-ctl.sh resume --of RUNID            (the operator's answer on stdin)
+#   run-ctl.sh review --of RUNID [--parent-state done]
+#                    (start the second-model review the run asked for)
 #   run-ctl.sh ask   [runid]
 #   run-ctl.sh learnings
 #   run-ctl.sh stop  [runid]
@@ -45,8 +48,11 @@ cmd_start() {
     # The heal and resume lineage. All optional; a plain `agentbox run` sets
     # none of them and the run is its own origin.
     local heal_left="" heal_max="" heal_attempt="" heal_parent="" heal_delay="" origin="" resume_of="" delay=""
+    local review_model="" review_of=""
     while [ $# -gt 0 ]; do
         case "$1" in
+            --review-model)   review_model="${2:?--review-model needs a value}"; shift 2 ;;
+            --review-of)      review_of="${2:?--review-of needs a value}"; shift 2 ;;
             --runid)          runid="${2:?--runid needs a value}"; shift 2 ;;
             --slug)           slug="${2:?--slug needs a value}"; shift 2 ;;
             --model)          model="${2:?--model needs a value}"; shift 2 ;;
@@ -67,9 +73,11 @@ cmd_start() {
     for _n in "$heal_left" "$heal_max" "$heal_attempt" "$heal_delay" "$delay"; do
         case "$_n" in ''|*[!0-9]*) [ -z "$_n" ] || die "heal counts and delays are whole numbers, got '${_n}'" ;; esac
     done
-    for _r in "$heal_parent" "$origin" "$resume_of"; do
+    for _r in "$heal_parent" "$origin" "$resume_of" "$review_of"; do
         [ -z "$_r" ] || abx_valid_runid "$_r" || die "not a run id: ${_r}"
     done
+    [ -z "$review_model" ] || [ "$review_model" != "$model" ] \
+        || die "the review model is the run model (${model}); a review on the same model is not a second opinion"
 
     [ -n "$runid" ] || die "start needs --runid"
     [ -n "$brief" ] || die "start needs --brief"
@@ -96,6 +104,8 @@ cmd_start() {
     [ -n "$origin" ]       && args+=(--origin "$origin")
     [ -n "$resume_of" ]    && args+=(--resume-of "$resume_of")
     [ -n "$delay" ]        && args+=(--delay "$delay")
+    [ -n "$review_model" ] && args+=(--review-model "$review_model")
+    [ -n "$review_of" ]    && args+=(--review-of "$review_of")
 
     # Detached, so the limactl shell that started it can return immediately.
     # The tmux server outlives that shell, which is the whole point: a run is
@@ -627,10 +637,11 @@ PYX
 # Start a follow-up of `parent` from `brief`, inheriting model, caps, origin,
 # delay and the remaining heal budget as given. Prints the child run id.
 start_followup() {
-    # start_followup PARENT_DIR PARENT_RUNID BRIEF_PATH CHILD_RUNID HEAL_LEFT KIND
-    local pdir="${1:?}" parent="${2:?}" brief="${3:?}" child="${4:?}" heal_left="${5:?}" kind="${6:?}"
-    local model slug branch turns budget heal_max attempt origin heal_delay delay=""
+    # start_followup PARENT_DIR PARENT_RUNID BRIEF_PATH CHILD_RUNID HEAL_LEFT KIND [MODEL]
+    local pdir="${1:?}" parent="${2:?}" brief="${3:?}" child="${4:?}" heal_left="${5:?}" kind="${6:?}" model_override="${7:-}"
+    local model slug branch turns budget heal_max attempt origin heal_delay delay="" review_model
     model=$(meta_field "$pdir" model); [ -n "$model" ] || model="sonnet"
+    [ -z "$model_override" ] || model="$model_override"
     slug=$(meta_field "$pdir" slug)
     if [ -z "$slug" ]; then
         branch=$(meta_field "$pdir" branch)
@@ -643,8 +654,15 @@ start_followup() {
     attempt=$(meta_field "$pdir" heal_attempt); [ -n "$attempt" ] || attempt=0
     origin=$(meta_field "$pdir" origin); [ -n "$origin" ] || origin="$parent"
     heal_delay=$(meta_field "$pdir" heal_delay)
+    review_model=$(meta_field "$pdir" review_model)
+    # A review of the origin's work is still owed after a heal or a resume, so
+    # the reviewer's name travels down the chain. It never travels into a
+    # review: that run reviews, it is not reviewed.
+    case "$kind" in review) review_model="" ;; esac
+    [ -z "$review_model" ] || [ "$review_model" != "$model" ] || review_model=""
 
     local args=(--runid "$child" --slug "$slug" --model "$model" --brief "$brief" --origin "$origin")
+    [ -n "$review_model" ] && args+=(--review-model "$review_model")
     [ -n "$turns" ]  && args+=(--max-turns "$turns")
     [ -n "$budget" ] && args+=(--max-budget-usd "$budget")
     [ -n "$heal_max" ] && args+=(--heal-max "$heal_max")
@@ -659,6 +677,8 @@ start_followup() {
             # A resumed run keeps the attempt count it had, so a heal after a
             # resume still counts against the same budget.
             [ "$attempt" -eq 0 ] || args+=(--heal-attempt "$attempt") ;;
+        review)
+            args+=(--review-of "$parent") ;;
     esac
     cmd_start "${args[@]}" >/dev/null || return 1
     printf '%s\n' "$child"
@@ -744,6 +764,92 @@ cmd_heal() {
 
     start_followup "$dir" "$of" "$brief" "$child" "$((heal_left - 1))" heal \
         || die "could not start the heal run for ${of}"
+}
+
+# The commit the chain was cut from: the origin's base when it recorded one,
+# else this run's own.
+base_commit_of() {
+    local dir="${1:?}" origin base
+    origin=$(meta_field "$dir" origin)
+    if [ -n "$origin" ] && abx_valid_runid "$origin" && [ -f "${ABX_RUNS_DIR}/${origin}/meta.json" ]; then
+        base=$(meta_field "${ABX_RUNS_DIR}/${origin}" base_commit)
+    fi
+    [ -n "${base:-}" ] || base=$(meta_field "$dir" base_commit)
+    [ -n "$base" ] || return 1
+    printf '%s' "$base"
+}
+
+cmd_review() {
+    local of="" parent_state="" dir state reviewer base ahead child brief origin_line obrief slug
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --of)           of="${2:?--of needs a run id}"; shift 2 ;;
+            --parent-state) parent_state="${2:?--parent-state needs a value}"; shift 2 ;;
+            *) die "unknown argument: $1" ;;
+        esac
+    done
+    [ -n "$of" ] || die "review needs --of RUNID"
+    dir=$(abx_run_dir "$of")
+    [ -f "${dir}/meta.json" ] || die "no such run: ${of}"
+
+    if [ -n "$parent_state" ]; then
+        state="$parent_state"
+    else
+        case "$(derived_state "$dir")" in
+            exit:0) state="done" ;;
+            running) state="running" ;;
+            *) state="other" ;;
+        esac
+    fi
+    [ "$state" = "done" ] || die "run ${of} is ${state}; only a run that ended done is reviewed"
+    [ -z "$(meta_field "$dir" review_of)" ] || die "run ${of} is itself a review; not reviewing a review"
+
+    reviewer=$(meta_field "$dir" review_model)
+    [ -n "$reviewer" ] || die "run ${of} did not ask for a review (no review model on record)"
+
+    base=$(base_commit_of "$dir") || die "run ${of} recorded no base commit; cannot bound the diff"
+    ahead=$(git -C "$ABX_WORK_DIR" rev-list --count "${base}..HEAD" 2>/dev/null) || ahead=""
+    case "$ahead" in ''|*[!0-9]*) die "cannot count commits past ${base} in ${ABX_WORK}" ;; esac
+    if [ "$ahead" -eq 0 ] && [ -z "$(git -C "$ABX_WORK_DIR" status --porcelain 2>/dev/null)" ]; then
+        printf 'nothing to review: no commits past %s and a clean tree\n' "$(git -C "$ABX_WORK_DIR" rev-parse --short "$base")"
+        return 2
+    fi
+
+    origin_line=$(origin_brief_of "$dir" "$of") || die "no brief on record for ${of}; cannot review it"
+    obrief=${origin_line#*$'\t'}
+
+    child=$(fresh_runid_after "$of")
+    brief="${ABX_BRIEFS_DIR}/${child}.md"
+
+    local tmp; tmp=$(mktemp -d -t agent-box-review.XXXXXX)
+    printf '%s' "$of"                                  > "${tmp}/PARENT"
+    printf '%s' "$(meta_field "$dir" model)"           > "${tmp}/MODEL"
+    printf '%s' "$reviewer"                            > "${tmp}/REVIEWER"
+    printf '%s' "$(meta_field "$dir" branch)"          > "${tmp}/BRANCH"
+    printf '%s' "$base"                                > "${tmp}/BASE"
+    # The commit list stays inside the guest: it becomes the reviewer's prompt.
+    git -C "$ABX_WORK_DIR" log --oneline "${base}..HEAD" 2>/dev/null | head -50 > "${tmp}/COMMITS"
+    [ -s "${tmp}/COMMITS" ] || printf '(no commits; uncommitted changes only)' > "${tmp}/COMMITS"
+    git -C "$ABX_WORK_DIR" diff --stat "${base}" 2>/dev/null | tail -40 > "${tmp}/STAT"
+    [ -s "${tmp}/STAT" ] || printf '(empty)' > "${tmp}/STAT"
+    python3 "${ABX_LIB_DIR}/run-format.py" --last-text "$of" 2>/dev/null | cut -c1-1200 > "${tmp}/LAST_TEXT"
+    [ -s "${tmp}/LAST_TEXT" ] || printf '(none)' > "${tmp}/LAST_TEXT"
+    cp "$obrief" "${tmp}/BRIEF"
+
+    ( umask 077; render_template "${ABX_LIB_DIR}/review-brief.md" "$brief" \
+        PARENT="${tmp}/PARENT" MODEL="${tmp}/MODEL" REVIEWER="${tmp}/REVIEWER" BRANCH="${tmp}/BRANCH" \
+        BASE="${tmp}/BASE" COMMITS="${tmp}/COMMITS" STAT="${tmp}/STAT" LAST_TEXT="${tmp}/LAST_TEXT" \
+        BRIEF="${tmp}/BRIEF" )
+    rm -rf "$tmp"
+    chmod 600 "$brief" 2>/dev/null || true
+
+    # The review keeps whatever heal budget the reviewed run had left: a review
+    # that dies on the environment is healed like any other run.
+    local heal_left; heal_left=$(meta_field "$dir" heal_left)
+    case "$heal_left" in ''|*[!0-9]*) heal_left=0 ;; esac
+    slug=$(meta_field "$dir" slug); [ -n "$slug" ] || slug="task"
+    start_followup "$dir" "$of" "$brief" "$child" "$heal_left" review "$reviewer" \
+        || die "could not start the review run for ${of}"
 }
 
 # The newest run recorded as waiting, or nothing.
@@ -848,7 +954,8 @@ case "${1:-}" in
     latest)    shift; cmd_latest ;;
     heal)      shift; cmd_heal "$@" ;;
     resume)    shift; cmd_resume "$@" ;;
+    review)    shift; cmd_review "$@" ;;
     ask)       shift; cmd_ask "$@" ;;
     learnings) shift; cmd_learnings ;;
-    *) die "usage: run-ctl.sh start|stop|sessions|state|runs|reconcile|latest|heal|resume|ask|learnings" ;;
+    *) die "usage: run-ctl.sh start|stop|sessions|state|runs|reconcile|latest|heal|resume|review|ask|learnings" ;;
 esac

@@ -1433,6 +1433,59 @@ EMPTY_OUT="${TMP_ROOT}/resume-empty.out"
 run_bounded 60 "$EMPTY_OUT" "$AGENTBOX" resume "$CLEAN_REPO" "$WAITING" --answer ""
 if [ "$BOUNDED_RC" -ne 0 ] && grep -qiE 'empty|needs --answer' "$EMPTY_OUT"; then ok "resume refuses an empty answer"; else bad "resume accepted an empty answer"; cat "$EMPTY_OUT"; fi
 
+step "8a4. review on a second model: refused on the same model, started from a done run, skipped when empty"
+# ===========================================================================
+#
+# Same shape as 8a3: synthetic done runs, because a real one needs a token. What
+# is real: the CLI's same-model refusal, `run-ctl.sh review` rendering the
+# template and starting the follow-up with the reviewer's model and lineage,
+# the empty case returning 2, and a review never being reviewed.
+
+SAME_OUT="${TMP_ROOT}/review-same.out"
+run_bounded 60 "$SAME_OUT" "$AGENTBOX" run "$CLEAN_REPO" "${TMP_ROOT}/noop-brief.md" --model sonnet --review sonnet
+if [ "$BOUNDED_RC" -ne 0 ] && grep -q 'not a second opinion' "$SAME_OUT"; then ok "run refuses --review on the run's own model"; else bad "run accepted --review on the same model"; cat "$SAME_OUT"; fi
+
+REVIEWED=20260101-444444
+guest bash -l > /dev/null 2>&1 <<SH
+set -u
+d="\$HOME/.agent-box/runs/${REVIEWED}"
+rm -rf "\$d"; mkdir -p "\$d" "\$HOME/.agent-box/briefs"; chmod 700 "\$d"
+printf 'exit:0\n' > "\$d/status"
+base=\$(git -C /work rev-parse HEAD)
+printf '{"runid":"${REVIEWED}","model":"sonnet","branch":"agent/task-${REVIEWED}","brief":"${REVIEWED}.md","started_at":"2026-01-01T04:44:44Z","tmux":null,"max_turns":7,"max_budget_usd":null,"claude_version":null,"slug":"task","origin":"${REVIEWED}","heal_left":1,"heal_max":1,"review_model":"haiku","base_commit":"%s"}\n' "\$base" > "\$d/meta.json"
+printf '# Brief: the original words\n\nDo the thing.\n' > "\$HOME/.agent-box/briefs/${REVIEWED}.md"
+SH
+# A clean tree at the base: nothing to review, exit 2, no follow-up.
+EMPTY_REV="${TMP_ROOT}/review-empty.out"
+guest bash -lc "/opt/agent-box/guest/run-ctl.sh review --of ${REVIEWED}; echo rc=\$?" > "$EMPTY_REV" 2>&1
+if grep -q 'nothing to review' "$EMPTY_REV" && grep -q 'rc=2' "$EMPTY_REV"; then ok "review of a run with no commits and a clean tree says so and returns 2"; else bad "empty review case: $(cat "$EMPTY_REV")"; fi
+
+# Dirty the tree: now there is something to review, and a follow-up starts.
+guest bash -lc 'printf "reviewed change\n" >> /work/README.md'
+REV_OUT="${TMP_ROOT}/review-start.out"
+guest bash -lc "/opt/agent-box/guest/run-ctl.sh review --of ${REVIEWED}; echo rc=\$?" > "$REV_OUT" 2>&1
+cat "$REV_OUT"
+REV_CHILD=$(grep -oE '^[0-9]{8}-[0-9]{6}$' "$REV_OUT" | head -1)
+if [ -n "$REV_CHILD" ] && grep -q 'rc=0' "$REV_OUT"; then ok "review started follow-up run ${REV_CHILD}"; else bad "review did not start a follow-up"; fi
+if [ -n "$REV_CHILD" ]; then
+    REV_META=$(guest bash -c "jq -c '[.review_of, .model, .review_model, .origin, .heal_left]' \$HOME/.agent-box/runs/${REV_CHILD}/meta.json" 2>/dev/null | tr -d '\r\n')
+    if [ "$REV_META" = "[\"${REVIEWED}\",\"haiku\",null,\"${REVIEWED}\",1]" ]; then
+        ok "the review runs on the reviewer's model, names the run it reviews, asks for no review of itself"
+    else
+        bad "the review's lineage is wrong: ${REV_META}"
+    fi
+    if guest bash -c "grep -q '^# Review of run ${REVIEWED} on a second model' \$HOME/.agent-box/briefs/${REV_CHILD}.md && grep -q 'Do the thing.' \$HOME/.agent-box/briefs/${REV_CHILD}.md"; then
+        ok "the review's brief is the rendered template around the original brief"
+    else
+        bad "the review's brief is not the rendered review template"
+    fi
+    "$AGENTBOX" stop-run "$CLEAN_REPO" "$REV_CHILD" > /dev/null 2>&1 || true
+    AGAIN="${TMP_ROOT}/review-again.out"
+    guest bash -lc "/opt/agent-box/guest/run-ctl.sh review --of ${REV_CHILD} --parent-state done" > "$AGAIN" 2>&1 || true
+    if grep -q 'not reviewing a review' "$AGAIN"; then ok "a review is never reviewed"; else bad "a review of a review was not refused: $(cat "$AGAIN")"; fi
+fi
+guest bash -lc 'git -C /work checkout -q -- README.md; git -C /work checkout -q main 2>/dev/null || git -C /work checkout -q master 2>/dev/null || true'
+
 step "8e. hook-event.sh turns one hook payload into one line"
 # ===========================================================================
 

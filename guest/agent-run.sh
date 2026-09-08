@@ -45,6 +45,13 @@ HEAL_DELAY=""
 ORIGIN=""
 RESUME_OF=""
 START_DELAY=""
+# Review on a second model. REVIEW_MODEL is the model this run's diff is to be
+# reviewed on once it ends `done` with commits; REVIEW_OF names the run this one
+# is reviewing (a review never starts a review of itself). BASE_COMMIT is the
+# commit the branch was cut from, recorded so a review can diff the whole chain.
+REVIEW_MODEL=""
+REVIEW_OF=""
+BASE_COMMIT=""
 
 die() { printf 'agent-run: %s\n' "$*" >&2; exit 1; }
 
@@ -73,6 +80,8 @@ while [ $# -gt 0 ]; do
         --origin)         ORIGIN="${2:?--origin needs a value}"; shift 2 ;;
         --resume-of)      RESUME_OF="${2:?--resume-of needs a value}"; shift 2 ;;
         --delay)          START_DELAY="${2:?--delay needs a value}"; shift 2 ;;
+        --review-model)   REVIEW_MODEL="${2:?--review-model needs a value}"; shift 2 ;;
+        --review-of)      REVIEW_OF="${2:?--review-of needs a value}"; shift 2 ;;
         -h|--help)
             sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
@@ -270,6 +279,9 @@ write_meta() {
         --arg heal_parent  "$HEAL_PARENT" \
         --arg heal_delay   "$HEAL_DELAY" \
         --arg resume_of    "$RESUME_OF" \
+        --arg review_model "$REVIEW_MODEL" \
+        --arg review_of    "$REVIEW_OF" \
+        --arg base_commit  "$BASE_COMMIT" \
         '{runid: $runid,
           model: $model,
           branch: (if $branch == "" then null else $branch end),
@@ -286,7 +298,10 @@ write_meta() {
           heal_attempt: (if $heal_attempt == "" then null else ($heal_attempt | tonumber?) end),
           heal_parent: (if $heal_parent == "" then null else $heal_parent end),
           heal_delay: (if $heal_delay == "" then null else ($heal_delay | tonumber?) end),
-          resume_of: (if $resume_of == "" then null else $resume_of end)}' \
+          resume_of: (if $resume_of == "" then null else $resume_of end),
+          review_model: (if $review_model == "" then null else $review_model end),
+          review_of: (if $review_of == "" then null else $review_of end),
+          base_commit: (if $base_commit == "" then null else $base_commit end)}' \
         > "$tmp" 2>/dev/null && mv -f "$tmp" "${RUN_DIR}/meta.json"
     chmod 600 "${RUN_DIR}/meta.json" 2>/dev/null || true
 }
@@ -294,6 +309,8 @@ write_meta ""
 
 printf 'agent-run: run %s (%s)\n' "$RUNID" "${TMUX_SESSION:-no tmux session}"
 [ -z "$HEAL_PARENT" ] || printf 'agent-run: heal attempt %s of %s, after run %s\n' "${HEAL_ATTEMPT:-?}" "${HEAL_MAX:-?}" "$HEAL_PARENT"
+[ -z "$REVIEW_OF" ] || printf 'agent-run: reviewing run %s\n' "$REVIEW_OF"
+[ -z "$REVIEW_MODEL" ] || printf 'agent-run: a review on %s follows if this run ends done with commits\n' "$REVIEW_MODEL"
 [ -z "$RESUME_OF" ]   || printf 'agent-run: resumed from run %s with the operator'"'"'s answer\n' "$RESUME_OF"
 
 # A follow-up waits before it starts, so a failure with a cooldown behind it
@@ -422,6 +439,7 @@ restore_branch_if_untouched() {
     fi
 }
 
+BASE_COMMIT=$(git -C "$WORK_DIR" rev-parse HEAD 2>/dev/null || true)
 git -C "$WORK_DIR" checkout -b "$BRANCH"
 BRANCH_CREATED=1
 write_meta "$BRANCH"
@@ -707,6 +725,7 @@ fi
     fi
     [ -z "$HEAL_PARENT" ] || printf 'heal      : attempt %s of %s, after run %s\n' "${HEAL_ATTEMPT:-?}" "${HEAL_MAX:-?}" "$HEAL_PARENT"
     [ -z "$RESUME_OF" ]   || printf 'resumed   : from run %s\n' "$RESUME_OF"
+    [ -z "$REVIEW_OF" ]   || printf 'reviews   : run %s; findings in .agent-box/review.md\n' "$REVIEW_OF"
     [ "$LEARNINGS_NEW" -eq 0 ] || printf 'learnings : %s new entr%s in .agent-box/learnings.md\n' "$LEARNINGS_NEW" "$([ "$LEARNINGS_NEW" -eq 1 ] && printf y || printf ies)"
     printf '\nThe full event stream stays inside the VM, under ~/.agent-box/runs/%s/.\n' "$RUNID"
 } > "$SUMMARY_FILE"
@@ -776,6 +795,19 @@ if [ "$RUN_STATE" = "failed" ] && [ -n "$HEAL_LEFT" ] && [ "$HEAL_LEFT" -gt 0 ];
     fi
 elif [ "$RUN_STATE" = "failed" ] && [ -n "$HEAL_MAX" ]; then
     printf '\nheal      : no attempts left (%s of %s used); this needs a person\n' "${HEAL_ATTEMPT:-0}" "$HEAL_MAX"
+fi
+
+# Review on a second model. Only a run that ended done, only when it was asked
+# for, and never for a run that is itself a review. run-ctl decides whether
+# there is anything to review (commits past the base) and says so if not.
+if [ "$RUN_STATE" = "done" ] && [ -n "$REVIEW_MODEL" ] && [ -z "$REVIEW_OF" ]; then
+    if _child=$("${ABX_LIB_DIR}/run-ctl.sh" review --of "$RUNID" --parent-state "done" 2>&1); then
+        printf '\nreview    : started follow-up run %s on %s; its branch carries this one\n' "$(abx_scrub_token "$_child")" "$REVIEW_MODEL"
+        printf 'review    : follow-up run %s on %s\n' "$_child" "$REVIEW_MODEL" >> "$SUMMARY_FILE"
+        cp -f "$SUMMARY_FILE" "$RUN_SUMMARY" 2>/dev/null || true
+    else
+        printf '\nreview    : %s\n' "$(abx_scrub_token "$_child")"
+    fi
 fi
 
 printf '\nNothing has been pushed. Review the branch on the host, then push it yourself.\n'
