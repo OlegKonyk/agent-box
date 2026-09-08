@@ -203,7 +203,7 @@ this repository. It is split in two on purpose:
     ca.pem                   TLS-intercepting proxy root, if any
     plugins.txt              marketplaces to register, plugins to install
     plugin-dir/<name>/       plugin roots loaded per session, not installed
-    claude/                  CLAUDE.md, settings.json, governor.json, rules/
+    claude/                  CLAUDE.md, settings.json, supervisor.json, rules/
 ```
 
 - `~/.config/agent-box/guest/` is mounted read-only into the VM at
@@ -216,6 +216,50 @@ this repository. It is split in two on purpose:
 Both distinctions are deliberate: see [docs/decisions.md](docs/decisions.md).
 What of `claude/` crosses into the guest, and what is refused, is in
 [docs/daily-use.md](docs/daily-use.md).
+
+## The supervisor plugin, in the box
+
+Two budgets apply to a run, and they do different jobs. `agentbox run
+--max-budget-usd X` is Claude Code's own cap: it stops the whole run, subagent
+spend included. The supervisor plugin's budget gates only its expensive tier
+(fable and mythos by default), so a `sonnet` run never reaches it; what the
+plugin adds inside a box is the rest of its policy — workers pinned to a cheap
+model, forks denied, report contracts enforced, and a spend ledger you can read
+back.
+
+Configure it with one file on the host, carried into the guest on every
+`start`, `run`, `shell` and `claude`:
+
+```
+~/.config/agent-box/guest/claude/supervisor.json
+```
+
+```json
+{
+  "mode": "enforce",
+  "readout": "start",
+  "budget_usd": 25.0,
+  "budget_profiles": {"small": 5.0, "medium": 25.0, "large": 100.0},
+  "worker_model": "sonnet"
+}
+```
+
+`mode` must be `enforce` in a box: the plugin's default is dormant until
+someone types `/supervisor:start`, and nobody types anything in a headless
+run. `readout: "start"` injects the policy once rather than a spend line every
+turn. Every other key works as on the host; the box's project path, for a
+`projects` map, is always `/work`. To check what the guest sees, from a shell
+in the box:
+
+```
+python3 ~/.claude/plugins/cache/konyklabs-plugins/supervisor/*/bin/supervisor.py budget show
+```
+
+Edit the host file and the next run picks it up. Changes made from inside an
+interactive session land in the guest's copy, which the next sync overwrites.
+The ledger lives in the guest and dies with `agentbox destroy`. A repository
+may carry its own `.claude/supervisor.json`, which can only tighten. The
+pre-2.0 name `governor.json` is still carried and still read, with a nag.
 
 ## Limits and known weaknesses
 
