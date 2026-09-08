@@ -392,11 +392,24 @@ try:
               file=sys.stderr)
         raise SystemExit(1)
 
-    if entry.get("hasTrustDialogAccepted") is True:
+    # Onboarding: the interactive CLI walks a fresh config through a theme
+    # picker and then a "Select login method" screen, and that screen appears
+    # even with CLAUDE_CODE_OAUTH_TOKEN in the environment (verified on
+    # 2.1.263: `agentbox claude` on a fresh box lands in the browser OAuth
+    # flow; `-p` skips onboarding, which is why `run` and `verify-auth` never
+    # saw it). Marking onboarding done is what makes the token the only
+    # credential the CLI ever asks for. The theme is only set when absent.
+    changes = []
+    if data.get("hasCompletedOnboarding") is not True:
+        data["hasCompletedOnboarding"] = True
+        data.setdefault("theme", "dark")
+        changes.append("marked onboarding complete")
+    if entry.get("hasTrustDialogAccepted") is not True:
+        entry["hasTrustDialogAccepted"] = True
+        changes.append("marked %s as trusted" % project)
+    if not changes:
         say("sync-claude-config: %s is already trusted" % project)
         raise SystemExit(0)
-
-    entry["hasTrustDialogAccepted"] = True
 
     # Same directory, so the replace is atomic on the same filesystem.
     directory = os.path.dirname(path) or "."
@@ -414,7 +427,7 @@ try:
             pass
         raise
 
-    say("sync-claude-config: marked %s as trusted" % project)
+    say("sync-claude-config: " + "; ".join(changes))
 finally:
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
