@@ -42,7 +42,7 @@ die()  { printf 'sync-claude-config: %s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" -ne 0 ] || die "must not run as root; the config directory belongs to the guest user"
 
 # Files that may cross. Anything else in the source directory is left behind.
-ALLOWED_FILES=(CLAUDE.md settings.json governor.json)
+ALLOWED_FILES=(CLAUDE.md settings.json supervisor.json governor.json)
 
 # Names that must NEVER cross, reported rather than skipped. Matched as shell
 # patterns against the entry name.
