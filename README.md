@@ -115,11 +115,18 @@ One instance per repository, named `agent-box-<repo basename>`.
 | `agentbox firewall-check <repo\|name>` | Rebuild the egress allowlist and re-verify it, inside the VM. The container probes are advisory. |
 
 `run` takes `--model M`, `--max-turns N`, `--max-budget-usd X`, `--wait`,
-`--notify`, and `--heal N [--heal-delay SECS]`: when the run fails, the box
-itself starts up to N follow-up runs, each told what failed and to repair the
-environment before continuing the same brief. How that loop, the `waiting`
-state and the learnings file fit together is in
-[docs/daily-use.md](docs/daily-use.md) under "Self-healing". `resize`, `stop`, `destroy` and `firewall-check` also take a bare
+`--notify`, `--heal N [--heal-delay SECS]` and `--review M`. Heal: when the
+run fails, the box itself starts up to N follow-up runs, each told what failed
+and to repair the environment before continuing the same brief. Review: when
+the run ends `done` with commits, the box starts a second run on model M (which
+must differ from the run's own) that reads the diff against the brief, re-runs
+the tests, fixes real defects in their own commits and writes
+`.agent-box/review.md`. Standing defaults for `model`, `max_budget_usd`,
+`heal` and `review` go in `~/.config/agent-box/config`, one `key: value` per
+line, so a run typed with no flags is still capped and reviewed. How the heal
+loop, the `waiting` state, the review and the learnings file fit together is
+in [docs/daily-use.md](docs/daily-use.md) under "Self-healing" and "Review on
+a second model". `resize`, `stop`, `destroy` and `firewall-check` also take a bare
 instance name, so a VM can still be shut down, resized and deleted after its
 repository directory is gone. Every subcommand stops reading options at a
 literal `--`, so a caller that builds a command line rather than typing it can
@@ -174,6 +181,7 @@ guest/verify-auth.sh    one small model call, to prove the token works
 guest/run-ctl.sh        start, stop, heal, resume and list the guest's runs
 guest/conventions.md    prepended to every brief: ask, write learnings, hands off the rails
 guest/heal-brief.md     the follow-up brief a failed run starts itself with
+guest/review-brief.md   the brief a finished run hands to its reviewer on a second model
 guest/resume-brief.md   the follow-up brief `agentbox resume` builds from the answer
 guest/hook-event.sh     the hook command; one JSON line per hook event
 guest/hooks.settings.json    the hooks block, merged in with --settings
@@ -236,18 +244,25 @@ Configure it with one file on the host, carried into the guest on every
 
 ```json
 {
-  "mode": "enforce",
-  "readout": "start",
+  "mode": "observe",
+  "readout": "off",
   "budget_usd": 25.0,
   "budget_profiles": {"small": 5.0, "medium": 25.0, "large": 100.0},
   "worker_model": "sonnet"
 }
 ```
 
-`mode` must be `enforce` in a box: the plugin's default is dormant until
-someone types `/supervisor:start`, and nobody types anything in a headless
-run. `readout: "start"` injects the policy once rather than a spend line every
-turn. Every other key works as on the host; the box's project path, for a
+`mode` is the setting to think about. The plugin's default, `off`, is dormant
+until someone types `/supervisor:start`, and nobody types anything in a
+headless run, so it must be `enforce` or `observe`. `enforce` applies the
+delegation policy: the conductor hands work to subagents and reads their
+evidence. That is right when the run model is expensive and wrong when it is
+`sonnet` talking to a `sonnet` implementer: measured on the same brief and box,
+9 turns in 40s at $0.15 with the plugin dormant against 2 turns plus subagents
+in 3m38s at $0.37 under `enforce`. So: `observe` for a `sonnet` run (the ledger
+and the readout, nothing denied or delegated), `enforce` only when the run is
+on the expensive tier. `readout: "start"` injects the policy once rather than
+a spend line every turn; `"off"` injects nothing. Every other key works as on the host; the box's project path, for a
 `projects` map, is always `/work`. To check what the guest sees, from a shell
 in the box:
 

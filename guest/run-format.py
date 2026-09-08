@@ -675,6 +675,8 @@ class Run:
             "heal_attempt": meta.get("heal_attempt"),
             "heal_parent": meta.get("heal_parent"),
             "resume_of": meta.get("resume_of"),
+            "review_of": meta.get("review_of"),
+            "review_model": meta.get("review_model"),
         }
 
     def tail_summary(self):

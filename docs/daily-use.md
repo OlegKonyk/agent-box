@@ -263,6 +263,41 @@ What the loop does not do, on purpose: it never widens the allowlist, never
 changes the egress mode, never raises a cap, never pushes. A heal that would
 need any of those writes a learning and stops.
 
+## Review on a second model
+
+A run that ends `done` is one model's word for it. `--review M` makes the box
+ask a second one:
+
+```
+./bin/agentbox run ~/dev/my-e2e-tests briefs/my-task.md --model sonnet --review opus
+```
+
+When the run ends `done` and its branch has commits past where it was cut
+(or a dirty tree), the guest starts a follow-up run on `M` from
+`guest/review-brief.md`: the original brief, the commit list, the diffstat and
+the run's last words, with instructions to read the diff against the
+definition of done, re-run the tests the brief names, look for the things a
+single unattended run gets wrong (a weakened test, a claim the diff does not
+support, work outside scope, a missed stop condition), fix what is real in its
+own commits, and write `/work/.agent-box/review.md`: one row per finding with
+a disposition, then the suite's result and whether the branch is fit to push.
+A finding only you can settle goes to `ask.md` and the review parks as
+`waiting`, like any other run.
+
+The review runs on a branch of its own, cut from the reviewed run's branch, so
+it carries the original commits plus its fixes; that is the branch to look at
+on the host. `agentbox runs --json` shows the lineage as `review_of` on the
+review and `review_model` on the run that asked for one. The reviewer must be
+a different model from the run's: the CLI refuses the same name, because the
+point is a second opinion. A review is never reviewed, and a run that produced
+nothing gets no review; the summary says `nothing to review`. A heal or a
+resume keeps the reviewer's name, so the review is still owed at the end of a
+chain.
+
+Put `review: opus` in `~/.config/agent-box/config` and every run gets one
+unless it says `--no-review`. `model`, `max_budget_usd` and `heal` take
+standing defaults the same way.
+
 ## Egress modes
 
 Every box has one, chosen at create and shown by `agentbox egress`:
@@ -791,15 +826,15 @@ cannot have its binary replaced underneath it. Update deliberately:
 It prints the version before and after. Updates come from
 `downloads.claude.ai`, which is on the base allowlist.
 
-## The governor, in here
+## The supervisor, in here
 
-If you use the governor plugin, the guest is a good place for it: the workers
-it pins to cheap models are the ones doing the bulk of the work, and the budget
-it enforces is the same subscription any other device draws on. Two things
-to know. Its configuration comes from `claude/governor.json` through the
-carry-over above. Its state — the ledger, the spend so far — lives in the guest
-under `~/.cache/governor` and **dies with the VM**, so a destroyed box takes
-its own accounting with it.
+If you use the supervisor plugin, the guest is a good place for its ledger:
+the spend it prices is the same subscription any other device draws on. Its
+configuration comes from `claude/supervisor.json` through the carry-over
+above (the pre-2.0 name `governor.json` still crosses and is still read). Its
+state lives in the guest and **dies with the VM**, so a destroyed box takes its
+own accounting with it. Which `mode` to set, and why `enforce` slows a `sonnet`
+run down, is in the README under "The supervisor plugin, in the box".
 
 ## The friction, listed rather than debugged
 

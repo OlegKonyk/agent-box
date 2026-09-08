@@ -97,6 +97,15 @@ run options:
                       runs on its own, each told what failed and to repair the
                       environment before continuing the same brief
   --heal-delay SECS   wait this long before each follow-up (default 60)
+  --review M          when the run ends done with commits, start a second run
+                      on model M that reviews the diff against the brief,
+                      fixes real defects in their own commits, and writes
+                      .agent-box/review.md. M must differ from --model.
+  --no-review         cancel a `review:` default from the config file
+
+  Standing defaults for --model, --max-budget-usd, --heal and --review go in
+  ${HOST_CONFIG_DIR}/config as `model: sonnet`, `max_budget_usd: 5`,
+  `heal: 1`, `review: opus`; the command line overrides each.
 
 create options — all off by default, all fixed for the life of the instance
 except the sizing, which 'resize' can change:
@@ -369,6 +378,17 @@ read_instance_meta() {
 }
 write_instance_egress() { write_instance_meta "${1:?}" egress "${2:?}"; }
 read_instance_egress()  { read_instance_meta  "${1:?}" egress; }
+
+# A plain `key: value` from the host config file, or nothing. The value is one
+# word: a model name, a number, a mode. Last one wins, like the egress reader.
+config_value() {
+    local key="${1:?}" v
+    [ -f "$HOST_CONFIG_FILE" ] || return 1
+    v=$(sed -n "s/^[[:space:]]*${key}[[:space:]]*:[[:space:]]*\([A-Za-z0-9._-]*\)[[:space:]]*\$/\1/p" \
+        "$HOST_CONFIG_FILE" | tail -1)
+    [ -n "$v" ] || return 1
+    printf '%s' "$v"
+}
 
 # `notify: true` in the host config file, or nothing.
 config_notify_default() {
@@ -992,9 +1012,16 @@ cmd_update() {
 # is not a reason for a run to die. --wait is the old behaviour, kept because
 # the smoke test and any script wrapping this one need an exit status.
 cmd_run() {
-    local repo brief inst slug runid model="sonnet"
+    local repo brief inst slug runid model="" review="" review_from=""
     local max_turns="" max_budget="" wait_for_it=0 notify=0 heal="" heal_delay=""
-    split_args "--model --max-turns --max-budget-usd --heal --heal-delay" "$@"
+    # Standing defaults from the host config file, each overridable on the
+    # command line: model, max_budget_usd, heal, review. Typing the same
+    # flags on every run is how a box ends up run without them.
+    model=$(config_value model) || model="sonnet"
+    max_budget=$(config_value max_budget_usd) || max_budget=""
+    heal=$(config_value heal) || heal=""
+    if review=$(config_value review); then review_from="${HOST_CONFIG_FILE}"; else review=""; fi
+    split_args "--model --max-turns --max-budget-usd --heal --heal-delay --review" "$@"
     check_operands 2 2 "run <repo> <brief.md> [options]"
     set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
     while [ $# -gt 0 ]; do
@@ -1006,9 +1033,16 @@ cmd_run() {
             --notify)         notify=1; shift ;;
             --heal)           heal="$2"; shift 2 ;;
             --heal-delay)     heal_delay="$2"; shift 2 ;;
+            --review)         review="$2"; review_from="command line"; shift 2 ;;
+            --no-review)      review=""; shift ;;
             *) die "unknown option: $1" ;;
         esac
     done
+    if [ -n "$review" ]; then
+        valid_plain_name "$review" || die "not a model name: ${review}"
+        [ "$review" != "$model" ] \
+            || die "--review ${review} is the run model; a review on the same model is not a second opinion. Pick another, or --no-review."
+    fi
     [ -z "$heal" ]       || case "$heal"       in ''|*[!0-9]*) die "--heal takes a whole number of attempts" ;; esac
     [ -z "$heal_delay" ] || case "$heal_delay" in ''|*[!0-9]*) die "--heal-delay takes a whole number of seconds" ;; esac
     [ -z "$heal_delay" ] || [ -n "$heal" ] || die "--heal-delay needs --heal"
@@ -1054,6 +1088,7 @@ cmd_run() {
     if [ -n "$heal" ] && [ "$heal" -gt 0 ]; then
         start_args+=(--heal-left "$heal" --heal-max "$heal" --heal-delay "$heal_delay")
     fi
+    [ -z "$review" ] || start_args+=(--review-model "$review")
 
     guest_shell "$inst" "${GUEST_BIN}/run-ctl.sh" "${start_args[@]}" >/dev/null \
         || die "could not start the run in ${inst}"
@@ -1061,6 +1096,8 @@ cmd_run() {
     announce_egress_mode "$inst"
     info "run ${runid} started in ${inst} on model ${model}"
     [ -z "$heal" ] || [ "$heal" -eq 0 ] || info "heal: up to ${heal} follow-up run(s) if it fails, ${heal_delay}s apart"
+    [ -z "$review" ] || info "review: a second run on ${review} reviews the diff when this one ends done (from ${review_from})"
+    [ -z "$max_budget" ] || info "cap: --max-budget-usd ${max_budget}"
 
     if [ "$notify" -eq 1 ]; then
         start_run_watcher "$inst" "$runid" "$repo"
